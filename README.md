@@ -30,6 +30,14 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+Python helper scripts under `scripts/` are managed with `uv` from the workspace root:
+
+```bash
+uv sync
+uv run export-voice-clone-prompt --help
+uv run export-speaker-bin --help
+```
+
 Optional Hugging Face helpers:
 
 ```bash
@@ -78,16 +86,33 @@ For better alignment with upstream `QwenLM/Qwen3-TTS`, stage 1 also supports imp
 
 ### Stage 1: Python prompt export, native speaker consumption
 
-Use the upstream Python package to export a prompt JSON from `create_voice_clone_prompt(...)`:
+Use the repository's `uv`-managed Python environment to export a prompt JSON from `create_voice_clone_prompt(...)`:
 
 ```bash
-pip install -U qwen-tts
+uv sync
 
-python3 scripts/export_voice_clone_prompt.py \
+uv run export-voice-clone-prompt \
   --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
   --ref-audio testdata/hello.wav \
   --ref-text "hello" \
   --out target/hello.voice-clone-prompt.json
+```
+
+The legacy script path still works too:
+
+```bash
+uv run python scripts/export_voice_clone_prompt.py --help
+uv run python scripts/export_speaker_bin.py --help
+```
+
+If you only need the upstream speaker embedding as a raw `speaker.bin`, export it directly:
+
+```bash
+uv run export-speaker-bin \
+  --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --ref-audio testdata/hello.wav \
+  --ref-text "hello" \
+  --out target/hello.python.speaker.bin
 ```
 
 Then consume that prompt from `qwen3-tts-cli`. In stage 1, the native engine reads the JSON and uses only `ref_spk_embedding`; `ref_code` and `ref_text` are preserved for future work but are not yet injected into the transformer:

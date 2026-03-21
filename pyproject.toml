@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qwen3-tts-native-scripts"
+version = "0.1.0"
+description = "Python helper scripts for qwen3-tts-native."
+requires-python = ">=3.12"
+dependencies = [
+    "qwen-tts",
+]
+scripts = { export-voice-clone-prompt = "qwen3_tts_native_scripts.export_voice_clone_prompt:main", export-speaker-bin = "qwen3_tts_native_scripts.export_speaker_bin:main" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["qwen3_tts_native_scripts"]

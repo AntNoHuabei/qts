@@ -82,8 +82,9 @@ cargo run -p qwen3-tts-cli -- synthesize \
 Stage-1 prompt import can be smoke-tested with a minimal prompt JSON that contains a valid `ref_spk_embedding`, or with the upstream exporter:
 
 ```bash
-pip install -U qwen-tts
-python3 -m py_compile scripts/export_voice_clone_prompt.py
+uv sync
+uv run export-voice-clone-prompt --help
+uv run export-speaker-bin --help
 
 cargo run -p qwen3-tts-cli -- synthesize \
   --model-dir "$QWEN3_TTS_MODEL_DIR" \
