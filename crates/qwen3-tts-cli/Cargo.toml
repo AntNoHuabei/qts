@@ -1,0 +1,20 @@
+[package]
+name = "qwen3-tts-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line tools for Qwen3 TTS synthesis and speaker embedding export."
+
+[features]
+default = []
+hf = ["qwen3-tts/hf"]
+metal = ["qwen3-tts/metal"]
+vulkan = ["qwen3-tts/vulkan"]
+native = ["qwen3-tts/native"]
+
+[dependencies]
+anyhow = "1.0.102"
+hound = "3.5.1"
+qwen3-tts = { version = "0.1.0", path = "../qwen3-tts" }

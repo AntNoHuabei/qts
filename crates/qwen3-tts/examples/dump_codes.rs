@@ -59,7 +59,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "wrote {} frames / {} codes to {}",
         rollout.frames.len(),
-        rollout.frames.iter().map(|f| f.codebook_tokens.len()).sum::<usize>(),
+        rollout
+            .frames
+            .iter()
+            .map(|f| f.codebook_tokens.len())
+            .sum::<usize>(),
         output.display()
     );
     Ok(())

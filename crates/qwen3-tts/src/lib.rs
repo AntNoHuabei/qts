@@ -6,18 +6,21 @@ pub const SAMPLE_RATE_HZ: u32 = 24_000;
 mod error;
 mod model;
 pub mod pipeline;
+mod voice_clone_prompt;
 
 #[cfg(feature = "hf")]
 pub mod hf;
 
 pub use error::Qwen3TtsError;
 pub use model::{load_and_validate, GgufFile, ModelPaths};
+pub use pipeline::speaker_encoder::{SpeakerEncoder, SpeakerEncoderConfig};
 pub use pipeline::tokenizer::{TextTokenizer, TokenizerConfig};
 pub use pipeline::tts_transformer::{
-    CodecRollout, PreparedPrefillInputs, PrefillForwardOutputs, SelectedCodecFrame, TtsTransformer,
+    CodecRollout, PrefillForwardOutputs, PreparedPrefillInputs, SelectedCodecFrame, TtsTransformer,
     TtsTransformerConfig,
 };
 pub use pipeline::vocoder::{Vocoder, VocoderConfig};
+pub use voice_clone_prompt::{PromptTensorI32, VoiceClonePromptV1, VOICE_CLONE_PROMPT_V1_SCHEMA};
 
 /// User-facing synthesis parameters (stable for future `gdext` bindings).
 #[derive(Debug, Clone)]
@@ -63,6 +66,7 @@ pub struct Qwen3TtsEngine {
     tokenizer: TextTokenizer,
     transformer: TtsTransformer,
     vocoder: Vocoder,
+    speaker_encoder: SpeakerEncoder,
 }
 
 impl Qwen3TtsEngine {
@@ -73,12 +77,14 @@ impl Qwen3TtsEngine {
         let tokenizer = TextTokenizer::load_from_gguf(&main)?;
         let transformer = TtsTransformer::load_from_gguf(&main)?;
         let vocoder = Vocoder::load_from_gguf(&vocoder_gguf)?;
+        let speaker_encoder = SpeakerEncoder::new(transformer.config().hidden_size as usize)?;
 
         Ok(Self {
             paths,
             tokenizer,
             transformer,
             vocoder,
+            speaker_encoder,
         })
     }
 
@@ -106,16 +112,108 @@ impl Qwen3TtsEngine {
     }
 
     #[must_use]
+    pub fn speaker_encoder(&self) -> &SpeakerEncoder {
+        &self.speaker_encoder
+    }
+
+    #[must_use]
     pub fn encode_for_tts(&self, text: &str) -> Vec<i32> {
         self.tokenizer.encode_for_tts(text)
     }
 
+    pub fn encode_reference_speaker(&self, wav_bytes: &[u8]) -> Result<Vec<f32>, Qwen3TtsError> {
+        self.speaker_encoder.encode_wav_bytes(wav_bytes)
+    }
+
+    #[must_use]
+    pub fn speaker_embedding_size(&self) -> usize {
+        self.transformer.config().hidden_size as usize
+    }
+
+    pub fn encode_reference_speaker_bin(&self, wav_bytes: &[u8]) -> Result<Vec<u8>, Qwen3TtsError> {
+        let embedding = self.encode_reference_speaker(wav_bytes)?;
+        Ok(embedding
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>())
+    }
+
+    pub fn decode_speaker_embedding_bin(
+        &self,
+        bin_bytes: &[u8],
+    ) -> Result<Vec<f32>, Qwen3TtsError> {
+        if bin_bytes.len() % std::mem::size_of::<f32>() != 0 {
+            return Err(Qwen3TtsError::InvalidInput(
+                "speaker.bin must be a raw little-endian f32 array".into(),
+            ));
+        }
+
+        let embedding = bin_bytes
+            .chunks_exact(std::mem::size_of::<f32>())
+            .map(|chunk| {
+                let bytes: [u8; 4] = chunk.try_into().expect("speaker f32 chunk");
+                f32::from_le_bytes(bytes)
+            })
+            .collect::<Vec<_>>();
+        if embedding.len() != self.speaker_embedding_size() {
+            return Err(Qwen3TtsError::InvalidInput(format!(
+                "speaker.bin must contain {} f32 values",
+                self.speaker_embedding_size()
+            )));
+        }
+        Ok(embedding)
+    }
+
+    pub fn decode_voice_clone_prompt_json(
+        &self,
+        json_bytes: &[u8],
+    ) -> Result<VoiceClonePromptV1, Qwen3TtsError> {
+        let prompt = VoiceClonePromptV1::from_json_bytes(json_bytes)?;
+        self.validate_speaker_embedding(prompt.speaker_embedding())?;
+        Ok(prompt)
+    }
+
+    pub fn synthesize_with_speaker_embedding(
+        &self,
+        req: &SynthesizeRequest,
+        speaker_embedding: &[f32],
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.validate_speaker_embedding(speaker_embedding)?;
+        self.synthesize_impl(req, Some(speaker_embedding))
+    }
+
+    pub fn synthesize_with_voice_clone_prompt(
+        &self,
+        req: &SynthesizeRequest,
+        prompt: &VoiceClonePromptV1,
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.synthesize_with_speaker_embedding(req, prompt.speaker_embedding())
+    }
+
     pub fn synthesize(&self, req: &SynthesizeRequest) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.synthesize_impl(req, None)
+    }
+
+    fn synthesize_impl(
+        &self,
+        req: &SynthesizeRequest,
+        speaker_embedding_override: Option<&[f32]>,
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
         let tokens = self.tokenizer.encode_for_tts(&req.text);
-        let zero_speaker = vec![0.0f32; self.transformer.config().hidden_size as usize];
+        let encoded_speaker;
+        let zero_speaker;
+        let speaker_embedding = if let Some(speaker_embedding) = speaker_embedding_override {
+            speaker_embedding
+        } else if let Some(wav_bytes) = req.reference_wav_bytes.as_deref() {
+            encoded_speaker = self.encode_reference_speaker(wav_bytes)?;
+            &encoded_speaker
+        } else {
+            zero_speaker = vec![0.0f32; self.speaker_embedding_size()];
+            &zero_speaker
+        };
         let prepared_inputs = self.transformer.build_prefill_inputs(
             &tokens,
-            Some(&zero_speaker),
+            Some(speaker_embedding),
             req.language_id,
             req.thread_count,
         )?;
@@ -139,13 +237,22 @@ impl Qwen3TtsEngine {
         let pcm_f32 = self
             .vocoder
             .decode(&flattened_codes, generated_frames, req.thread_count)?;
-        let _ = req.reference_wav_bytes.as_ref();
 
         Ok(SynthesizeResult {
             pcm_f32,
             sample_rate_hz: self.vocoder.config().sample_rate as u32,
             generated_frames,
         })
+    }
+
+    fn validate_speaker_embedding(&self, speaker_embedding: &[f32]) -> Result<(), Qwen3TtsError> {
+        let expected = self.speaker_embedding_size();
+        if speaker_embedding.len() != expected {
+            return Err(Qwen3TtsError::InvalidInput(format!(
+                "speaker embedding must have {expected} elements"
+            )));
+        }
+        Ok(())
     }
 }
 

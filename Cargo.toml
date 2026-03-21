@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/ggml-sys",
     "crates/ggml",
-    "crates/qwen3-tts", "xtask",
+    "crates/qwen3-tts", "xtask", "crates/qwen3-tts-cli",
 ]
 
 [workspace.package]

@@ -65,7 +65,10 @@ fn bench_synthesize(c: &mut Criterion) {
     group.bench_function(
         BenchmarkId::new(
             &cfg.backend_label,
-            format!("threads={} frames={}", cfg.thread_count, cfg.max_audio_frames),
+            format!(
+                "threads={} frames={}",
+                cfg.thread_count, cfg.max_audio_frames
+            ),
         ),
         |b| {
             b.iter(|| {

@@ -5,14 +5,43 @@
 //! cargo test -p qwen3-tts integration_ -- --ignored --nocapture
 //! ```
 
+use std::io::Cursor;
 use std::path::PathBuf;
 
+use hound::{SampleFormat, WavSpec, WavWriter};
 use qwen3_tts::{Qwen3TtsEngine, SynthesizeRequest};
 
 fn require_model_dir() -> PathBuf {
     std::env::var("QWEN3_TTS_MODEL_DIR")
         .map(PathBuf::from)
         .expect("QWEN3_TTS_MODEL_DIR must be set when running ignored integration tests")
+}
+
+fn synthetic_voice_like_wav(sample_rate_hz: u32, seconds: f32) -> Vec<u8> {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: sample_rate_hz,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).expect("wav writer");
+    let total_samples = (sample_rate_hz as f32 * seconds) as usize;
+    for idx in 0..total_samples {
+        let t = idx as f32 / sample_rate_hz as f32;
+        let envelope = ((idx as f32 / total_samples as f32) * std::f32::consts::PI)
+            .sin()
+            .max(0.1);
+        let sample = ((2.0 * std::f32::consts::PI * 140.0 * t).sin() * 0.55
+            + (2.0 * std::f32::consts::PI * 280.0 * t).sin() * 0.25
+            + (2.0 * std::f32::consts::PI * 560.0 * t).sin() * 0.15)
+            * envelope;
+        writer
+            .write_sample((sample * i16::MAX as f32) as i16)
+            .expect("write wav sample");
+    }
+    writer.finalize().expect("finalize wav");
+    cursor.into_inner()
 }
 
 #[test]
@@ -39,4 +68,60 @@ fn integration_synthesize_direct_path_audio() {
     assert_eq!(result.sample_rate_hz, 24_000);
     assert!(result.generated_frames > 0);
     assert!(!result.pcm_f32.is_empty());
+}
+
+#[test]
+#[ignore = "set QWEN3_TTS_MODEL_DIR to run"]
+fn integration_reference_wav_changes_conditioning() {
+    let dir = require_model_dir();
+    let engine = Qwen3TtsEngine::from_model_dir(&dir).expect("load");
+    let reference_wav = synthetic_voice_like_wav(16_000, 1.25);
+    let speaker = engine
+        .encode_reference_speaker(&reference_wav)
+        .expect("encode reference speaker");
+    let hidden_size = engine.transformer().config().hidden_size as usize;
+    assert_eq!(speaker.len(), hidden_size);
+    assert!(speaker.iter().any(|value| value.abs() > 1e-4));
+    let tokens = engine.encode_for_tts("hello");
+    let zero_speaker = vec![0.0f32; hidden_size];
+    let baseline_prefill = engine
+        .transformer()
+        .build_prefill_inputs(&tokens, Some(&zero_speaker), 2050, 1)
+        .expect("baseline prefill");
+    let conditioned_prefill = engine
+        .transformer()
+        .build_prefill_inputs(&tokens, Some(&speaker), 2050, 1)
+        .expect("conditioned prefill");
+    assert_ne!(
+        baseline_prefill.prefill_embd,
+        conditioned_prefill.prefill_embd
+    );
+
+    let baseline = SynthesizeRequest {
+        text: "hello".into(),
+        max_audio_frames: 16,
+        temperature: 0.0,
+        top_k: 0,
+        top_p: 1.0,
+        ..Default::default()
+    };
+    let conditioned = SynthesizeRequest {
+        reference_wav_bytes: Some(reference_wav),
+        ..baseline.clone()
+    };
+
+    let baseline_audio = engine.synthesize(&baseline).expect("baseline synthesize");
+    let conditioned_audio = engine
+        .synthesize(&conditioned)
+        .expect("conditioned synthesize");
+    assert_eq!(
+        baseline_audio.sample_rate_hz,
+        conditioned_audio.sample_rate_hz
+    );
+    assert_eq!(
+        baseline_audio.generated_frames,
+        conditioned_audio.generated_frames
+    );
+    assert!(!baseline_audio.pcm_f32.is_empty());
+    assert!(!conditioned_audio.pcm_f32.is_empty());
 }

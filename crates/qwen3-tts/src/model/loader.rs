@@ -113,7 +113,8 @@ impl GgufFile {
             .ok_or_else(|| Qwen3TtsError::InvalidGguf(self.path.clone()))?;
         let name_c = CString::new(name)?;
         let tensor = unsafe { sys::ggml_get_tensor(meta_ctx, name_c.as_ptr()) };
-        let tensor = NonNull::new(tensor).ok_or_else(|| Qwen3TtsError::MissingTensor(name.into()))?;
+        let tensor =
+            NonNull::new(tensor).ok_or_else(|| Qwen3TtsError::MissingTensor(name.into()))?;
 
         let idx = self
             .tensor_index(name)
@@ -173,7 +174,10 @@ impl GgufFile {
         Ok((info, data))
     }
 
-    pub fn read_tensor_bytes(&self, name: &str) -> Result<(GgufTensorInfo, Vec<u8>), Qwen3TtsError> {
+    pub fn read_tensor_bytes(
+        &self,
+        name: &str,
+    ) -> Result<(GgufTensorInfo, Vec<u8>), Qwen3TtsError> {
         let info = self.tensor_info(name)?;
         let raw = self.read_tensor_bytes_by_info(&info)?;
         Ok((info, raw))

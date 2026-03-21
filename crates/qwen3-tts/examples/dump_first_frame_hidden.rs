@@ -45,7 +45,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer.write_all(&value.to_le_bytes())?;
     }
     writer.flush()?;
-    println!("cb0={} hidden_len={}", frame.codebook_0_token, frame.hidden_state.len());
+    println!(
+        "cb0={} hidden_len={}",
+        frame.codebook_0_token,
+        frame.hidden_state.len()
+    );
     println!("codes={:?}", frame.codebook_tokens);
     Ok(())
 }
