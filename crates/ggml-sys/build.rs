@@ -17,7 +17,14 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=GGML_SRC");
+    println!("cargo:rerun-if-env-changed=VULKAN_SDK");
     validate_features(&target);
+
+    if feature_enabled("vulkan") {
+        println!(
+            "cargo:warning=ggml-sys: Vulkan builds require a Vulkan SDK/loader and `glslc` (for example `libvulkan-dev` and `glslc` on Linux)"
+        );
+    }
 
     let mut cfg = cmake::Config::new(&ggml_root);
     cfg.profile("Release");
@@ -84,6 +91,7 @@ fn main() {
     }
     if feature_enabled("vulkan") {
         println!("cargo:rustc-link-lib=static=ggml-vulkan");
+        emit_vulkan_loader_links(&target);
     }
     if feature_enabled("hip") {
         println!("cargo:rustc-link-lib=static=ggml-hip");
@@ -172,6 +180,33 @@ fn validate_features(target: &str) {
     if feature_enabled("cuda") && target.contains("apple") {
         panic!("ggml-sys: `cuda` feature is not supported on Apple targets");
     }
+}
+
+fn emit_vulkan_loader_links(target: &str) {
+    if target.contains("apple") {
+        for dir in vulkan_search_dirs() {
+            if dir.exists() {
+                println!("cargo:rustc-link-search=native={}", dir.display());
+            }
+        }
+        println!("cargo:rustc-link-lib=dylib=vulkan");
+    } else if target.contains("windows") {
+        println!("cargo:rustc-link-lib=vulkan-1");
+    } else {
+        println!("cargo:rustc-link-lib=vulkan");
+    }
+}
+
+fn vulkan_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(sdk) = env::var("VULKAN_SDK") {
+        let sdk = PathBuf::from(sdk);
+        dirs.push(sdk.join("lib"));
+        dirs.push(sdk.join("macOS").join("lib"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/lib"));
+    dirs.push(PathBuf::from("/usr/local/lib"));
+    dirs
 }
 
 fn find_lib_dir(dst: &Path, out_dir: &Path) -> Option<PathBuf> {

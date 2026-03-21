@@ -38,3 +38,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: clippy ggml-sys with metal
         run: cargo clippy -p ggml-sys --no-default-features --features metal --all-targets -- -D warnings
+
+  features-vulkan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install Vulkan build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev glslc
+      - name: check qwen3-tts with vulkan
+        run: cargo check -p qwen3-tts --no-default-features --features vulkan

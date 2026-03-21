@@ -12,6 +12,7 @@ default = []
 # Optional Hugging Face cache download helpers (URLs in docs/models.md).
 hf = ["dep:hf-hub"]
 metal = ["ggml/metal"]
+vulkan = ["ggml/vulkan"]
 native = ["ggml/native"]
 
 [dependencies]

@@ -10,6 +10,7 @@ description = "Thin safe wrappers over ggml-sys for Qwen TTS Native."
 [features]
 default = []
 metal = ["ggml-sys/metal"]
+vulkan = ["ggml-sys/vulkan"]
 native = ["ggml-sys/native"]
 
 [dependencies]

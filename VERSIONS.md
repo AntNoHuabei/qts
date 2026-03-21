@@ -34,6 +34,7 @@
 
 - `metal` is **Apple targets only** (build script will `panic!` elsewhere).
 - `cuda` is **rejected on Apple** targets.
+- `vulkan` requires the Vulkan toolchain to be discoverable by CMake, including `glslc`.
 
 Default workspace build uses **CPU** only and disables Apple Metal/BLAS in CMake unless you enable the corresponding features.
 
@@ -59,3 +60,12 @@ cargo build -p ggml-sys
 | Feature | Effect |
 |---------|--------|
 | `hf` | Hugging Face download helpers. |
+| `metal` | Prefer Metal at runtime on Apple builds; fall back to CPU if Metal init fails. |
+| `vulkan` | Prefer Vulkan at runtime on non-Apple builds; fall back to CPU if Vulkan init fails. |
+| `native` | Enable host-CPU-specific ggml kernels for less portable but faster CPU binaries. |
+
+## Vulkan prerequisites
+
+- Linux: install a Vulkan loader / headers plus `glslc` before building `--features vulkan`.
+- Windows: install the Vulkan SDK so CMake can find both Vulkan and `glslc`.
+- Apple: the project currently keeps Metal as the preferred GPU backend; enabling `vulkan` does not change runtime selection there.

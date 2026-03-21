@@ -28,7 +28,7 @@ fn run_bench(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
-            "cpu" | "metal" | "both" => {
+            "cpu" | "metal" | "vulkan" | "all" | "both" => {
                 backend = args[idx].clone();
                 idx += 1;
             }
@@ -66,6 +66,8 @@ fn run_bench(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let backends = match backend.as_str() {
         "cpu" => vec!["cpu"],
         "metal" => vec!["metal"],
+        "vulkan" => vec!["vulkan"],
+        "all" => vec!["cpu", "metal", "vulkan"],
         "both" => vec!["cpu", "metal"],
         _ => return Err(format!("unsupported backend: {backend}").into()),
     };
@@ -106,15 +108,24 @@ fn run_single_bench(
     command.arg("bench");
     command.arg("-p").arg("qwen3-tts");
     command.arg("--bench").arg("synthesize");
-    if backend == "metal" {
-        command.arg("--features").arg("metal");
+    match backend {
+        "metal" => {
+            command.arg("--features").arg("metal");
+        }
+        "vulkan" => {
+            command.arg("--features").arg("vulkan");
+        }
+        _ => {}
     }
     command.arg("--");
     for arg in criterion_args {
         command.arg(arg);
     }
 
-    command.env("CARGO_TARGET_DIR", workspace_root.join(format!("target/bench-{backend}")));
+    command.env(
+        "CARGO_TARGET_DIR",
+        workspace_root.join(format!("target/bench-{backend}")),
+    );
     command.env("QWEN3_TTS_BENCH_BACKEND", backend);
     command.env("QWEN3_TTS_BENCH_MODEL_DIR", model_dir);
     command.env("QWEN3_TTS_BENCH_TEXT", text);
@@ -147,7 +158,11 @@ fn workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
         .to_path_buf())
 }
 
-fn value_arg(args: &[String], idx: &mut usize, flag: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn value_arg(
+    args: &[String],
+    idx: &mut usize,
+    flag: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     *idx += 1;
     let value = args
         .get(*idx)
@@ -159,6 +174,6 @@ fn value_arg(args: &[String], idx: &mut usize, flag: &str) -> Result<String, Box
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -p xtask -- bench [cpu|metal|both] [--model-dir PATH] [--text TEXT] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [-- <criterion args>]"
+        "usage: cargo run -p xtask -- bench [cpu|metal|vulkan|all] [--model-dir PATH] [--text TEXT] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [-- <criterion args>]"
     );
 }

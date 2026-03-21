@@ -1,14 +1,15 @@
 //! TTS transformer metadata, weights, and prefill-input construction from GGUF.
 
-use std::cell::{RefCell, RefMut};
 use std::cmp::max;
-use std::collections::BTreeMap;
 use std::ptr::NonNull;
-use std::rc::Rc;
 
 use ggml::sys;
 use rand::Rng;
 
+use super::backend::{
+    execute_graph, graph_metadata_mem_size, slice_as_bytes, slice_as_bytes_mut, BackendSet,
+    OwnedBuffer, TensorDownload, TensorUpload,
+};
 use crate::model::GgufFile;
 use crate::Qwen3TtsError;
 
@@ -333,7 +334,8 @@ impl TtsTransformer {
             self.config.tts_eos_token_id,
             self.config.tts_pad_token_id,
         ];
-        let mut projected_text_tokens = Vec::with_capacity(special_tokens.len() + text_tokens.len());
+        let mut projected_text_tokens =
+            Vec::with_capacity(special_tokens.len() + text_tokens.len());
         projected_text_tokens.extend_from_slice(&special_tokens);
         projected_text_tokens.extend_from_slice(text_tokens);
         let projected_text = self.project_text_tokens(&projected_text_tokens, thread_count)?;
@@ -359,7 +361,8 @@ impl TtsTransformer {
             ]
         };
         let codec_tail_tokens = [self.config.codec_pad_id, self.config.codec_bos_id];
-        let mut all_codec_tokens = Vec::with_capacity(codec_prefill_tokens.len() + codec_tail_tokens.len());
+        let mut all_codec_tokens =
+            Vec::with_capacity(codec_prefill_tokens.len() + codec_tail_tokens.len());
         all_codec_tokens.extend_from_slice(&codec_prefill_tokens);
         all_codec_tokens.extend_from_slice(&codec_tail_tokens);
         let all_codec_embed = self.lookup_codec_embedding_rows(&all_codec_tokens, thread_count)?;
@@ -373,7 +376,8 @@ impl TtsTransformer {
         let mut dst_token = codec_prefill_tokens.len();
 
         if let Some(speaker_embd) = speaker_embd {
-            let dst = &mut codec_input_embedding[dst_token * hidden_size..(dst_token + 1) * hidden_size];
+            let dst =
+                &mut codec_input_embedding[dst_token * hidden_size..(dst_token + 1) * hidden_size];
             dst.copy_from_slice(speaker_embd);
             dst_token += 1;
         }
@@ -455,8 +459,9 @@ impl TtsTransformer {
         let graph_nodes = 4096;
         let ctx = ComputeContext::new_graph(graph_nodes)?;
         let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
-        let graph = NonNull::new(graph)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate prefill graph".into()))?;
+        let graph = NonNull::new(graph).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate prefill graph".into())
+        })?;
 
         let inp_prefill_embd = unsafe {
             sys::ggml_new_tensor_2d(
@@ -466,25 +471,24 @@ impl TtsTransformer {
                 n_tokens as i64,
             )
         };
-        let inp_prefill_embd = NonNull::new(inp_prefill_embd)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate prefill input".into()))?;
+        let inp_prefill_embd = NonNull::new(inp_prefill_embd).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate prefill input".into())
+        })?;
 
         let inp_pos = unsafe {
-            sys::ggml_new_tensor_1d(
-                ctx.as_ptr(),
-                sys::ggml_type_GGML_TYPE_I32,
-                n_tokens as i64,
-            )
+            sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, n_tokens as i64)
         };
-        let inp_pos = NonNull::new(inp_pos)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate position input".into()))?;
+        let inp_pos = NonNull::new(inp_pos).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate position input".into())
+        })?;
         let positions = (0..n_tokens as i32).collect::<Vec<_>>();
 
         let mut inp_l = inp_prefill_embd.as_ptr();
         let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
 
         for layer in &self.talker.layers {
-            let mut cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
+            let mut cur =
+                unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.attn_norm.as_ptr()) };
 
             let mut q_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_q.as_ptr(), cur) };
@@ -520,11 +524,13 @@ impl TtsTransformer {
             };
 
             if let Some(attn_q_norm) = layer.attn_q_norm {
-                q_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
+                q_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
                 q_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), q_cur, attn_q_norm.as_ptr()) };
             }
             if let Some(attn_k_norm) = layer.attn_k_norm {
-                k_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
+                k_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
                 k_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), k_cur, attn_k_norm.as_ptr()) };
             }
 
@@ -597,19 +603,30 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 =
-                unsafe { sys::ggml_cast(ctx.as_ptr(), layer.ffn_down.as_ptr(), sys::ggml_type_GGML_TYPE_F32) };
+            let ffn_down_f32 = unsafe {
+                sys::ggml_cast(
+                    ctx.as_ptr(),
+                    layer.ffn_down.as_ptr(),
+                    sys::ggml_type_GGML_TYPE_F32,
+                )
+            };
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
 
         let mut hidden_states =
             unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
-        hidden_states =
-            unsafe { sys::ggml_mul(ctx.as_ptr(), hidden_states, self.talker.output_norm.as_ptr()) };
+        hidden_states = unsafe {
+            sys::ggml_mul(
+                ctx.as_ptr(),
+                hidden_states,
+                self.talker.output_norm.as_ptr(),
+            )
+        };
         hidden_states = unsafe { sys::ggml_cont(ctx.as_ptr(), hidden_states) };
-        let mut logits =
-            unsafe { sys::ggml_mul_mat(ctx.as_ptr(), self.talker.codec_head.as_ptr(), hidden_states) };
+        let mut logits = unsafe {
+            sys::ggml_mul_mat(ctx.as_ptr(), self.talker.codec_head.as_ptr(), hidden_states)
+        };
         logits = unsafe { sys::ggml_cont(ctx.as_ptr(), logits) };
 
         unsafe {
@@ -623,7 +640,6 @@ impl TtsTransformer {
         execute_graph(
             &self.talker._backends,
             graph,
-            graph_nodes,
             &[
                 TensorUpload {
                     tensor: inp_prefill_embd.as_ptr(),
@@ -677,7 +693,8 @@ impl TtsTransformer {
 
         let hidden_offset = (outputs.n_tokens - 1) * hidden_size;
         let logits_offset = (outputs.n_tokens - 1) * vocab_size;
-        let hidden_state = outputs.hidden_states[hidden_offset..hidden_offset + hidden_size].to_vec();
+        let hidden_state =
+            outputs.hidden_states[hidden_offset..hidden_offset + hidden_size].to_vec();
         let mut logits = outputs.logits[logits_offset..logits_offset + vocab_size].to_vec();
         let suppress_start = vocab_size.saturating_sub(1024);
         for (token, logit) in logits.iter_mut().enumerate().skip(suppress_start) {
@@ -798,9 +815,9 @@ impl TtsTransformer {
 
         while codebook_tokens.len() < self.config.n_codebooks as usize {
             let generation_step = codebook_tokens.len() - 1;
-            let prev_code = *codebook_tokens
-                .last()
-                .ok_or_else(|| Qwen3TtsError::InvalidInput("code predictor lost previous code".into()))?;
+            let prev_code = *codebook_tokens.last().ok_or_else(|| {
+                Qwen3TtsError::InvalidInput("code predictor lost previous code".into())
+            })?;
             let outputs = self.forward_code_pred_step_cached(
                 prev_code,
                 generation_step + 1,
@@ -952,7 +969,9 @@ impl TtsTransformer {
             let step_embd = self.build_talker_step_embedding(
                 &frames
                     .last()
-                    .ok_or_else(|| Qwen3TtsError::InvalidInput("rollout lost previous frame".into()))?
+                    .ok_or_else(|| {
+                        Qwen3TtsError::InvalidInput("rollout lost previous frame".into())
+                    })?
                     .codebook_tokens,
                 trailing_row,
                 thread_count,
@@ -1028,14 +1047,8 @@ impl TtsTransformer {
                 *logit = f32::NEG_INFINITY;
             }
         }
-        let first_codebook_0 = select_token(
-            &logits,
-            repetition_penalty,
-            temperature,
-            top_k,
-            top_p,
-            &[],
-        )?;
+        let first_codebook_0 =
+            select_token(&logits, repetition_penalty, temperature, top_k, top_p, &[])?;
         if first_codebook_0 == self.config.codec_eos_id {
             return Ok(CodecRollout { frames: Vec::new() });
         }
@@ -1070,12 +1083,15 @@ impl TtsTransformer {
             let step_embd = self.build_talker_step_embedding(
                 &frames
                     .last()
-                    .ok_or_else(|| Qwen3TtsError::InvalidInput("rollout lost previous frame".into()))?
+                    .ok_or_else(|| {
+                        Qwen3TtsError::InvalidInput("rollout lost previous frame".into())
+                    })?
                     .codebook_tokens,
                 trailing_row,
                 thread_count,
             )?;
-            let step_outputs = self.forward_step_cached(&step_embd, n_past, thread_count, &cache)?;
+            let step_outputs =
+                self.forward_step_cached(&step_embd, n_past, thread_count, &cache)?;
             let mut logits = step_outputs.logits;
             for (token, logit) in logits.iter_mut().enumerate().skip(suppress_start) {
                 if token as i32 != self.config.codec_eos_id {
@@ -1126,8 +1142,9 @@ impl TtsTransformer {
         let graph_nodes = 16;
         let ctx = ComputeContext::new_graph(graph_nodes)?;
         let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
-        let graph = NonNull::new(graph)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate text projection graph".into()))?;
+        let graph = NonNull::new(graph).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate text projection graph".into())
+        })?;
 
         let inp_tokens = unsafe {
             sys::ggml_new_tensor_1d(
@@ -1136,9 +1153,16 @@ impl TtsTransformer {
                 text_tokens.len() as i64,
             )
         };
-        let inp_tokens = NonNull::new(inp_tokens)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate text token input".into()))?;
-        let mut cur = unsafe { sys::ggml_get_rows(ctx.as_ptr(), self.talker.text_embd.as_ptr(), inp_tokens.as_ptr()) };
+        let inp_tokens = NonNull::new(inp_tokens).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate text token input".into())
+        })?;
+        let mut cur = unsafe {
+            sys::ggml_get_rows(
+                ctx.as_ptr(),
+                self.talker.text_embd.as_ptr(),
+                inp_tokens.as_ptr(),
+            )
+        };
         cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), self.talker.text_proj_fc1.as_ptr(), cur) };
         cur = unsafe { sys::ggml_add(ctx.as_ptr(), cur, self.talker.text_proj_fc1_bias.as_ptr()) };
         cur = unsafe { sys::ggml_silu(ctx.as_ptr(), cur) };
@@ -1154,7 +1178,6 @@ impl TtsTransformer {
         execute_graph(
             &self.talker._backends,
             graph,
-            graph_nodes,
             &[TensorUpload {
                 tensor: inp_tokens.as_ptr(),
                 bytes: slice_as_bytes(text_tokens),
@@ -1190,8 +1213,9 @@ impl TtsTransformer {
         let graph_nodes = 8;
         let ctx = ComputeContext::new_graph(graph_nodes)?;
         let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
-        let graph = NonNull::new(graph)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate embedding graph".into()))?;
+        let graph = NonNull::new(graph).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate embedding graph".into())
+        })?;
 
         let inp_tokens = unsafe {
             sys::ggml_new_tensor_1d(
@@ -1200,10 +1224,16 @@ impl TtsTransformer {
                 token_ids.len() as i64,
             )
         };
-        let inp_tokens = NonNull::new(inp_tokens)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate codec token input".into()))?;
-        let mut rows =
-            unsafe { sys::ggml_get_rows(ctx.as_ptr(), self.talker.codec_embd.as_ptr(), inp_tokens.as_ptr()) };
+        let inp_tokens = NonNull::new(inp_tokens).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate codec token input".into())
+        })?;
+        let mut rows = unsafe {
+            sys::ggml_get_rows(
+                ctx.as_ptr(),
+                self.talker.codec_embd.as_ptr(),
+                inp_tokens.as_ptr(),
+            )
+        };
         rows = unsafe { sys::ggml_cast(ctx.as_ptr(), rows, sys::ggml_type_GGML_TYPE_F32) };
         unsafe {
             sys::ggml_build_forward_expand(graph.as_ptr(), rows);
@@ -1213,7 +1243,6 @@ impl TtsTransformer {
         execute_graph(
             &self.talker._backends,
             graph,
-            graph_nodes,
             &[TensorUpload {
                 tensor: inp_tokens.as_ptr(),
                 bytes: slice_as_bytes(token_ids),
@@ -1247,12 +1276,17 @@ impl TtsTransformer {
             ));
         }
 
-        let mut sequence_embd =
-            Vec::with_capacity((2 + prev_codes.len()) * hidden_size);
+        let mut sequence_embd = Vec::with_capacity((2 + prev_codes.len()) * hidden_size);
         sequence_embd.extend_from_slice(hidden_state);
-        sequence_embd.extend_from_slice(&self.lookup_codec_embedding_rows(&[codebook_0_token], thread_count)?);
+        sequence_embd.extend_from_slice(
+            &self.lookup_codec_embedding_rows(&[codebook_0_token], thread_count)?,
+        );
         for (cb_idx, &token) in prev_codes.iter().enumerate() {
-            sequence_embd.extend_from_slice(&self.lookup_code_pred_embedding_row(cb_idx, token, thread_count)?);
+            sequence_embd.extend_from_slice(&self.lookup_code_pred_embedding_row(
+                cb_idx,
+                token,
+                thread_count,
+            )?);
         }
 
         let n_tokens = sequence_embd.len() / hidden_size;
@@ -1276,11 +1310,7 @@ impl TtsTransformer {
         })?;
 
         let inp_pos = unsafe {
-            sys::ggml_new_tensor_1d(
-                ctx.as_ptr(),
-                sys::ggml_type_GGML_TYPE_I32,
-                n_tokens as i64,
-            )
+            sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, n_tokens as i64)
         };
         let inp_pos = NonNull::new(inp_pos).ok_or_else(|| {
             Qwen3TtsError::InvalidInput("failed to allocate code predictor positions".into())
@@ -1290,7 +1320,8 @@ impl TtsTransformer {
         let mut inp_l = inp_embd.as_ptr();
         let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
         for layer in &self.code_pred.layers {
-            let mut cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
+            let mut cur =
+                unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.attn_norm.as_ptr()) };
 
             let mut q_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_q.as_ptr(), cur) };
@@ -1326,11 +1357,13 @@ impl TtsTransformer {
             };
 
             if let Some(attn_q_norm) = layer.attn_q_norm {
-                q_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
+                q_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
                 q_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), q_cur, attn_q_norm.as_ptr()) };
             }
             if let Some(attn_k_norm) = layer.attn_k_norm {
-                k_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
+                k_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
                 k_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), k_cur, attn_k_norm.as_ptr()) };
             }
 
@@ -1402,8 +1435,13 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 =
-                unsafe { sys::ggml_cast(ctx.as_ptr(), layer.ffn_down.as_ptr(), sys::ggml_type_GGML_TYPE_F32) };
+            let ffn_down_f32 = unsafe {
+                sys::ggml_cast(
+                    ctx.as_ptr(),
+                    layer.ffn_down.as_ptr(),
+                    sys::ggml_type_GGML_TYPE_F32,
+                )
+            };
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -1435,7 +1473,6 @@ impl TtsTransformer {
         execute_graph(
             &self.code_pred._backends,
             graph,
-            graph_nodes,
             &[
                 TensorUpload {
                     tensor: inp_embd.as_ptr(),
@@ -1469,11 +1506,9 @@ impl TtsTransformer {
                 cb_idx + 1
             )));
         }
-        let weight = self
-            .code_pred
-            .embeddings
-            .get(cb_idx)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("missing code predictor embedding".into()))?;
+        let weight = self.code_pred.embeddings.get(cb_idx).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("missing code predictor embedding".into())
+        })?;
         let hidden_size = self.config.hidden_size as usize;
         let graph_nodes = 16;
         let ctx = ComputeContext::new_graph(graph_nodes)?;
@@ -1481,13 +1516,13 @@ impl TtsTransformer {
         let graph = NonNull::new(graph).ok_or_else(|| {
             Qwen3TtsError::InvalidInput("failed to allocate code predictor embedding graph".into())
         })?;
-        let inp_token = unsafe {
-            sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, 1)
-        };
+        let inp_token =
+            unsafe { sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, 1) };
         let inp_token = NonNull::new(inp_token).ok_or_else(|| {
             Qwen3TtsError::InvalidInput("failed to allocate code predictor embedding input".into())
         })?;
-        let mut rows = unsafe { sys::ggml_get_rows(ctx.as_ptr(), weight.as_ptr(), inp_token.as_ptr()) };
+        let mut rows =
+            unsafe { sys::ggml_get_rows(ctx.as_ptr(), weight.as_ptr(), inp_token.as_ptr()) };
         rows = unsafe { sys::ggml_cast(ctx.as_ptr(), rows, sys::ggml_type_GGML_TYPE_F32) };
         unsafe {
             sys::ggml_build_forward_expand(graph.as_ptr(), rows);
@@ -1496,7 +1531,6 @@ impl TtsTransformer {
         execute_graph(
             &self.code_pred._backends,
             graph,
-            graph_nodes,
             &[TensorUpload {
                 tensor: inp_token.as_ptr(),
                 bytes: slice_as_bytes(std::slice::from_ref(&token_id)),
@@ -1539,15 +1573,18 @@ impl TtsTransformer {
         })?;
 
         let inp_hidden = unsafe {
-            sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_F32, hidden_size as i64)
+            sys::ggml_new_tensor_1d(
+                ctx.as_ptr(),
+                sys::ggml_type_GGML_TYPE_F32,
+                hidden_size as i64,
+            )
         };
         let inp_hidden = NonNull::new(inp_hidden).ok_or_else(|| {
             Qwen3TtsError::InvalidInput("failed to allocate code predictor hidden input".into())
         })?;
 
-        let inp_cb0 = unsafe {
-            sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, 1)
-        };
+        let inp_cb0 =
+            unsafe { sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, 1) };
         let inp_cb0 = NonNull::new(inp_cb0).ok_or_else(|| {
             Qwen3TtsError::InvalidInput("failed to allocate code predictor cb0 input".into())
         })?;
@@ -1559,14 +1596,23 @@ impl TtsTransformer {
         })?;
         let positions = [0i32, 1i32];
 
-        let hidden_2d = unsafe { sys::ggml_reshape_2d(ctx.as_ptr(), inp_hidden.as_ptr(), hidden_size as i64, 1) };
-        let mut cb0_2d = unsafe { sys::ggml_get_rows(ctx.as_ptr(), self.talker.codec_embd.as_ptr(), inp_cb0.as_ptr()) };
+        let hidden_2d = unsafe {
+            sys::ggml_reshape_2d(ctx.as_ptr(), inp_hidden.as_ptr(), hidden_size as i64, 1)
+        };
+        let mut cb0_2d = unsafe {
+            sys::ggml_get_rows(
+                ctx.as_ptr(),
+                self.talker.codec_embd.as_ptr(),
+                inp_cb0.as_ptr(),
+            )
+        };
         cb0_2d = unsafe { sys::ggml_cast(ctx.as_ptr(), cb0_2d, sys::ggml_type_GGML_TYPE_F32) };
         let mut inp_l = unsafe { sys::ggml_concat(ctx.as_ptr(), hidden_2d, cb0_2d, 1) };
         let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
 
         for (layer_idx, layer) in self.code_pred.layers.iter().enumerate() {
-            let mut cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
+            let mut cur =
+                unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.attn_norm.as_ptr()) };
             let mut q_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_q.as_ptr(), cur) };
             let mut k_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_k.as_ptr(), cur) };
@@ -1600,11 +1646,13 @@ impl TtsTransformer {
             };
 
             if let Some(attn_q_norm) = layer.attn_q_norm {
-                q_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
+                q_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
                 q_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), q_cur, attn_q_norm.as_ptr()) };
             }
             if let Some(attn_k_norm) = layer.attn_k_norm {
-                k_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
+                k_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
                 k_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), k_cur, attn_k_norm.as_ptr()) };
             }
 
@@ -1670,8 +1718,14 @@ impl TtsTransformer {
                 )
             };
             unsafe {
-                sys::ggml_build_forward_expand(graph.as_ptr(), sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view));
-                sys::ggml_build_forward_expand(graph.as_ptr(), sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view));
+                sys::ggml_build_forward_expand(
+                    graph.as_ptr(),
+                    sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view),
+                );
+                sys::ggml_build_forward_expand(
+                    graph.as_ptr(),
+                    sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view),
+                );
             }
 
             let q = unsafe { sys::ggml_permute(ctx.as_ptr(), q_cur, 0, 2, 1, 3) };
@@ -1701,8 +1755,13 @@ impl TtsTransformer {
             let up = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_up.as_ptr(), cur) };
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
-            let ffn_down_f32 =
-                unsafe { sys::ggml_cast(ctx.as_ptr(), layer.ffn_down.as_ptr(), sys::ggml_type_GGML_TYPE_F32) };
+            let ffn_down_f32 = unsafe {
+                sys::ggml_cast(
+                    ctx.as_ptr(),
+                    layer.ffn_down.as_ptr(),
+                    sys::ggml_type_GGML_TYPE_F32,
+                )
+            };
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -1719,7 +1778,9 @@ impl TtsTransformer {
                 hidden_size * std::mem::size_of::<f32>(),
             )
         };
-        let mut logits = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), self.code_pred.heads[0].as_ptr(), last_hidden) };
+        let mut logits = unsafe {
+            sys::ggml_mul_mat(ctx.as_ptr(), self.code_pred.heads[0].as_ptr(), last_hidden)
+        };
         logits = unsafe { sys::ggml_cont(ctx.as_ptr(), logits) };
         unsafe {
             sys::ggml_build_forward_expand(graph.as_ptr(), logits);
@@ -1729,7 +1790,6 @@ impl TtsTransformer {
         execute_graph(
             &cache._backends,
             graph,
-            graph_nodes,
             &[
                 TensorUpload {
                     tensor: inp_hidden.as_ptr(),
@@ -1796,15 +1856,21 @@ impl TtsTransformer {
         })?;
         let pos = n_past as i32;
 
-        let weight = self.code_pred.embeddings.get(generation_step - 1).ok_or_else(|| {
-            Qwen3TtsError::InvalidInput("missing code predictor embedding".into())
-        })?;
-        let mut inp_l = unsafe { sys::ggml_get_rows(ctx.as_ptr(), weight.as_ptr(), inp_code.as_ptr()) };
+        let weight = self
+            .code_pred
+            .embeddings
+            .get(generation_step - 1)
+            .ok_or_else(|| {
+                Qwen3TtsError::InvalidInput("missing code predictor embedding".into())
+            })?;
+        let mut inp_l =
+            unsafe { sys::ggml_get_rows(ctx.as_ptr(), weight.as_ptr(), inp_code.as_ptr()) };
         inp_l = unsafe { sys::ggml_reshape_2d(ctx.as_ptr(), inp_l, hidden_size as i64, 1) };
         let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
 
         for (layer_idx, layer) in self.code_pred.layers.iter().enumerate() {
-            let mut cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
+            let mut cur =
+                unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.attn_norm.as_ptr()) };
             let mut q_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_q.as_ptr(), cur) };
             let mut k_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_k.as_ptr(), cur) };
@@ -1838,11 +1904,13 @@ impl TtsTransformer {
             };
 
             if let Some(attn_q_norm) = layer.attn_q_norm {
-                q_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
+                q_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
                 q_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), q_cur, attn_q_norm.as_ptr()) };
             }
             if let Some(attn_k_norm) = layer.attn_k_norm {
-                k_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
+                k_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
                 k_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), k_cur, attn_k_norm.as_ptr()) };
             }
 
@@ -1908,8 +1976,14 @@ impl TtsTransformer {
                 )
             };
             unsafe {
-                sys::ggml_build_forward_expand(graph.as_ptr(), sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view));
-                sys::ggml_build_forward_expand(graph.as_ptr(), sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view));
+                sys::ggml_build_forward_expand(
+                    graph.as_ptr(),
+                    sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view),
+                );
+                sys::ggml_build_forward_expand(
+                    graph.as_ptr(),
+                    sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view),
+                );
             }
 
             let n_kv = n_past + 1;
@@ -1964,16 +2038,26 @@ impl TtsTransformer {
             let up = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_up.as_ptr(), cur) };
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
-            let ffn_down_f32 =
-                unsafe { sys::ggml_cast(ctx.as_ptr(), layer.ffn_down.as_ptr(), sys::ggml_type_GGML_TYPE_F32) };
+            let ffn_down_f32 = unsafe {
+                sys::ggml_cast(
+                    ctx.as_ptr(),
+                    layer.ffn_down.as_ptr(),
+                    sys::ggml_type_GGML_TYPE_F32,
+                )
+            };
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
 
         let mut cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
         cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, self.code_pred.output_norm.as_ptr()) };
-        let mut logits =
-            unsafe { sys::ggml_mul_mat(ctx.as_ptr(), self.code_pred.heads[generation_step].as_ptr(), cur) };
+        let mut logits = unsafe {
+            sys::ggml_mul_mat(
+                ctx.as_ptr(),
+                self.code_pred.heads[generation_step].as_ptr(),
+                cur,
+            )
+        };
         logits = unsafe { sys::ggml_cont(ctx.as_ptr(), logits) };
         unsafe {
             sys::ggml_build_forward_expand(graph.as_ptr(), logits);
@@ -1983,7 +2067,6 @@ impl TtsTransformer {
         execute_graph(
             &cache._backends,
             graph,
-            graph_nodes,
             &[
                 TensorUpload {
                     tensor: inp_code.as_ptr(),
@@ -2079,8 +2162,9 @@ impl TtsTransformer {
         let graph_nodes = 128;
         let ctx = ComputeContext::new_graph(graph_nodes)?;
         let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
-        let graph = NonNull::new(graph)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate step embedding graph".into()))?;
+        let graph = NonNull::new(graph).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate step embedding graph".into())
+        })?;
 
         let inp_trailing = unsafe {
             sys::ggml_new_tensor_2d(
@@ -2095,11 +2179,17 @@ impl TtsTransformer {
         })?;
         let inp_cb0 =
             unsafe { sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, 1) };
-        let inp_cb0 = NonNull::new(inp_cb0)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate codec token input".into()))?;
+        let inp_cb0 = NonNull::new(inp_cb0).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate codec token input".into())
+        })?;
 
-        let mut cur =
-            unsafe { sys::ggml_get_rows(ctx.as_ptr(), self.talker.codec_embd.as_ptr(), inp_cb0.as_ptr()) };
+        let mut cur = unsafe {
+            sys::ggml_get_rows(
+                ctx.as_ptr(),
+                self.talker.codec_embd.as_ptr(),
+                inp_cb0.as_ptr(),
+            )
+        };
         cur = unsafe { sys::ggml_cast(ctx.as_ptr(), cur, sys::ggml_type_GGML_TYPE_F32) };
 
         let mut code_inputs = Vec::with_capacity(codebook_tokens.len().saturating_sub(1));
@@ -2109,7 +2199,8 @@ impl TtsTransformer {
             let inp_code = NonNull::new(inp_code).ok_or_else(|| {
                 Qwen3TtsError::InvalidInput("failed to allocate code predictor token input".into())
             })?;
-            let mut embd = unsafe { sys::ggml_get_rows(ctx.as_ptr(), weight.as_ptr(), inp_code.as_ptr()) };
+            let mut embd =
+                unsafe { sys::ggml_get_rows(ctx.as_ptr(), weight.as_ptr(), inp_code.as_ptr()) };
             embd = unsafe { sys::ggml_cast(ctx.as_ptr(), embd, sys::ggml_type_GGML_TYPE_F32) };
             cur = unsafe { sys::ggml_add(ctx.as_ptr(), cur, embd) };
             code_inputs.push((cb_idx, inp_code));
@@ -2140,7 +2231,6 @@ impl TtsTransformer {
         execute_graph(
             &self.talker._backends,
             graph,
-            graph_nodes,
             uploads.as_slice(),
             &mut [TensorDownload {
                 tensor: cur,
@@ -2167,14 +2257,17 @@ impl TtsTransformer {
 
         let n_tokens = prefill_embd.len() / hidden_size;
         if n_tokens > cache.n_ctx {
-            return Err(Qwen3TtsError::InvalidInput("talker context length exceeded".into()));
+            return Err(Qwen3TtsError::InvalidInput(
+                "talker context length exceeded".into(),
+            ));
         }
 
         let graph_nodes = 4096;
         let ctx = ComputeContext::new_graph(graph_nodes)?;
         let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
-        let graph = NonNull::new(graph)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate cached prefill graph".into()))?;
+        let graph = NonNull::new(graph).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate cached prefill graph".into())
+        })?;
 
         let inp_prefill_embd = unsafe {
             sys::ggml_new_tensor_2d(
@@ -2184,25 +2277,24 @@ impl TtsTransformer {
                 n_tokens as i64,
             )
         };
-        let inp_prefill_embd = NonNull::new(inp_prefill_embd)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate prefill input".into()))?;
+        let inp_prefill_embd = NonNull::new(inp_prefill_embd).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate prefill input".into())
+        })?;
 
         let inp_pos = unsafe {
-            sys::ggml_new_tensor_1d(
-                ctx.as_ptr(),
-                sys::ggml_type_GGML_TYPE_I32,
-                n_tokens as i64,
-            )
+            sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, n_tokens as i64)
         };
-        let inp_pos = NonNull::new(inp_pos)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate position input".into()))?;
+        let inp_pos = NonNull::new(inp_pos).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate position input".into())
+        })?;
         let positions = (0..n_tokens as i32).collect::<Vec<_>>();
 
         let mut inp_l = inp_prefill_embd.as_ptr();
         let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
 
         for (layer_idx, layer) in self.talker.layers.iter().enumerate() {
-            let mut cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
+            let mut cur =
+                unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.attn_norm.as_ptr()) };
 
             let mut q_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_q.as_ptr(), cur) };
@@ -2238,11 +2330,13 @@ impl TtsTransformer {
             };
 
             if let Some(attn_q_norm) = layer.attn_q_norm {
-                q_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
+                q_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
                 q_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), q_cur, attn_q_norm.as_ptr()) };
             }
             if let Some(attn_k_norm) = layer.attn_k_norm {
-                k_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
+                k_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
                 k_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), k_cur, attn_k_norm.as_ptr()) };
             }
 
@@ -2308,8 +2402,14 @@ impl TtsTransformer {
                 )
             };
             unsafe {
-                sys::ggml_build_forward_expand(graph.as_ptr(), sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view));
-                sys::ggml_build_forward_expand(graph.as_ptr(), sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view));
+                sys::ggml_build_forward_expand(
+                    graph.as_ptr(),
+                    sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view),
+                );
+                sys::ggml_build_forward_expand(
+                    graph.as_ptr(),
+                    sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view),
+                );
             }
 
             let q = unsafe { sys::ggml_permute(ctx.as_ptr(), q_cur, 0, 2, 1, 3) };
@@ -2346,16 +2446,26 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 =
-                unsafe { sys::ggml_cast(ctx.as_ptr(), layer.ffn_down.as_ptr(), sys::ggml_type_GGML_TYPE_F32) };
+            let ffn_down_f32 = unsafe {
+                sys::ggml_cast(
+                    ctx.as_ptr(),
+                    layer.ffn_down.as_ptr(),
+                    sys::ggml_type_GGML_TYPE_F32,
+                )
+            };
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
 
         let mut hidden_states =
             unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
-        hidden_states =
-            unsafe { sys::ggml_mul(ctx.as_ptr(), hidden_states, self.talker.output_norm.as_ptr()) };
+        hidden_states = unsafe {
+            sys::ggml_mul(
+                ctx.as_ptr(),
+                hidden_states,
+                self.talker.output_norm.as_ptr(),
+            )
+        };
         let last_hidden = unsafe {
             sys::ggml_view_2d(
                 ctx.as_ptr(),
@@ -2367,7 +2477,9 @@ impl TtsTransformer {
             )
         };
         let last_hidden = unsafe { sys::ggml_cont(ctx.as_ptr(), last_hidden) };
-        let mut logits = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), self.talker.codec_head.as_ptr(), last_hidden) };
+        let mut logits = unsafe {
+            sys::ggml_mul_mat(ctx.as_ptr(), self.talker.codec_head.as_ptr(), last_hidden)
+        };
         logits = unsafe { sys::ggml_cont(ctx.as_ptr(), logits) };
 
         unsafe {
@@ -2380,7 +2492,6 @@ impl TtsTransformer {
         execute_graph(
             &cache._backends,
             graph,
-            graph_nodes,
             &[
                 TensorUpload {
                     tensor: inp_prefill_embd.as_ptr(),
@@ -2425,7 +2536,9 @@ impl TtsTransformer {
             ));
         }
         if n_past >= cache.n_ctx {
-            return Err(Qwen3TtsError::InvalidInput("talker context length exceeded".into()));
+            return Err(Qwen3TtsError::InvalidInput(
+                "talker context length exceeded".into(),
+            ));
         }
 
         let graph_nodes = 4096;
@@ -2447,14 +2560,16 @@ impl TtsTransformer {
 
         let inp_pos =
             unsafe { sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, 1) };
-        let inp_pos = NonNull::new(inp_pos)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate step position".into()))?;
+        let inp_pos = NonNull::new(inp_pos).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate step position".into())
+        })?;
         let pos = n_past as i32;
 
         let mut inp_l = inp_step.as_ptr();
         let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
         for (layer_idx, layer) in self.talker.layers.iter().enumerate() {
-            let mut cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
+            let mut cur =
+                unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.attn_norm.as_ptr()) };
 
             let mut q_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_q.as_ptr(), cur) };
@@ -2490,11 +2605,13 @@ impl TtsTransformer {
             };
 
             if let Some(attn_q_norm) = layer.attn_q_norm {
-                q_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
+                q_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
                 q_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), q_cur, attn_q_norm.as_ptr()) };
             }
             if let Some(attn_k_norm) = layer.attn_k_norm {
-                k_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
+                k_cur =
+                    unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
                 k_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), k_cur, attn_k_norm.as_ptr()) };
             }
 
@@ -2560,8 +2677,14 @@ impl TtsTransformer {
                 )
             };
             unsafe {
-                sys::ggml_build_forward_expand(graph.as_ptr(), sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view));
-                sys::ggml_build_forward_expand(graph.as_ptr(), sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view));
+                sys::ggml_build_forward_expand(
+                    graph.as_ptr(),
+                    sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view),
+                );
+                sys::ggml_build_forward_expand(
+                    graph.as_ptr(),
+                    sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view),
+                );
             }
 
             let n_kv = n_past + 1;
@@ -2622,8 +2745,13 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 =
-                unsafe { sys::ggml_cast(ctx.as_ptr(), layer.ffn_down.as_ptr(), sys::ggml_type_GGML_TYPE_F32) };
+            let ffn_down_f32 = unsafe {
+                sys::ggml_cast(
+                    ctx.as_ptr(),
+                    layer.ffn_down.as_ptr(),
+                    sys::ggml_type_GGML_TYPE_F32,
+                )
+            };
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -2633,8 +2761,9 @@ impl TtsTransformer {
         hidden_state =
             unsafe { sys::ggml_mul(ctx.as_ptr(), hidden_state, self.talker.output_norm.as_ptr()) };
         hidden_state = unsafe { sys::ggml_cont(ctx.as_ptr(), hidden_state) };
-        let mut logits =
-            unsafe { sys::ggml_mul_mat(ctx.as_ptr(), self.talker.codec_head.as_ptr(), hidden_state) };
+        let mut logits = unsafe {
+            sys::ggml_mul_mat(ctx.as_ptr(), self.talker.codec_head.as_ptr(), hidden_state)
+        };
         logits = unsafe { sys::ggml_cont(ctx.as_ptr(), logits) };
         unsafe {
             sys::ggml_build_forward_expand(graph.as_ptr(), hidden_state);
@@ -2646,7 +2775,6 @@ impl TtsTransformer {
         execute_graph(
             &cache._backends,
             graph,
-            graph_nodes,
             &[
                 TensorUpload {
                     tensor: inp_step.as_ptr(),
@@ -2713,7 +2841,11 @@ struct TalkerWeights {
 }
 
 impl TalkerWeights {
-    fn load(file: &GgufFile, cfg: &TtsTransformerConfig, backends: BackendSet) -> Result<Self, Qwen3TtsError> {
+    fn load(
+        file: &GgufFile,
+        cfg: &TtsTransformerConfig,
+        backends: BackendSet,
+    ) -> Result<Self, Qwen3TtsError> {
         unsafe {
             sys::ggml_cpu_init();
         }
@@ -2739,7 +2871,8 @@ impl TalkerWeights {
             hidden_u,
             codec_vocab_u,
         );
-        let output_norm = load_tensor_into_context(file, ctx.as_ptr(), "talker.output_norm.weight")?;
+        let output_norm =
+            load_tensor_into_context(file, ctx.as_ptr(), "talker.output_norm.weight")?;
         let codec_head = load_tensor_into_context(file, ctx.as_ptr(), "talker.codec_head.weight")?;
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
         for layer_idx in 0..cfg.n_layers {
@@ -2760,18 +2893,46 @@ impl TalkerWeights {
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_k_norm.weight"),
                 )?,
-                attn_q: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "attn_q.weight"))?,
-                attn_k: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "attn_k.weight"))?,
-                attn_v: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "attn_v.weight"))?,
+                attn_q: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "attn_q.weight"),
+                )?,
+                attn_k: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "attn_k.weight"),
+                )?,
+                attn_v: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "attn_v.weight"),
+                )?,
                 attn_output: load_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_output.weight"),
                 )?,
-                ffn_norm: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "ffn_norm.weight"))?,
-                ffn_gate: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "ffn_gate.weight"))?,
-                ffn_up: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "ffn_up.weight"))?,
-                ffn_down: load_tensor_into_context(file, ctx.as_ptr(), &(prefix + "ffn_down.weight"))?,
+                ffn_norm: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "ffn_norm.weight"),
+                )?,
+                ffn_gate: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "ffn_gate.weight"),
+                )?,
+                ffn_up: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "ffn_up.weight"),
+                )?,
+                ffn_down: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix + "ffn_down.weight"),
+                )?,
             });
         }
 
@@ -2809,7 +2970,12 @@ impl TalkerWeights {
                     let name = format!("talker.blk.{layer_idx}.{suffix}");
                     let (_, raw) = file.read_tensor_bytes(&name)?;
                     unsafe {
-                        sys::ggml_backend_tensor_set(tensor.as_ptr(), raw.as_ptr().cast(), 0, raw.len());
+                        sys::ggml_backend_tensor_set(
+                            tensor.as_ptr(),
+                            raw.as_ptr().cast(),
+                            0,
+                            raw.len(),
+                        );
                     }
                 }
             }
@@ -2878,7 +3044,11 @@ struct CodePredKvCache {
 }
 
 impl TalkerKvCache {
-    fn new(cfg: &TtsTransformerConfig, n_ctx: usize, backends: BackendSet) -> Result<Self, Qwen3TtsError> {
+    fn new(
+        cfg: &TtsTransformerConfig,
+        n_ctx: usize,
+        backends: BackendSet,
+    ) -> Result<Self, Qwen3TtsError> {
         unsafe {
             sys::ggml_cpu_init();
         }
@@ -2905,12 +3075,14 @@ impl TalkerKvCache {
                 )
             };
             k_cache.push(
-                NonNull::new(k)
-                    .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate K cache".into()))?,
+                NonNull::new(k).ok_or_else(|| {
+                    Qwen3TtsError::InvalidInput("failed to allocate K cache".into())
+                })?,
             );
             v_cache.push(
-                NonNull::new(v)
-                    .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to allocate V cache".into()))?,
+                NonNull::new(v).ok_or_else(|| {
+                    Qwen3TtsError::InvalidInput("failed to allocate V cache".into())
+                })?,
             );
         }
         let buffer = OwnedBuffer::alloc(ctx.as_ptr(), backends.primary_ptr())?;
@@ -2926,7 +3098,11 @@ impl TalkerKvCache {
 }
 
 impl CodePredKvCache {
-    fn new(cfg: &TtsTransformerConfig, n_ctx: usize, backends: BackendSet) -> Result<Self, Qwen3TtsError> {
+    fn new(
+        cfg: &TtsTransformerConfig,
+        n_ctx: usize,
+        backends: BackendSet,
+    ) -> Result<Self, Qwen3TtsError> {
         unsafe {
             sys::ggml_cpu_init();
         }
@@ -2952,16 +3128,12 @@ impl CodePredKvCache {
                     n_ctx as i64,
                 )
             };
-            k_cache.push(
-                NonNull::new(k).ok_or_else(|| {
-                    Qwen3TtsError::InvalidInput("failed to allocate code predictor K cache".into())
-                })?,
-            );
-            v_cache.push(
-                NonNull::new(v).ok_or_else(|| {
-                    Qwen3TtsError::InvalidInput("failed to allocate code predictor V cache".into())
-                })?,
-            );
+            k_cache.push(NonNull::new(k).ok_or_else(|| {
+                Qwen3TtsError::InvalidInput("failed to allocate code predictor K cache".into())
+            })?);
+            v_cache.push(NonNull::new(v).ok_or_else(|| {
+                Qwen3TtsError::InvalidInput("failed to allocate code predictor V cache".into())
+            })?);
         }
         let buffer = OwnedBuffer::alloc(ctx.as_ptr(), backends.primary_ptr())?;
         Ok(Self {
@@ -2976,7 +3148,11 @@ impl CodePredKvCache {
 }
 
 impl CodePredWeights {
-    fn load(file: &GgufFile, cfg: &TtsTransformerConfig, backends: BackendSet) -> Result<Self, Qwen3TtsError> {
+    fn load(
+        file: &GgufFile,
+        cfg: &TtsTransformerConfig,
+        backends: BackendSet,
+    ) -> Result<Self, Qwen3TtsError> {
         unsafe {
             sys::ggml_cpu_init();
         }
@@ -3021,7 +3197,8 @@ impl CodePredWeights {
         if codec_embd_cpu.as_ref().map(|v| v.len()) != Some(per_codebook) {
             codec_embd_cpu = None;
         }
-        let output_norm = load_tensor_into_context(file, ctx.as_ptr(), "code_pred.output_norm.weight")?;
+        let output_norm =
+            load_tensor_into_context(file, ctx.as_ptr(), "code_pred.output_norm.weight")?;
         let mut layers = Vec::with_capacity(cfg.code_pred_layers as usize);
         for layer_idx in 0..cfg.code_pred_layers {
             let prefix = format!("code_pred.blk.{layer_idx}.");
@@ -3041,18 +3218,46 @@ impl CodePredWeights {
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_k_norm.weight"),
                 )?,
-                attn_q: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "attn_q.weight"))?,
-                attn_k: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "attn_k.weight"))?,
-                attn_v: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "attn_v.weight"))?,
+                attn_q: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "attn_q.weight"),
+                )?,
+                attn_k: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "attn_k.weight"),
+                )?,
+                attn_v: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "attn_v.weight"),
+                )?,
                 attn_output: load_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_output.weight"),
                 )?,
-                ffn_norm: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "ffn_norm.weight"))?,
-                ffn_gate: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "ffn_gate.weight"))?,
-                ffn_up: load_tensor_into_context(file, ctx.as_ptr(), &(prefix.clone() + "ffn_up.weight"))?,
-                ffn_down: load_tensor_into_context(file, ctx.as_ptr(), &(prefix + "ffn_down.weight"))?,
+                ffn_norm: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "ffn_norm.weight"),
+                )?,
+                ffn_gate: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "ffn_gate.weight"),
+                )?,
+                ffn_up: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix.clone() + "ffn_up.weight"),
+                )?,
+                ffn_down: load_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &(prefix + "ffn_down.weight"),
+                )?,
             });
         }
 
@@ -3069,7 +3274,12 @@ impl CodePredWeights {
                 };
                 let (_, raw) = file.read_tensor_bytes(&name)?;
                 unsafe {
-                    sys::ggml_backend_tensor_set(tensor.as_ptr(), raw.as_ptr().cast(), 0, raw.len());
+                    sys::ggml_backend_tensor_set(
+                        tensor.as_ptr(),
+                        raw.as_ptr().cast(),
+                        0,
+                        raw.len(),
+                    );
                 }
             }
         }
@@ -3095,7 +3305,12 @@ impl CodePredWeights {
                     let name = format!("code_pred.blk.{layer_idx}.{suffix}");
                     let (_, raw) = file.read_tensor_bytes(&name)?;
                     unsafe {
-                        sys::ggml_backend_tensor_set(tensor.as_ptr(), raw.as_ptr().cast(), 0, raw.len());
+                        sys::ggml_backend_tensor_set(
+                            tensor.as_ptr(),
+                            raw.as_ptr().cast(),
+                            0,
+                            raw.len(),
+                        );
                     }
                 }
             }
@@ -3127,13 +3342,17 @@ impl OwnedContext {
                 no_alloc,
             })
         };
-        let raw = NonNull::new(raw)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to initialize ggml context".into()))?;
+        let raw = NonNull::new(raw).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to initialize ggml context".into())
+        })?;
         Ok(Self { raw })
     }
 
     fn new_for_tensor_metadata(n_tensors: usize) -> Result<Self, Qwen3TtsError> {
-        Self::new(max(1, n_tensors) * unsafe { sys::ggml_tensor_overhead() }, true)
+        Self::new(
+            max(1, n_tensors) * unsafe { sys::ggml_tensor_overhead() },
+            true,
+        )
     }
 
     fn as_ptr(&self) -> *mut sys::ggml_context {
@@ -3153,258 +3372,14 @@ struct ComputeContext(OwnedContext);
 
 impl ComputeContext {
     fn new_graph(max_nodes: usize) -> Result<Self, Qwen3TtsError> {
-        Ok(Self(OwnedContext::new(graph_metadata_mem_size(max_nodes), true)?))
+        Ok(Self(OwnedContext::new(
+            graph_metadata_mem_size(max_nodes),
+            true,
+        )?))
     }
 
     fn as_ptr(&self) -> *mut sys::ggml_context {
         self.0.as_ptr()
-    }
-}
-
-#[derive(Clone)]
-struct BackendSet(Rc<BackendSetInner>);
-
-struct BackendSetInner {
-    primary: OwnedBackend,
-    cpu_fallback: Option<OwnedBackend>,
-    primary_galloc: RefCell<OwnedGallocr>,
-}
-
-impl BackendSet {
-    fn new() -> Result<Self, Qwen3TtsError> {
-        unsafe {
-            sys::ggml_backend_load_all();
-            sys::ggml_cpu_init();
-        }
-
-        #[cfg(all(feature = "metal", target_vendor = "apple"))]
-        {
-            if let Some(primary) = OwnedBackend::init_by_name(b"Metal\0")? {
-                let primary_galloc = RefCell::new(OwnedGallocr::new(primary.as_ptr())?);
-                return Ok(Self(Rc::new(BackendSetInner {
-                    primary,
-                    cpu_fallback: Some(OwnedBackend::cpu()?),
-                    primary_galloc,
-                })));
-            }
-        }
-
-        let primary = OwnedBackend::cpu()?;
-        let primary_galloc = RefCell::new(OwnedGallocr::new(primary.as_ptr())?);
-        Ok(Self(Rc::new(BackendSetInner {
-            primary,
-            cpu_fallback: None,
-            primary_galloc,
-        })))
-    }
-
-    fn primary_ptr(&self) -> sys::ggml_backend_t {
-        self.0.primary.as_ptr()
-    }
-
-    fn configure_threads(&self, thread_count: usize) {
-        self.0.primary.set_threads(thread_count);
-        if let Some(cpu_fallback) = &self.0.cpu_fallback {
-            cpu_fallback.set_threads(thread_count);
-        }
-    }
-
-    fn primary_galloc(&self) -> RefMut<'_, OwnedGallocr> {
-        self.0.primary_galloc.borrow_mut()
-    }
-}
-
-struct OwnedBackend {
-    raw: NonNull<sys::ggml_backend>,
-    is_cpu: bool,
-}
-
-impl OwnedBackend {
-    fn cpu() -> Result<Self, Qwen3TtsError> {
-        let raw = unsafe { sys::ggml_backend_cpu_init() };
-        let raw = NonNull::new(raw).ok_or_else(|| {
-            Qwen3TtsError::InvalidInput("failed to initialize ggml CPU backend".into())
-        })?;
-        Ok(Self { raw, is_cpu: true })
-    }
-
-    #[cfg(all(feature = "metal", target_vendor = "apple"))]
-    fn init_by_name(name: &[u8]) -> Result<Option<Self>, Qwen3TtsError> {
-        let raw = unsafe { sys::ggml_backend_init_by_name(name.as_ptr().cast(), std::ptr::null()) };
-        Ok(NonNull::new(raw).map(|raw| Self { raw, is_cpu: false }))
-    }
-
-    fn as_ptr(&self) -> sys::ggml_backend_t {
-        self.raw.as_ptr()
-    }
-
-    fn set_threads(&self, thread_count: usize) {
-        if self.is_cpu {
-            unsafe {
-                sys::ggml_backend_cpu_set_n_threads(self.raw.as_ptr(), normalize_threads(thread_count));
-            }
-        }
-    }
-}
-
-impl Drop for OwnedBackend {
-    fn drop(&mut self) {
-        unsafe {
-            sys::ggml_backend_free(self.raw.as_ptr());
-        }
-    }
-}
-
-struct OwnedGallocr {
-    raw: NonNull<sys::ggml_gallocr>,
-}
-
-impl OwnedGallocr {
-    fn new(backend: sys::ggml_backend_t) -> Result<Self, Qwen3TtsError> {
-        let raw = unsafe { sys::ggml_gallocr_new(sys::ggml_backend_get_default_buffer_type(backend)) };
-        let raw = NonNull::new(raw)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to initialize ggml graph allocator".into()))?;
-        Ok(Self { raw })
-    }
-}
-
-impl Drop for OwnedGallocr {
-    fn drop(&mut self) {
-        unsafe {
-            sys::ggml_gallocr_free(self.raw.as_ptr());
-        }
-    }
-}
-
-struct TensorUpload<'a> {
-    tensor: *mut sys::ggml_tensor,
-    bytes: &'a [u8],
-}
-
-struct TensorDownload<'a> {
-    tensor: *mut sys::ggml_tensor,
-    bytes: &'a mut [u8],
-}
-
-struct OwnedBuffer {
-    raw: NonNull<sys::ggml_backend_buffer>,
-}
-
-impl OwnedBuffer {
-    fn alloc(ctx: *mut sys::ggml_context, backend: sys::ggml_backend_t) -> Result<Self, Qwen3TtsError> {
-        let raw = unsafe { sys::ggml_backend_alloc_ctx_tensors(ctx, backend) };
-        let raw = NonNull::new(raw).ok_or_else(|| {
-            Qwen3TtsError::InvalidInput("failed to allocate ggml backend tensor buffer".into())
-        })?;
-        Ok(Self { raw })
-    }
-}
-
-impl Drop for OwnedBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            sys::ggml_backend_buffer_free(self.raw.as_ptr());
-        }
-    }
-}
-
-fn graph_metadata_mem_size(max_nodes: usize) -> usize {
-    let tensor_overhead = unsafe { sys::ggml_tensor_overhead() };
-    let graph_overhead = unsafe { sys::ggml_graph_overhead_custom(max_nodes, false) };
-    max(1024 * 1024, graph_overhead + tensor_overhead * max_nodes * 16)
-}
-
-fn slice_as_bytes<T>(slice: &[T]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), std::mem::size_of_val(slice)) }
-}
-
-fn slice_as_bytes_mut<T>(slice: &mut [T]) -> &mut [u8] {
-    unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(slice)) }
-}
-
-fn execute_graph(
-    backends: &BackendSet,
-    graph: NonNull<sys::ggml_cgraph>,
-    _max_nodes: usize,
-    uploads: &[TensorUpload<'_>],
-    downloads: &mut [TensorDownload<'_>],
-    thread_count: usize,
-    error_message: &str,
-) -> Result<(), Qwen3TtsError> {
-    maybe_log_backend_support(backends, graph, error_message);
-    backends.configure_threads(thread_count);
-    let galloc = backends.primary_galloc();
-    let allocated = unsafe { sys::ggml_gallocr_alloc_graph(galloc.raw.as_ptr(), graph.as_ptr()) };
-    if !allocated {
-        return Err(Qwen3TtsError::InvalidInput(format!(
-            "failed to allocate backend graph for {error_message}"
-        )));
-    }
-
-    for upload in uploads {
-        unsafe {
-            sys::ggml_backend_tensor_set(upload.tensor, upload.bytes.as_ptr().cast(), 0, upload.bytes.len());
-        }
-    }
-
-    let status = unsafe { sys::ggml_backend_graph_compute(backends.primary_ptr(), graph.as_ptr()) };
-    if status != sys::ggml_status_GGML_STATUS_SUCCESS {
-        return Err(Qwen3TtsError::InvalidInput(error_message.into()));
-    }
-
-    for download in downloads {
-        unsafe {
-            sys::ggml_backend_tensor_get(
-                download.tensor,
-                download.bytes.as_mut_ptr().cast(),
-                0,
-                download.bytes.len(),
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn maybe_log_backend_support(backends: &BackendSet, graph: NonNull<sys::ggml_cgraph>, label: &str) {
-    if std::env::var_os("QWEN3_TTS_DEBUG_BACKEND").is_none() {
-        return;
-    }
-
-    let n_nodes = unsafe { sys::ggml_graph_n_nodes(graph.as_ptr()) };
-    let mut supported = 0usize;
-    let mut offloaded = 0usize;
-    let mut unsupported_ops = BTreeMap::<String, usize>::new();
-    for idx in 0..n_nodes {
-        let node = unsafe { sys::ggml_graph_node(graph.as_ptr(), idx) };
-        if node.is_null() {
-            continue;
-        }
-        let is_supported = unsafe { sys::ggml_backend_supports_op(backends.primary_ptr(), node) };
-        let is_offloaded = unsafe { sys::ggml_backend_offload_op(backends.primary_ptr(), node) };
-        if is_supported {
-            supported += 1;
-        } else {
-            let op = unsafe {
-                let desc = sys::ggml_op_desc(node);
-                if desc.is_null() {
-                    "<unknown>".to_string()
-                } else {
-                    std::ffi::CStr::from_ptr(desc).to_string_lossy().into_owned()
-                }
-            };
-            *unsupported_ops.entry(op).or_default() += 1;
-        }
-        if is_offloaded {
-            offloaded += 1;
-        }
-    }
-
-    eprintln!(
-        "[backend-debug] {label}: nodes={n_nodes} supported={supported} offloaded={offloaded}"
-    );
-    for (op, count) in unsupported_ops.into_iter().take(12) {
-        eprintln!("[backend-debug] unsupported {op}: {count}");
     }
 }
 
@@ -3451,16 +3426,13 @@ fn load_optional_tensor_into_context(
             for (idx, dim) in info.dims.iter().copied().enumerate() {
                 ne[idx] = dim as i64;
             }
-            let tensor = unsafe { sys::ggml_new_tensor(ctx, info.ty, info.dims.len() as i32, ne.as_ptr()) };
+            let tensor =
+                unsafe { sys::ggml_new_tensor(ctx, info.ty, info.dims.len() as i32, ne.as_ptr()) };
             Ok(NonNull::new(tensor))
         }
         Err(Qwen3TtsError::MissingTensor(_)) => Ok(None),
         Err(err) => Err(err),
     }
-}
-
-fn normalize_threads(thread_count: usize) -> i32 {
-    max(1, thread_count) as i32
 }
 
 fn select_token(
@@ -3472,7 +3444,9 @@ fn select_token(
     recent_tokens: &[i32],
 ) -> Result<i32, Qwen3TtsError> {
     if logits.is_empty() {
-        return Err(Qwen3TtsError::InvalidInput("logits must not be empty".into()));
+        return Err(Qwen3TtsError::InvalidInput(
+            "logits must not be empty".into(),
+        ));
     }
 
     let mut adjusted = logits.to_vec();
@@ -3554,7 +3528,9 @@ fn select_token(
             .collect::<Vec<_>>();
         let total = exp_values.iter().sum::<f32>();
         if total <= 0.0 {
-            return Err(Qwen3TtsError::InvalidInput("all logits are filtered out".into()));
+            return Err(Qwen3TtsError::InvalidInput(
+                "all logits are filtered out".into(),
+            ));
         }
         let mut cumulative = 0.0f32;
         let mut keep = vec![false; adjusted.len()];
