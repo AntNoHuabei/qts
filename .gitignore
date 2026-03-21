@@ -1,0 +1,23 @@
+/target
+**/target
+.DS_Store
+
+# Local CMake outputs (ggml-sys / ggml submodule build tree)
+vendor/ggml/build/
+*.swp
+.idea
+.vscode
+
+# Local checkpoints (GGUF, etc.) — use QWEN3_TTS_MODEL_DIR; see docs/testing.md
+models/
+
+# Test audio, golden vectors, synthetic GGUF — layout described in testdata/README.md
+testdata/**
+!/testdata/README.md
+
+# GGUF drops outside models/ (e.g. workspace root)
+*.gguf
+
+# Criterion / xtask separate target dirs
+target/bench-cpu/
+target/bench-metal/

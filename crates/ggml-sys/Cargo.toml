@@ -1,0 +1,39 @@
+[package]
+name = "ggml-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Low-level FFI bindings to ggml-org/ggml (built from vendored sources)."
+links = "ggml"
+build = "build.rs"
+
+[lib]
+name = "ggml_sys"
+
+[features]
+default = []
+# Map to ggml CMake options (see VERSIONS.md). Enable only backends you need.
+metal = []
+cuda = []
+vulkan = []
+hip = []
+blas = []
+musa = []
+opencl = []
+rpc = []
+sycl = []
+webgpu = []
+openvino = []
+hexagon = []
+cann = []
+zendnn = []
+zdnn = []
+virtgpu = []
+# Optimize CPU kernels for the host CPU (less portable binaries).
+native = []
+
+[build-dependencies]
+bindgen = "0.71"
+cmake = "0.1"

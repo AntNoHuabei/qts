@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ggml-sys",
+    "crates/ggml",
+    "crates/qwen3-tts", "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yetanotherai/qwen-tts-native"
+
+[workspace.dependencies]
+ggml-sys = { path = "crates/ggml-sys" }
+ggml = { path = "crates/ggml" }
+thiserror = "2"
+hf-hub = "0.4"
+rand = "0.9"

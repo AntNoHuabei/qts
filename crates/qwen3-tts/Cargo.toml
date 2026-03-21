@@ -1,0 +1,28 @@
+[package]
+name = "qwen3-tts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Qwen3 TTS inference (GGUF + GGML); Rust API for host apps and gdext."
+
+[features]
+default = []
+# Optional Hugging Face cache download helpers (URLs in docs/models.md).
+hf = ["dep:hf-hub"]
+metal = ["ggml/metal"]
+native = ["ggml/native"]
+
+[dependencies]
+ggml.workspace = true
+thiserror.workspace = true
+hf-hub = { workspace = true, optional = true }
+rand.workspace = true
+
+[dev-dependencies]
+criterion = "0.5.1"
+
+[[bench]]
+name = "synthesize"
+harness = false

@@ -1,0 +1,16 @@
+[package]
+name = "ggml"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin safe wrappers over ggml-sys for Qwen TTS Native."
+
+[features]
+default = []
+metal = ["ggml-sys/metal"]
+native = ["ggml-sys/native"]
+
+[dependencies]
+ggml-sys.workspace = true
