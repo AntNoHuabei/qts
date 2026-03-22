@@ -25,8 +25,6 @@ unsafe fn ggml_conv_transpose_1d_vulkan_compat(
         return sys::ggml_conv_transpose_1d(ctx, kernel, input, s0, p0, d0);
     }
     let f32 = sys::ggml_type_GGML_TYPE_F32;
-    let orig_k_ty = (*kernel).type_ as u32;
-    let orig_x_ty = (*input).type_ as u32;
     let cast_k = (*kernel).type_ != f32;
     let cast_x = (*input).type_ != f32;
     let mut k = kernel;
@@ -139,6 +137,12 @@ pub struct Vocoder {
     config: VocoderConfig,
     weights: VocoderWeights,
 }
+
+// SAFETY: Vocoder weight tensors (NonNull<ggml_tensor>) point to immutable data
+// allocated on a CPU backend buffer. Each decode() call builds its own independent
+// ggml graph and allocation — no shared mutable state is accessed across threads.
+unsafe impl Send for Vocoder {}
+unsafe impl Sync for Vocoder {}
 
 impl Vocoder {
     pub fn load_from_gguf(file: &GgufFile) -> Result<Self, Qwen3TtsError> {

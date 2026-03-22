@@ -1,9 +1,8 @@
-use std::cell::{RefCell, RefMut};
 use std::cmp::max;
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ggml::sys;
 
@@ -110,12 +109,18 @@ impl BackendKind {
 }
 
 #[derive(Clone)]
-pub(crate) struct BackendSet(Rc<BackendSetInner>);
+pub(crate) struct BackendSet(Arc<BackendSetInner>);
+
+// SAFETY: BackendSet wraps ggml backends whose weight data is immutable after loading.
+// Each graph execution creates its own allocation via the Mutex-protected gallocr.
+// The CPU backend's thread pool is per-graph-execution (set_n_threads is called before compute).
+unsafe impl Send for BackendSet {}
+unsafe impl Sync for BackendSet {}
 
 struct BackendSetInner {
     primary: OwnedBackend,
     cpu_fallback: Option<OwnedBackend>,
-    primary_galloc: RefCell<OwnedGallocr>,
+    primary_galloc: Mutex<OwnedGallocr>,
     /// Vulkan's `ggml_vk_conv_transpose_1d` requires F32 weights/activations; GGUF kernels are often quantized.
     vulkan_conv_transpose_cast_quant: bool,
 }
@@ -229,8 +234,8 @@ impl BackendSet {
         cpu_fallback: Option<OwnedBackend>,
         vulkan_conv_transpose_cast_quant: bool,
     ) -> Result<Self, Qwen3TtsError> {
-        let primary_galloc = RefCell::new(OwnedGallocr::new(primary.as_ptr())?);
-        Ok(Self(Rc::new(BackendSetInner {
+        let primary_galloc = Mutex::new(OwnedGallocr::new(primary.as_ptr())?);
+        Ok(Self(Arc::new(BackendSetInner {
             primary,
             cpu_fallback,
             primary_galloc,
@@ -254,8 +259,8 @@ impl BackendSet {
         }
     }
 
-    fn primary_galloc(&self) -> RefMut<'_, OwnedGallocr> {
-        self.0.primary_galloc.borrow_mut()
+    fn primary_galloc(&self) -> MutexGuard<'_, OwnedGallocr> {
+        self.0.primary_galloc.lock().unwrap()
     }
 }
 
@@ -526,6 +531,7 @@ fn run_graph_impl(
     downloads: &mut [TensorDownload<'_>],
     error_message: &str,
 ) -> Result<(), Qwen3TtsError> {
+    let _t0 = std::time::Instant::now();
     for upload in uploads {
         unsafe {
             sys::ggml_backend_tensor_set(
@@ -536,10 +542,12 @@ fn run_graph_impl(
             );
         }
     }
+    let _t1 = std::time::Instant::now();
     let status = unsafe { sys::ggml_backend_graph_compute(backends.primary_ptr(), graph.as_ptr()) };
     if status != sys::ggml_status_GGML_STATUS_SUCCESS {
         return Err(Qwen3TtsError::InvalidInput(error_message.into()));
     }
+    let _t2 = std::time::Instant::now();
     for download in downloads {
         unsafe {
             sys::ggml_backend_tensor_get(
@@ -549,6 +557,15 @@ fn run_graph_impl(
                 download.bytes.len(),
             );
         }
+    }
+    let _t3 = std::time::Instant::now();
+    if backend_debug_enabled() {
+        eprintln!(
+            "[graph_impl] upload={:.2}ms  compute={:.2}ms  download={:.2}ms  ({error_message})",
+            (_t1 - _t0).as_secs_f64() * 1000.0,
+            (_t2 - _t1).as_secs_f64() * 1000.0,
+            (_t3 - _t2).as_secs_f64() * 1000.0,
+        );
     }
     Ok(())
 }

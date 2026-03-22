@@ -97,6 +97,7 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
     let mut top_p = 1.0f32;
     let mut repetition_penalty = 1.05f32;
     let mut language_id = 2050i32;
+    let mut vocoder_chunk_size = 0usize;
 
     let mut idx = 0;
     while idx < args.len() {
@@ -148,6 +149,9 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
             "--language-id" => {
                 language_id = parse_value_arg(&args, &mut idx, "--language-id")?;
             }
+            "--chunk-size" => {
+                vocoder_chunk_size = parse_value_arg(&args, &mut idx, "--chunk-size")?;
+            }
             other => bail!("unknown synthesize argument: {other}"),
         }
     }
@@ -164,13 +168,7 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
     let engine = load_engine(&model_dir)?;
     let max_audio_frames = match max_audio_frames {
         Some(value) => value,
-        None => {
-            let (value, token_count) = estimate_max_audio_frames(&engine, &text);
-            eprintln!(
-                "--frames not provided; using estimated max audio frames={value} for {token_count} text tokens"
-            );
-            value
-        }
+        None => 256,
     };
 
     let request = SynthesizeRequest {
@@ -188,6 +186,7 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
         thread_count,
         repetition_penalty,
         language_id,
+        vocoder_chunk_size,
     };
 
     let result = if let Some(path) = voice_clone_prompt {
@@ -245,6 +244,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
     let mut repetition_penalty = 1.05f32;
     let mut language_id = 2050i32;
     let mut runs = 1usize;
+    let mut vocoder_chunk_size = 0usize;
 
     let mut idx = 0;
     while idx < args.len() {
@@ -299,6 +299,9 @@ fn run_profile(args: Vec<String>) -> Result<()> {
             "--runs" => {
                 runs = parse_value_arg(&args, &mut idx, "--runs")?;
             }
+            "--chunk-size" => {
+                vocoder_chunk_size = parse_value_arg(&args, &mut idx, "--chunk-size")?;
+            }
             other => bail!("unknown profile argument: {other}"),
         }
     }
@@ -318,13 +321,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
     let engine = load_engine(&model_dir)?;
     let max_audio_frames = match max_audio_frames {
         Some(value) => value,
-        None => {
-            let (value, token_count) = estimate_max_audio_frames(&engine, &text);
-            eprintln!(
-                "--frames not provided; using estimated max audio frames={value} for {token_count} text tokens"
-            );
-            value
-        }
+        None => 256,
     };
 
     let request = SynthesizeRequest {
@@ -342,6 +339,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
         thread_count,
         repetition_penalty,
         language_id,
+        vocoder_chunk_size,
     };
 
     let voice_prompt = if let Some(path) = &voice_clone_prompt {
@@ -407,14 +405,6 @@ fn load_engine(model_dir: &Path) -> Result<Qwen3TtsEngine> {
         .with_context(|| format!("failed to load model dir {}", model_dir.display()))
 }
 
-fn estimate_max_audio_frames(engine: &Qwen3TtsEngine, text: &str) -> (usize, usize) {
-    let token_count = engine.encode_for_tts(text).len();
-    let estimated = token_count
-        .saturating_mul(4)
-        .saturating_add(16)
-        .clamp(32, 512);
-    (estimated, token_count)
-}
 
 fn write_wav_f32(path: &Path, sample_rate_hz: u32, pcm_f32: &[f32]) -> Result<()> {
     let spec = WavSpec {

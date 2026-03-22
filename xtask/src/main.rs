@@ -124,7 +124,7 @@ fn run_profile(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     for backend in backends {
         let mut command = Command::new("cargo");
         command.current_dir(&workspace_root);
-        command.args(["run", "-p", "qwen3-tts-cli"]);
+        command.args(["run", "--release", "-p", "qwen3-tts-cli"]);
         if backend != "cpu" {
             command.args(["--features", backend]);
         }

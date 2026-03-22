@@ -18,7 +18,7 @@ pub use pipeline::speaker_encoder::{SpeakerEncoder, SpeakerEncoderConfig};
 pub use pipeline::tokenizer::{TextTokenizer, TokenizerConfig};
 pub use pipeline::tts_transformer::{
     CodecRollout, PrefillConditioning, PrefillForwardOutputs, PreparedPrefillInputs,
-    SelectedCodecFrame, TtsTransformer, TtsTransformerConfig,
+    SelectedCodecFrame, TtsTransformer, TtsTransformerConfig, VocoderChunk,
 };
 pub use pipeline::vocoder::{Vocoder, VocoderConfig};
 pub use synthesis_profile::SynthesisStageTimings;
@@ -41,6 +41,10 @@ pub struct SynthesizeRequest {
     pub repetition_penalty: f32,
     /// Codec language id (e.g. 2050=en, 2055=zh, 2058=ja).
     pub language_id: i32,
+    /// When > 0, pipeline transformer (GPU) and vocoder (CPU) by processing
+    /// vocoder chunks of this many frames in a background thread while the
+    /// transformer continues generating. Set to 0 to disable (sequential).
+    pub vocoder_chunk_size: usize,
 }
 
 impl Default for SynthesizeRequest {
@@ -55,6 +59,7 @@ impl Default for SynthesizeRequest {
             thread_count: 4,
             repetition_penalty: 1.05,
             language_id: 2050,
+            vocoder_chunk_size: 0,
         }
     }
 }
@@ -316,12 +321,48 @@ impl Qwen3TtsEngine {
         )?;
         let prefill_build = t_prefill.elapsed();
 
+        if req.vocoder_chunk_size > 0 {
+            self.synthesize_pipelined(
+                req,
+                &prepared_inputs,
+                &prompt_frames,
+                prefix_frame_count,
+                timings,
+                speaker_encode,
+                tokenize,
+                prefill_build,
+            )
+        } else {
+            self.synthesize_sequential(
+                req,
+                &prepared_inputs,
+                &prompt_frames,
+                prefix_frame_count,
+                timings,
+                speaker_encode,
+                tokenize,
+                prefill_build,
+            )
+        }
+    }
+
+    fn synthesize_sequential(
+        &self,
+        req: &SynthesizeRequest,
+        prepared_inputs: &PreparedPrefillInputs,
+        prompt_frames: &[Vec<i32>],
+        prefix_frame_count: usize,
+        timings: Option<&mut SynthesisStageTimings>,
+        speaker_encode: std::time::Duration,
+        tokenize: std::time::Duration,
+        prefill_build: std::time::Duration,
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
         let t_roll = Instant::now();
         let codec_rollout = self.transformer.rollout_codec_frames_kv(
             &prepared_inputs.prefill_embd,
             &prepared_inputs.trailing_text_hidden,
             &prepared_inputs.tts_pad_embed,
-            &prompt_frames,
+            prompt_frames,
             req.thread_count,
             req.max_audio_frames,
             req.repetition_penalty,
@@ -360,6 +401,7 @@ impl Qwen3TtsEngine {
         };
         let post = t_trim.elapsed() + flatten_dur;
 
+        let sample_rate_hz = self.vocoder.config().sample_rate as u32;
         if let Some(t) = timings {
             t.speaker_encode = speaker_encode;
             t.tokenize = tokenize;
@@ -367,12 +409,154 @@ impl Qwen3TtsEngine {
             t.codec_rollout = codec_rollout_dur;
             t.vocoder_decode = vocoder_decode;
             t.post = post;
+            t.first_frame_latency =
+                speaker_encode + tokenize + prefill_build + codec_rollout.first_frame_elapsed;
+            t.generated_samples = pcm_f32.len();
+            t.sample_rate_hz = sample_rate_hz;
         }
 
         Ok(SynthesizeResult {
             pcm_f32,
-            sample_rate_hz: self.vocoder.config().sample_rate as u32,
+            sample_rate_hz,
             generated_frames,
+        })
+    }
+
+    /// Pipeline transformer (GPU/main thread) with vocoder (CPU/background thread).
+    ///
+    /// The transformer generates frames autoregressively; every `chunk_size` generated
+    /// frames the codebook tokens are sent to a vocoder worker that decodes them in
+    /// parallel on CPU. When the transformer finishes the last chunk is flushed and
+    /// all audio is concatenated.
+    fn synthesize_pipelined(
+        &self,
+        req: &SynthesizeRequest,
+        prepared_inputs: &PreparedPrefillInputs,
+        prompt_frames: &[Vec<i32>],
+        prefix_frame_count: usize,
+        timings: Option<&mut SynthesisStageTimings>,
+        speaker_encode: std::time::Duration,
+        tokenize: std::time::Duration,
+        prefill_build: std::time::Duration,
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        use std::sync::mpsc;
+
+        let chunk_size = req.vocoder_chunk_size;
+        let thread_count = req.thread_count;
+        // Give the vocoder fewer threads to reduce contention with the
+        // transformer's code predictor (both use CPU). On systems with many
+        // cores (like Apple Silicon) this is a reasonable compromise.
+        let vocoder_thread_count = (thread_count / 2).max(1);
+
+        // Bounded channel — at most 2 chunks buffered so the vocoder thread
+        // doesn't fall too far behind (back-pressure).
+        let (chunk_tx, chunk_rx) = mpsc::sync_channel::<VocoderChunk>(2);
+
+        // Prompt frames are decoded by the vocoder as part of the first chunk
+        // that includes them. We feed them separately so the streaming rollout
+        // only emits generated (non-prompt) frames.
+        let prompt_chunk = if prefix_frame_count > 0 {
+            let codes = prompt_frames
+                .iter()
+                .flat_map(|f| f.iter().copied())
+                .collect::<Vec<_>>();
+            Some(VocoderChunk {
+                codes,
+                n_frames: prefix_frame_count,
+            })
+        } else {
+            None
+        };
+
+        let t_pipeline_start = Instant::now();
+
+        std::thread::scope(|s| {
+            let vocoder = &self.vocoder;
+
+            let vocoder_handle = s.spawn(move || -> Result<(Vec<f32>, std::time::Duration), Qwen3TtsError> {
+                let t_voc_start = Instant::now();
+                let mut all_pcm = Vec::<f32>::new();
+
+                if let Some(prompt_chunk) = prompt_chunk {
+                    let audio = vocoder.decode(
+                        &prompt_chunk.codes,
+                        prompt_chunk.n_frames,
+                        vocoder_thread_count,
+                    )?;
+                    all_pcm.extend_from_slice(&audio);
+                }
+
+                while let Ok(chunk) = chunk_rx.recv() {
+                    let audio = vocoder.decode(&chunk.codes, chunk.n_frames, vocoder_thread_count)?;
+                    all_pcm.extend_from_slice(&audio);
+                }
+
+                Ok((all_pcm, t_voc_start.elapsed()))
+            });
+
+            let t_roll = Instant::now();
+            let codec_rollout = self.transformer.rollout_codec_frames_kv_streaming(
+                &prepared_inputs.prefill_embd,
+                &prepared_inputs.trailing_text_hidden,
+                &prepared_inputs.tts_pad_embed,
+                prompt_frames,
+                thread_count,
+                req.max_audio_frames,
+                req.repetition_penalty,
+                req.temperature,
+                req.top_k,
+                req.top_p,
+                chunk_size,
+                &chunk_tx,
+            );
+            let codec_rollout_dur = t_roll.elapsed();
+            drop(chunk_tx);
+
+            let codec_rollout = codec_rollout?;
+            let generated_frames = codec_rollout
+                .frames
+                .len()
+                .saturating_sub(prefix_frame_count);
+
+            let (pcm_all, vocoder_decode) = vocoder_handle.join().unwrap()?;
+
+            let pipeline_wall_clock = t_pipeline_start.elapsed();
+
+            let t_trim = Instant::now();
+            let pcm_f32 = if prefix_frame_count == 0 || pcm_all.is_empty() {
+                pcm_all
+            } else {
+                let total_frames = prefix_frame_count + generated_frames;
+                let cut = prefix_frame_count
+                    .saturating_mul(pcm_all.len())
+                    .checked_div(total_frames)
+                    .unwrap_or(0)
+                    .min(pcm_all.len());
+                pcm_all[cut..].to_vec()
+            };
+            let post = t_trim.elapsed();
+
+            let sample_rate_hz = self.vocoder.config().sample_rate as u32;
+            if let Some(t) = timings {
+                t.speaker_encode = speaker_encode;
+                t.tokenize = tokenize;
+                t.prefill_build = prefill_build;
+                t.codec_rollout = codec_rollout_dur;
+                t.vocoder_decode = vocoder_decode;
+                t.post = post;
+                let sequential_sum = codec_rollout_dur + vocoder_decode;
+                t.pipeline_overlap = sequential_sum.saturating_sub(pipeline_wall_clock);
+                t.first_frame_latency =
+                    speaker_encode + tokenize + prefill_build + codec_rollout.first_frame_elapsed;
+                t.generated_samples = pcm_f32.len();
+                t.sample_rate_hz = sample_rate_hz;
+            }
+
+            Ok(SynthesizeResult {
+                pcm_f32,
+                sample_rate_hz,
+                generated_frames,
+            })
         })
     }
 

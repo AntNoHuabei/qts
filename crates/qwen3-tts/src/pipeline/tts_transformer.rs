@@ -2,6 +2,7 @@
 
 use std::cmp::max;
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
 use ggml::sys;
 use rand::Rng;
@@ -113,6 +114,12 @@ pub struct SelectedCodecFrame {
 #[derive(Debug, Clone)]
 pub struct CodecRollout {
     pub frames: Vec<SelectedCodecFrame>,
+    pub first_frame_elapsed: Duration,
+}
+
+pub struct VocoderChunk {
+    pub codes: Vec<i32>,
+    pub n_frames: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -953,8 +960,9 @@ impl TtsTransformer {
         top_p: f32,
     ) -> Result<CodecRollout, Qwen3TtsError> {
         if max_frames == 0 {
-            return Ok(CodecRollout { frames: Vec::new() });
+            return Ok(CodecRollout { frames: Vec::new(), first_frame_elapsed: Duration::ZERO });
         }
+        let t_rollout_start = Instant::now();
 
         let prefill_outputs = self.forward_prefill(prefill_embd, thread_count)?;
         for frame in prompt_frames {
@@ -974,6 +982,7 @@ impl TtsTransformer {
         )?;
         if first.codebook_0_token == self.config.codec_eos_id {
             return Ok(CodecRollout {
+                first_frame_elapsed: t_rollout_start.elapsed(),
                 frames: prompt_frames
                     .iter()
                     .map(|codebook_tokens| SelectedCodecFrame {
@@ -1007,6 +1016,7 @@ impl TtsTransformer {
             })
             .collect::<Vec<_>>();
         frames.push(first);
+        let first_frame_elapsed = t_rollout_start.elapsed();
         let mut history_embd = prefill_embd.to_vec();
         let hidden_size = self.config.hidden_size as usize;
         if !trailing_text_hidden.len().is_multiple_of(hidden_size) {
@@ -1067,7 +1077,7 @@ impl TtsTransformer {
             frames.push(next_frame);
         }
 
-        Ok(CodecRollout { frames })
+        Ok(CodecRollout { frames, first_frame_elapsed })
     }
 
     pub fn rollout_codec_frames_kv(
@@ -1084,8 +1094,9 @@ impl TtsTransformer {
         top_p: f32,
     ) -> Result<CodecRollout, Qwen3TtsError> {
         if max_frames == 0 {
-            return Ok(CodecRollout { frames: Vec::new() });
+            return Ok(CodecRollout { frames: Vec::new(), first_frame_elapsed: Duration::ZERO });
         }
+        let t_rollout_start = Instant::now();
 
         let hidden_size = self.config.hidden_size as usize;
         if prefill_embd.is_empty() || !prefill_embd.len().is_multiple_of(hidden_size) {
@@ -1139,6 +1150,7 @@ impl TtsTransformer {
         )?;
         if first_codebook_0 == self.config.codec_eos_id {
             return Ok(CodecRollout {
+                first_frame_elapsed: t_rollout_start.elapsed(),
                 frames: prompt_frames
                     .iter()
                     .map(|codebook_tokens| SelectedCodecFrame {
@@ -1175,9 +1187,9 @@ impl TtsTransformer {
             hidden_state: first_outputs.hidden_state,
             logits,
         });
+        let first_frame_elapsed = t_rollout_start.elapsed();
         let mut n_past = prefill_len;
 
-        // Pre-build a fixed-shape step graph that will be reused for every decode step.
         let n_kv_max = prefill_len + max_frames + 1;
         let mut step_tmpl = self.build_step_graph_template(&cache, n_kv_max)?;
 
@@ -1243,7 +1255,212 @@ impl TtsTransformer {
             n_past += 1;
         }
 
-        Ok(CodecRollout { frames })
+        Ok(CodecRollout { frames, first_frame_elapsed })
+    }
+
+    /// Streaming variant that sends `VocoderChunk`s to `chunk_tx` every
+    /// `chunk_size` generated frames so the vocoder can decode in parallel.
+    pub fn rollout_codec_frames_kv_streaming(
+        &self,
+        prefill_embd: &[f32],
+        trailing_text_hidden: &[f32],
+        tts_pad_embed: &[f32],
+        prompt_frames: &[Vec<i32>],
+        thread_count: usize,
+        max_frames: usize,
+        repetition_penalty: f32,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        chunk_size: usize,
+        chunk_tx: &std::sync::mpsc::SyncSender<VocoderChunk>,
+    ) -> Result<CodecRollout, Qwen3TtsError> {
+        if max_frames == 0 {
+            return Ok(CodecRollout { frames: Vec::new(), first_frame_elapsed: Duration::ZERO });
+        }
+        let t_rollout_start = Instant::now();
+
+        let hidden_size = self.config.hidden_size as usize;
+        if prefill_embd.is_empty() || !prefill_embd.len().is_multiple_of(hidden_size) {
+            return Err(Qwen3TtsError::InvalidInput(
+                "prefill embedding shape is invalid".into(),
+            ));
+        }
+        if !trailing_text_hidden.len().is_multiple_of(hidden_size) {
+            return Err(Qwen3TtsError::InvalidInput(
+                "trailing text hidden shape is invalid".into(),
+            ));
+        }
+        if tts_pad_embed.len() != hidden_size {
+            return Err(Qwen3TtsError::InvalidInput(
+                "tts pad embedding shape is invalid".into(),
+            ));
+        }
+        for frame in prompt_frames {
+            self.validate_codebook_frame(frame)?;
+        }
+
+        let prefill_len = prefill_embd.len() / hidden_size;
+        let trailing_len = trailing_text_hidden.len() / hidden_size;
+        let required_ctx = max(256, prefill_len + max_frames + 16);
+        let cache = TalkerKvCache::new(&self.config, required_ctx, self.talker._backends.clone())?;
+        let code_pred_cache = CodePredKvCache::new(
+            &self.config,
+            self.config.n_codebooks as usize,
+            self.code_pred._backends.clone(),
+        )?;
+
+        let first_outputs = self.forward_prefill_cached(prefill_embd, thread_count, &cache)?;
+        let mut logits = first_outputs.logits;
+        let suppress_start = self.config.codec_vocab_size.saturating_sub(1024) as usize;
+        for (token, logit) in logits.iter_mut().enumerate().skip(suppress_start) {
+            if token as i32 != self.config.codec_eos_id {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+        let prompt_recent_tokens = prompt_frames
+            .iter()
+            .filter_map(|frame| frame.first().copied())
+            .collect::<Vec<_>>();
+        let first_codebook_0 = select_token(
+            &logits,
+            repetition_penalty,
+            temperature,
+            top_k,
+            top_p,
+            &prompt_recent_tokens,
+        )?;
+        if first_codebook_0 == self.config.codec_eos_id {
+            return Ok(CodecRollout {
+                first_frame_elapsed: t_rollout_start.elapsed(),
+                frames: prompt_frames
+                    .iter()
+                    .map(|codebook_tokens| SelectedCodecFrame {
+                        codebook_0_token: codebook_tokens[0],
+                        codebook_tokens: codebook_tokens.clone(),
+                        hidden_state: Vec::new(),
+                        logits: Vec::new(),
+                    })
+                    .collect(),
+            });
+        }
+
+        let first_codes = self.predict_remaining_codebooks_kv_with_cache(
+            &first_outputs.hidden_state,
+            first_codebook_0,
+            thread_count,
+            temperature,
+            top_k,
+            top_p,
+            &code_pred_cache,
+        )?;
+        let mut frames = prompt_frames
+            .iter()
+            .map(|codebook_tokens| SelectedCodecFrame {
+                codebook_0_token: codebook_tokens[0],
+                codebook_tokens: codebook_tokens.clone(),
+                hidden_state: Vec::new(),
+                logits: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        frames.push(SelectedCodecFrame {
+            codebook_0_token: first_codebook_0,
+            codebook_tokens: first_codes,
+            hidden_state: first_outputs.hidden_state,
+            logits,
+        });
+        let first_frame_elapsed = t_rollout_start.elapsed();
+        let mut n_past = prefill_len;
+
+        let n_kv_max = prefill_len + max_frames + 1;
+        let mut step_tmpl = self.build_step_graph_template(&cache, n_kv_max)?;
+
+        let prefix_frame_count = prompt_frames.len();
+        let chunk_size = chunk_size.max(1);
+        let mut unsent_start = prefix_frame_count;
+
+        let flush_chunk = |frames: &[SelectedCodecFrame], start: usize, end: usize, tx: &std::sync::mpsc::SyncSender<VocoderChunk>| {
+            if end <= start { return; }
+            let codes = frames[start..end]
+                .iter()
+                .flat_map(|f| f.codebook_tokens.iter().copied())
+                .collect::<Vec<_>>();
+            let _ = tx.send(VocoderChunk { codes, n_frames: end - start });
+        };
+
+        while frames.len() < max_frames {
+            let recent_tokens = frames
+                .iter()
+                .map(|frame| frame.codebook_0_token)
+                .collect::<Vec<_>>();
+            let trailing_row = if frames.len() - 1 < trailing_len {
+                &trailing_text_hidden[(frames.len() - 1) * hidden_size..frames.len() * hidden_size]
+            } else {
+                tts_pad_embed
+            };
+            let step_embd = self.build_talker_step_embedding(
+                &frames
+                    .last()
+                    .ok_or_else(|| {
+                        Qwen3TtsError::InvalidInput("rollout lost previous frame".into())
+                    })?
+                    .codebook_tokens,
+                trailing_row,
+                thread_count,
+            )?;
+            let step_outputs = self.forward_step_with_template(
+                &mut step_tmpl,
+                &step_embd,
+                n_past,
+                thread_count,
+                &cache,
+            )?;
+            let mut logits = step_outputs.logits;
+            for (token, logit) in logits.iter_mut().enumerate().skip(suppress_start) {
+                if token as i32 != self.config.codec_eos_id {
+                    *logit = f32::NEG_INFINITY;
+                }
+            }
+            let codebook_0_token = select_token(
+                &logits,
+                repetition_penalty,
+                temperature,
+                top_k,
+                top_p,
+                &recent_tokens,
+            )?;
+            if codebook_0_token == self.config.codec_eos_id {
+                break;
+            }
+            let codebook_tokens = self.predict_remaining_codebooks_kv_with_cache(
+                &step_outputs.hidden_state,
+                codebook_0_token,
+                thread_count,
+                temperature,
+                top_k,
+                top_p,
+                &code_pred_cache,
+            )?;
+            frames.push(SelectedCodecFrame {
+                codebook_0_token,
+                codebook_tokens,
+                hidden_state: step_outputs.hidden_state,
+                logits,
+            });
+            n_past += 1;
+
+            let generated_since_last = frames.len() - unsent_start;
+            if generated_since_last >= chunk_size {
+                flush_chunk(&frames, unsent_start, frames.len(), chunk_tx);
+                unsent_start = frames.len();
+            }
+        }
+
+        if frames.len() > unsent_start {
+            flush_chunk(&frames, unsent_start, frames.len(), chunk_tx);
+        }
+
+        Ok(CodecRollout { frames, first_frame_elapsed })
     }
 
     fn validate_codebook_frame(&self, codebook_tokens: &[i32]) -> Result<(), Qwen3TtsError> {
@@ -3702,6 +3919,16 @@ impl TalkerKvCache {
             );
         }
         let buffer = OwnedBuffer::alloc(ctx.as_ptr(), backends.primary_ptr())?;
+        unsafe {
+            let nbytes = sys::ggml_nbytes(k_cache[0].as_ptr());
+            let zeros = vec![0u8; nbytes];
+            for k in &k_cache {
+                sys::ggml_backend_tensor_set(k.as_ptr(), zeros.as_ptr().cast(), 0, nbytes);
+            }
+            for v in &v_cache {
+                sys::ggml_backend_tensor_set(v.as_ptr(), zeros.as_ptr().cast(), 0, nbytes);
+            }
+        }
         Ok(Self {
             _ctx: ctx,
             _backends: backends,

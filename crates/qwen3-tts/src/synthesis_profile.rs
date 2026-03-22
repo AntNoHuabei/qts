@@ -5,8 +5,10 @@ use std::time::Duration;
 
 /// Per-stage wall times for a single [`crate::Qwen3TtsEngine::synthesize_with_profile`] call.
 ///
-/// Stages are sequential; their sum approximates end-to-end latency (excluding Rust overhead
-/// outside the measured blocks, which is usually small).
+/// When pipelining is disabled, stages are sequential and their sum approximates
+/// end-to-end latency. With pipelining (`vocoder_chunk_size > 0`), `codec_rollout`
+/// and `vocoder_decode` overlap; use [`total()`] which accounts for this via
+/// `pipeline_overlap`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SynthesisStageTimings {
     /// Reference WAV → speaker embedding (zero if not used).
@@ -21,17 +23,29 @@ pub struct SynthesisStageTimings {
     pub vocoder_decode: Duration,
     /// Flatten codec rows + optional ICL prefix trim on PCM.
     pub post: Duration,
+    /// Time saved by overlapping transformer and vocoder (pipelining).
+    /// Zero when pipelining is disabled.
+    pub pipeline_overlap: Duration,
+    /// Time from synthesis start to first generated codec frame (includes
+    /// speaker encode + tokenize + prefill + first frame prediction).
+    /// This is the theoretical minimum latency for streaming playback.
+    pub first_frame_latency: Duration,
+    /// Number of PCM samples in the final output (after prefix trim).
+    pub generated_samples: usize,
+    /// Output sample rate (Hz).
+    pub sample_rate_hz: u32,
 }
 
 impl SynthesisStageTimings {
     #[must_use]
     pub fn total(&self) -> Duration {
-        self.speaker_encode
+        let sum = self.speaker_encode
             + self.tokenize
             + self.prefill_build
             + self.codec_rollout
             + self.vocoder_decode
-            + self.post
+            + self.post;
+        sum.saturating_sub(self.pipeline_overlap)
     }
 
     /// Arithmetic mean of each stage (wall clock). Empty slice returns `None`.
@@ -46,6 +60,10 @@ impl SynthesisStageTimings {
             let nanos = (sum / n).min(u128::from(u64::MAX)) as u64;
             Duration::from_nanos(nanos)
         };
+        let avg_usize = |field: fn(&Self) -> usize| {
+            let sum: u128 = samples.iter().map(|s| field(s) as u128).sum();
+            (sum / n) as usize
+        };
         Some(Self {
             speaker_encode: avg(|s| s.speaker_encode),
             tokenize: avg(|s| s.tokenize),
@@ -53,6 +71,10 @@ impl SynthesisStageTimings {
             codec_rollout: avg(|s| s.codec_rollout),
             vocoder_decode: avg(|s| s.vocoder_decode),
             post: avg(|s| s.post),
+            pipeline_overlap: avg(|s| s.pipeline_overlap),
+            first_frame_latency: avg(|s| s.first_frame_latency),
+            generated_samples: avg_usize(|s| s.generated_samples),
+            sample_rate_hz: samples[0].sample_rate_hz,
         })
     }
 
@@ -88,7 +110,37 @@ impl SynthesisStageTimings {
             };
             let _ = writeln!(out, "  {name:<28} {ms:>10.3} ms  ({pct:>5.1}%)");
         }
+        if !self.pipeline_overlap.is_zero() {
+            let overlap_ms = duration_ms(self.pipeline_overlap);
+            let _ = writeln!(
+                out,
+                "  {:<28} {:>+10.3} ms  (pipeline overlap)",
+                "pipeline_overlap", -overlap_ms
+            );
+        }
+        if !self.first_frame_latency.is_zero() {
+            let _ = writeln!(
+                out,
+                "  {:<28} {:>10.3} ms",
+                "first_frame_latency", duration_ms(self.first_frame_latency)
+            );
+        }
         let _ = writeln!(out, "  {:<28} {:>10.3} ms  (100.0%)", "total", total_ms);
+        if self.sample_rate_hz > 0 && self.generated_samples > 0 {
+            let audio_secs =
+                self.generated_samples as f64 / self.sample_rate_hz as f64;
+            let audio_ms = audio_secs * 1_000.0;
+            let rtf = if audio_secs > 0.0 {
+                total.as_secs_f64() / audio_secs
+            } else {
+                0.0
+            };
+            let _ = writeln!(
+                out,
+                "  {:<28} {:>10.3} ms  (RTF = {:.3}x)",
+                "audio duration", audio_ms, rtf
+            );
+        }
         out
     }
 }
