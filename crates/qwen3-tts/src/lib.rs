@@ -466,7 +466,7 @@ impl Qwen3TtsEngine {
             let n_codebooks = vocoder.config().n_codebooks as usize;
 
             let vocoder_handle = s.spawn(move || -> Result<(Vec<f32>, std::time::Duration), Qwen3TtsError> {
-                const OVERLAP_FRAMES: usize = 1;
+                const OVERLAP_FRAMES: usize = 3;
                 let standard_frames = OVERLAP_FRAMES + chunk_size;
 
                 let t_voc_start = Instant::now();

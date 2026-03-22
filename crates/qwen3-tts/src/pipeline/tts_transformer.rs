@@ -1048,6 +1048,7 @@ impl TtsTransformer {
         let trailing_len = trailing_text_hidden.len() / hidden_size;
 
         while frames.len() < max_frames {
+            let generated_frames = frames.len().saturating_sub(prompt_frames.len());
             let recent_tokens = frames
                 .iter()
                 .map(|frame| frame.codebook_0_token)
@@ -1061,8 +1062,9 @@ impl TtsTransformer {
                 break;
             }
 
-            let trailing_row = if frames.len() - 1 < trailing_len {
-                &trailing_text_hidden[(frames.len() - 1) * hidden_size..frames.len() * hidden_size]
+            let trailing_idx = generated_frames.saturating_sub(1);
+            let trailing_row = if trailing_idx < trailing_len {
+                &trailing_text_hidden[trailing_idx * hidden_size..(trailing_idx + 1) * hidden_size]
             } else {
                 tts_pad_embed
             };
@@ -1225,12 +1227,14 @@ impl TtsTransformer {
         let mut kv_writeback_dur = Duration::ZERO;
 
         while frames.len() < max_frames {
+            let generated_frames = frames.len().saturating_sub(prompt_frames.len());
             let recent_tokens = frames
                 .iter()
                 .map(|frame| frame.codebook_0_token)
                 .collect::<Vec<_>>();
-            let trailing_row = if frames.len() - 1 < trailing_len {
-                &trailing_text_hidden[(frames.len() - 1) * hidden_size..frames.len() * hidden_size]
+            let trailing_idx = generated_frames.saturating_sub(1);
+            let trailing_row = if trailing_idx < trailing_len {
+                &trailing_text_hidden[trailing_idx * hidden_size..(trailing_idx + 1) * hidden_size]
             } else {
                 tts_pad_embed
             };
@@ -1454,12 +1458,14 @@ impl TtsTransformer {
         let mut kv_writeback_dur = Duration::ZERO;
 
         while frames.len() < max_frames {
+            let generated_frames = frames.len().saturating_sub(prompt_frames.len());
             let recent_tokens = frames
                 .iter()
                 .map(|frame| frame.codebook_0_token)
                 .collect::<Vec<_>>();
-            let trailing_row = if frames.len() - 1 < trailing_len {
-                &trailing_text_hidden[(frames.len() - 1) * hidden_size..frames.len() * hidden_size]
+            let trailing_idx = generated_frames.saturating_sub(1);
+            let trailing_row = if trailing_idx < trailing_len {
+                &trailing_text_hidden[trailing_idx * hidden_size..(trailing_idx + 1) * hidden_size]
             } else {
                 tts_pad_embed
             };
@@ -3658,58 +3664,58 @@ impl TtsTransformer {
             }
         }
 
-        // Download K/V per layer and write back to cache (F32 -> F16).
+        // Batch all downloads first, then convert once, then batch uploads.
         let t_kv = Instant::now();
         let n_layers = self.config.n_layers as usize;
         let kv_elems =
             (self.config.head_dim as usize) * (self.config.n_key_value_heads as usize);
         let kv_f32_bytes = kv_elems * std::mem::size_of::<f32>();
         let kv_f16_bytes = kv_elems * std::mem::size_of::<u16>();
-        let mut kv_buf = vec![0.0f32; kv_elems];
-        let mut kv_f16 = vec![0u16; kv_elems];
+        let total_slots = n_layers * 2;
+        let mut kv_f32_all = vec![0.0f32; total_slots * kv_elems];
+        let mut kv_f16_all = vec![0u16; total_slots * kv_elems];
+
+        for layer_idx in 0..n_layers {
+            let k_slot = layer_idx * 2;
+            let v_slot = k_slot + 1;
+            unsafe {
+                sys::ggml_backend_tensor_get(
+                    tmpl.layer_k_out[layer_idx],
+                    kv_f32_all[k_slot * kv_elems..].as_mut_ptr().cast(),
+                    0,
+                    kv_f32_bytes,
+                );
+                sys::ggml_backend_tensor_get(
+                    tmpl.layer_v_out[layer_idx],
+                    kv_f32_all[v_slot * kv_elems..].as_mut_ptr().cast(),
+                    0,
+                    kv_f32_bytes,
+                );
+            }
+        }
+
+        for (dst, &src) in kv_f16_all.iter_mut().zip(kv_f32_all.iter()) {
+            *dst = unsafe { sys::ggml_fp32_to_fp16(src) };
+        }
 
         for layer_idx in 0..n_layers {
             let k_cache = cache.k_cache[layer_idx].as_ptr();
             let v_cache = cache.v_cache[layer_idx].as_ptr();
             let offset_k = n_past * unsafe { (*k_cache).nb[2] };
             let offset_v = n_past * unsafe { (*v_cache).nb[2] };
-
-            unsafe {
-                sys::ggml_backend_tensor_get(
-                    tmpl.layer_k_out[layer_idx],
-                    kv_buf.as_mut_ptr().cast(),
-                    0,
-                    kv_f32_bytes,
-                );
-            }
-            for (dst, &src) in kv_f16.iter_mut().zip(kv_buf.iter()) {
-                *dst = unsafe { sys::ggml_fp32_to_fp16(src) };
-            }
-            unsafe {
-                sys::ggml_backend_tensor_set(
-                    k_cache,
-                    kv_f16.as_ptr().cast(),
-                    offset_k,
-                    kv_f16_bytes,
-                );
-            }
-
-            unsafe {
-                sys::ggml_backend_tensor_get(
-                    tmpl.layer_v_out[layer_idx],
-                    kv_buf.as_mut_ptr().cast(),
-                    0,
-                    kv_f32_bytes,
-                );
-            }
-            for (dst, &src) in kv_f16.iter_mut().zip(kv_buf.iter()) {
-                *dst = unsafe { sys::ggml_fp32_to_fp16(src) };
-            }
+            let k_slot = layer_idx * 2;
+            let v_slot = k_slot + 1;
             unsafe {
                 sys::ggml_backend_tensor_set(
                     v_cache,
-                    kv_f16.as_ptr().cast(),
+                    kv_f16_all[v_slot * kv_elems..].as_ptr().cast(),
                     offset_v,
+                    kv_f16_bytes,
+                );
+                sys::ggml_backend_tensor_set(
+                    k_cache,
+                    kv_f16_all[k_slot * kv_elems..].as_ptr().cast(),
+                    offset_k,
                     kv_f16_bytes,
                 );
             }
@@ -3994,50 +4000,57 @@ impl TtsTransformer {
             }
         }
 
-        // Write K/V back to cache (F32 -> F16).
+        // Batch all downloads first, then convert once, then batch uploads.
         let n_layers = self.config.code_pred_layers as usize;
         let kv_elems = (self.config.head_dim as usize) * (self.config.n_key_value_heads as usize);
         let kv_f32_bytes = kv_elems * std::mem::size_of::<f32>();
         let kv_f16_bytes = kv_elems * std::mem::size_of::<u16>();
-        let mut kv_buf = vec![0.0f32; kv_elems];
-        let mut kv_f16 = vec![0u16; kv_elems];
+        let total_slots = n_layers * 2;
+        let mut kv_f32_all = vec![0.0f32; total_slots * kv_elems];
+        let mut kv_f16_all = vec![0u16; total_slots * kv_elems];
+
+        for layer_idx in 0..n_layers {
+            let k_slot = layer_idx * 2;
+            let v_slot = k_slot + 1;
+            unsafe {
+                sys::ggml_backend_tensor_get(
+                    tmpl.layer_k_out[layer_idx],
+                    kv_f32_all[k_slot * kv_elems..].as_mut_ptr().cast(),
+                    0,
+                    kv_f32_bytes,
+                );
+                sys::ggml_backend_tensor_get(
+                    tmpl.layer_v_out[layer_idx],
+                    kv_f32_all[v_slot * kv_elems..].as_mut_ptr().cast(),
+                    0,
+                    kv_f32_bytes,
+                );
+            }
+        }
+
+        for (dst, &src) in kv_f16_all.iter_mut().zip(kv_f32_all.iter()) {
+            *dst = unsafe { sys::ggml_fp32_to_fp16(src) };
+        }
 
         for layer_idx in 0..n_layers {
             let k_cache = cache.k_cache[layer_idx].as_ptr();
             let v_cache = cache.v_cache[layer_idx].as_ptr();
             let offset_k = n_past * unsafe { (*k_cache).nb[2] };
             let offset_v = n_past * unsafe { (*v_cache).nb[2] };
-            unsafe {
-                sys::ggml_backend_tensor_get(
-                    tmpl.layer_k_out[layer_idx],
-                    kv_buf.as_mut_ptr().cast(),
-                    0,
-                    kv_f32_bytes,
-                );
-            }
-            for (dst, &src) in kv_f16.iter_mut().zip(kv_buf.iter()) {
-                *dst = unsafe { sys::ggml_fp32_to_fp16(src) };
-            }
+            let k_slot = layer_idx * 2;
+            let v_slot = k_slot + 1;
             unsafe {
                 sys::ggml_backend_tensor_set(
-                    k_cache, kv_f16.as_ptr().cast(), offset_k, kv_f16_bytes,
+                    k_cache,
+                    kv_f16_all[k_slot * kv_elems..].as_ptr().cast(),
+                    offset_k,
+                    kv_f16_bytes,
                 );
-            }
-
-            unsafe {
-                sys::ggml_backend_tensor_get(
-                    tmpl.layer_v_out[layer_idx],
-                    kv_buf.as_mut_ptr().cast(),
-                    0,
-                    kv_f32_bytes,
-                );
-            }
-            for (dst, &src) in kv_f16.iter_mut().zip(kv_buf.iter()) {
-                *dst = unsafe { sys::ggml_fp32_to_fp16(src) };
-            }
-            unsafe {
                 sys::ggml_backend_tensor_set(
-                    v_cache, kv_f16.as_ptr().cast(), offset_v, kv_f16_bytes,
+                    v_cache,
+                    kv_f16_all[v_slot * kv_elems..].as_ptr().cast(),
+                    offset_v,
+                    kv_f16_bytes,
                 );
             }
         }
