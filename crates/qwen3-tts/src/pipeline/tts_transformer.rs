@@ -307,7 +307,7 @@ impl TtsTransformer {
         );
 
         let talker_backends = BackendSet::new()?;
-        let code_pred_backends = BackendSet::cpu_only()?;
+        let code_pred_backends = BackendSet::new()?;
         let talker = TalkerWeights::load(file, &cfg, talker_backends)?;
         let code_pred = CodePredWeights::load(file, &cfg, code_pred_backends)?;
 
