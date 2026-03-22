@@ -6,8 +6,8 @@ use std::ptr::NonNull;
 use ggml::sys;
 
 use super::backend::{
-    execute_graph, ggml_soft_max_ext_with_diag_mask_cache, graph_metadata_mem_size, slice_as_bytes,
-    slice_as_bytes_mut, BackendSet, OwnedBuffer, TensorDownload, TensorUpload,
+    execute_graph, ggml_soft_max_ext_with_diag_mask_cache, graph_metadata_mem_size, rerun_graph,
+    slice_as_bytes, slice_as_bytes_mut, BackendSet, OwnedBuffer, TensorDownload, TensorUpload,
 };
 use crate::{model::GgufFile, Qwen3TtsError};
 
@@ -133,6 +133,21 @@ impl Default for VocoderConfig {
     }
 }
 
+/// Pre-built vocoder graph that can be re-run for the same frame count without
+/// rebuilding or reallocating the ggml graph.
+pub struct VocoderGraphTemplate {
+    _ctx: ComputeContext,
+    graph: NonNull<sys::ggml_cgraph>,
+    cb_tensors: Vec<NonNull<sys::ggml_tensor>>,
+    positions: NonNull<sys::ggml_tensor>,
+    attn_mask: Option<(*mut sys::ggml_tensor, Vec<f32>)>,
+    output: *mut sys::ggml_tensor,
+    n_frames: usize,
+    n_samples: usize,
+    pos_values: Vec<i32>,
+    allocated: bool,
+}
+
 pub struct Vocoder {
     config: VocoderConfig,
     weights: VocoderWeights,
@@ -181,12 +196,17 @@ impl Vocoder {
         if n_frames == 0 {
             return Ok(Vec::new());
         }
-        if codes.len() != n_frames * self.config.n_codebooks as usize {
-            return Err(Qwen3TtsError::InvalidInput(
-                "vocoder codes shape is invalid".into(),
-            ));
-        }
+        let mut tmpl = self.build_decode_template(n_frames)?;
+        self.decode_with_template(&mut tmpl, codes, thread_count)
+    }
 
+    /// Build a reusable vocoder graph for a fixed `n_frames`. The returned
+    /// template can be executed repeatedly via [`decode_with_template`] without
+    /// rebuilding or reallocating the ggml graph.
+    pub fn build_decode_template(
+        &self,
+        n_frames: usize,
+    ) -> Result<VocoderGraphTemplate, Qwen3TtsError> {
         let graph_nodes = 32_768;
         let ctx = ComputeContext::new_graph(graph_nodes)?;
         let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
@@ -215,16 +235,6 @@ impl Vocoder {
             Qwen3TtsError::InvalidInput("failed to allocate positions tensor".into())
         })?;
         let pos_values = (0..n_frames as i32).collect::<Vec<_>>();
-
-        let mut cb_values = Vec::with_capacity(self.config.n_codebooks as usize);
-
-        for cb in 0..self.config.n_codebooks as usize {
-            let mut cb_codes = vec![0i32; n_frames];
-            for frame in 0..n_frames {
-                cb_codes[frame] = codes[frame * self.config.n_codebooks as usize + cb];
-            }
-            cb_values.push(cb_codes);
-        }
 
         let first_emb = unsafe {
             sys::ggml_get_rows(
@@ -442,35 +452,93 @@ impl Vocoder {
         }
 
         let n_samples = unsafe { (*cur).ne[0] as usize };
-        let mut audio = vec![0.0f32; n_samples];
-        let mut uploads = Vec::with_capacity(cb_tensors.len() + 2);
+
+        Ok(VocoderGraphTemplate {
+            _ctx: ctx,
+            graph,
+            cb_tensors,
+            positions,
+            attn_mask: attn_softmax_mask,
+            output: cur,
+            n_frames,
+            n_samples,
+            pos_values,
+            allocated: false,
+        })
+    }
+
+    /// Execute a pre-built vocoder graph template with new codebook data.
+    /// On the first call the graph is allocated; subsequent calls reuse
+    /// the existing allocation.
+    pub fn decode_with_template(
+        &self,
+        tmpl: &mut VocoderGraphTemplate,
+        codes: &[i32],
+        thread_count: usize,
+    ) -> Result<Vec<f32>, Qwen3TtsError> {
+        let n_codebooks = self.config.n_codebooks as usize;
+        let n_frames = tmpl.n_frames;
+        if codes.len() != n_frames * n_codebooks {
+            return Err(Qwen3TtsError::InvalidInput(
+                "vocoder codes shape is invalid".into(),
+            ));
+        }
+
+        let mut cb_values = Vec::with_capacity(n_codebooks);
+        for cb in 0..n_codebooks {
+            let mut cb_codes = vec![0i32; n_frames];
+            for frame in 0..n_frames {
+                cb_codes[frame] = codes[frame * n_codebooks + cb];
+            }
+            cb_values.push(cb_codes);
+        }
+
+        let mut audio = vec![0.0f32; tmpl.n_samples];
+        let mut uploads = Vec::with_capacity(tmpl.cb_tensors.len() + 2);
         uploads.push(TensorUpload {
-            tensor: positions.as_ptr(),
-            bytes: slice_as_bytes(pos_values.as_slice()),
+            tensor: tmpl.positions.as_ptr(),
+            bytes: slice_as_bytes(tmpl.pos_values.as_slice()),
         });
-        for (tensor, values) in cb_tensors.iter().zip(cb_values.iter()) {
+        for (tensor, values) in tmpl.cb_tensors.iter().zip(cb_values.iter()) {
             uploads.push(TensorUpload {
                 tensor: tensor.as_ptr(),
                 bytes: slice_as_bytes(values.as_slice()),
             });
         }
-        if let Some((t, data)) = &attn_softmax_mask {
+        if let Some((t, data)) = &tmpl.attn_mask {
             uploads.push(TensorUpload {
                 tensor: *t,
                 bytes: slice_as_bytes(data.as_slice()),
             });
         }
-        execute_graph(
-            &self.weights._backends,
-            graph,
-            uploads.as_slice(),
-            &mut [TensorDownload {
-                tensor: cur,
-                bytes: slice_as_bytes_mut(audio.as_mut_slice()),
-            }],
-            thread_count,
-            "vocoder graph execution failed",
-        )?;
+
+        if !tmpl.allocated {
+            execute_graph(
+                &self.weights._backends,
+                tmpl.graph,
+                uploads.as_slice(),
+                &mut [TensorDownload {
+                    tensor: tmpl.output,
+                    bytes: slice_as_bytes_mut(audio.as_mut_slice()),
+                }],
+                thread_count,
+                "vocoder graph execution failed",
+            )?;
+            tmpl.allocated = true;
+        } else {
+            rerun_graph(
+                &self.weights._backends,
+                tmpl.graph,
+                uploads.as_slice(),
+                &mut [TensorDownload {
+                    tensor: tmpl.output,
+                    bytes: slice_as_bytes_mut(audio.as_mut_slice()),
+                }],
+                thread_count,
+                "vocoder graph re-run failed",
+            )?;
+        }
+
         Ok(audio)
     }
 

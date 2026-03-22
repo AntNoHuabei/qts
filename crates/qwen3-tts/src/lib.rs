@@ -20,7 +20,7 @@ pub use pipeline::tts_transformer::{
     CodecRollout, PrefillConditioning, PrefillForwardOutputs, PreparedPrefillInputs,
     SelectedCodecFrame, TtsTransformer, TtsTransformerConfig, VocoderChunk,
 };
-pub use pipeline::vocoder::{Vocoder, VocoderConfig};
+pub use pipeline::vocoder::{Vocoder, VocoderConfig, VocoderGraphTemplate};
 pub use synthesis_profile::SynthesisStageTimings;
 pub use voice_clone_prompt::{
     TensorF32, TensorI32, VoiceClonePromptV2, VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
@@ -474,11 +474,13 @@ impl Qwen3TtsEngine {
 
             let vocoder_handle = s.spawn(move || -> Result<(Vec<f32>, std::time::Duration), Qwen3TtsError> {
                 const OVERLAP_FRAMES: usize = 1;
+                let standard_frames = OVERLAP_FRAMES + chunk_size;
 
                 let t_voc_start = Instant::now();
                 let mut all_pcm = Vec::<f32>::new();
                 let mut prev_codes: Vec<i32> = Vec::new();
                 let mut prev_n_frames: usize = 0;
+                let mut template: Option<VocoderGraphTemplate> = None;
 
                 if let Some(prompt_chunk) = prompt_chunk {
                     let audio = vocoder.decode(
@@ -494,19 +496,28 @@ impl Qwen3TtsEngine {
                 while let Ok(chunk) = chunk_rx.recv() {
                     let ctx_frames = OVERLAP_FRAMES.min(prev_n_frames);
 
-                    let audio = if ctx_frames > 0 {
+                    let mut combined_buf = Vec::new();
+                    let (codes_slice, decode_frames) = if ctx_frames > 0 {
+                        combined_buf.reserve(ctx_frames * n_codebooks + chunk.codes.len());
                         let ctx_start = prev_codes.len() - ctx_frames * n_codebooks;
-                        let mut combined =
-                            Vec::with_capacity(ctx_frames * n_codebooks + chunk.codes.len());
-                        combined.extend_from_slice(&prev_codes[ctx_start..]);
-                        combined.extend_from_slice(&chunk.codes);
-                        vocoder.decode(
-                            &combined,
-                            ctx_frames + chunk.n_frames,
+                        combined_buf.extend_from_slice(&prev_codes[ctx_start..]);
+                        combined_buf.extend_from_slice(&chunk.codes);
+                        (combined_buf.as_slice(), ctx_frames + chunk.n_frames)
+                    } else {
+                        (chunk.codes.as_slice(), chunk.n_frames)
+                    };
+
+                    let audio = if decode_frames == standard_frames {
+                        if template.is_none() {
+                            template = Some(vocoder.build_decode_template(standard_frames)?);
+                        }
+                        vocoder.decode_with_template(
+                            template.as_mut().unwrap(),
+                            codes_slice,
                             vocoder_thread_count,
                         )?
                     } else {
-                        vocoder.decode(&chunk.codes, chunk.n_frames, vocoder_thread_count)?
+                        vocoder.decode(codes_slice, decode_frames, vocoder_thread_count)?
                     };
 
                     if ctx_frames > 0 && !all_pcm.is_empty() {
