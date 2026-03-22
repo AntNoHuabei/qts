@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Command-line tools for Qwen3 TTS synthesis and speaker embedding export."
+description = "Command-line tools for Qwen3 TTS synthesis and WAV output."
 
 [features]
 default = ["metal", "blas", "vulkan"]

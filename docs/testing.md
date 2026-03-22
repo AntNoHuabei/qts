@@ -76,12 +76,14 @@ Optional: `--out target/profile-run1.wav` writes WAV from the first run only. Th
 
 ## CLI smoke checks
 
-With a valid model directory and a small reference WAV:
+With a valid model directory, smoke-test loading a `speaker.bin` produced by the Python exporter (upstream-aligned embedding):
 
 ```bash
-cargo run -p qwen3-tts-cli -- speaker-bin \
-  --model-dir "$QWEN3_TTS_MODEL_DIR" \
-  --wav testdata/hello.wav \
+uv sync
+uv run export-speaker-bin \
+  --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --ref-audio testdata/hello.wav \
+  --ref-text "hello" \
   --out target/hello.speaker.bin
 
 cargo run -p qwen3-tts-cli -- synthesize \

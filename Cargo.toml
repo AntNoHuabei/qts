@@ -19,3 +19,9 @@ ggml = { path = "crates/ggml" }
 thiserror = "2"
 hf-hub = "0.4"
 rand = "0.9"
+
+[profile.release]
+debug = "line-tables-only"
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -141,14 +141,6 @@ impl Qwen3TtsEngine {
         self.transformer.config().hidden_size as usize
     }
 
-    pub fn encode_reference_speaker_bin(&self, wav_bytes: &[u8]) -> Result<Vec<u8>, Qwen3TtsError> {
-        let embedding = self.encode_reference_speaker(wav_bytes)?;
-        Ok(embedding
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>())
-    }
-
     pub fn decode_speaker_embedding_bin(
         &self,
         bin_bytes: &[u8],

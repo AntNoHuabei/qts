@@ -21,7 +21,6 @@ fn main() -> Result<()> {
 
 fn run_speaker_bin(args: Vec<String>) -> Result<()> {
     let mut model_dir = default_model_dir()?;
-    let mut wav_path = None;
     let mut prompt_path = None;
     let mut out_path = None;
 
@@ -30,9 +29,6 @@ fn run_speaker_bin(args: Vec<String>) -> Result<()> {
         match args[idx].as_str() {
             "--model-dir" => {
                 model_dir = PathBuf::from(value_arg(&args, &mut idx, "--model-dir")?);
-            }
-            "--wav" => {
-                wav_path = Some(PathBuf::from(value_arg(&args, &mut idx, "--wav")?));
             }
             "--voice-clone-prompt" => {
                 prompt_path = Some(PathBuf::from(value_arg(
@@ -49,28 +45,16 @@ fn run_speaker_bin(args: Vec<String>) -> Result<()> {
     }
 
     let out_path = out_path.context("--out is required")?;
-    if wav_path.is_some() == prompt_path.is_some() {
-        bail!("exactly one of --wav or --voice-clone-prompt is required");
-    }
+    let prompt_path = prompt_path.context("--voice-clone-prompt is required")?;
     let engine = load_engine(&model_dir)?;
-    let speaker_bin = match (wav_path, prompt_path) {
-        (Some(wav_path), None) => {
-            let wav_bytes = fs::read(&wav_path)
-                .with_context(|| format!("failed to read {}", wav_path.display()))?;
-            engine.encode_reference_speaker_bin(&wav_bytes)?
-        }
-        (None, Some(prompt_path)) => {
-            let prompt_bytes = fs::read(&prompt_path)
-                .with_context(|| format!("failed to read {}", prompt_path.display()))?;
-            let prompt = engine.decode_voice_clone_prompt(&prompt_bytes)?;
-            prompt
-                .speaker_embedding()
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect::<Vec<_>>()
-        }
-        _ => unreachable!("validated exclusive prompt input"),
-    };
+    let prompt_bytes = fs::read(&prompt_path)
+        .with_context(|| format!("failed to read {}", prompt_path.display()))?;
+    let prompt = engine.decode_voice_clone_prompt(&prompt_bytes)?;
+    let speaker_bin = prompt
+        .speaker_embedding()
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
     fs::write(&out_path, &speaker_bin)
         .with_context(|| format!("failed to write {}", out_path.display()))?;
 
@@ -459,6 +443,6 @@ where
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  cargo run -p qwen3-tts-cli -- synthesize --text TEXT --out OUT.wav [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N]\n  cargo run -p qwen3-tts-cli -- profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] (same tuning flags as synthesize)\n  cargo run -p qwen3-tts-cli -- speaker-bin (--wav REF.wav | --voice-clone-prompt prompt.pb) --out speaker.bin [--model-dir DIR]\n\nIf --frames is omitted, synthesize/profile derive a text-length-based max frame budget.\n\nOr from the repo root (see .cargo/config.toml): cargo xtask bench … / cargo xtask profile …"
+        "usage:\n  cargo run -p qwen3-tts-cli -- synthesize --text TEXT --out OUT.wav [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N]\n  cargo run -p qwen3-tts-cli -- profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] (same tuning flags as synthesize)\n  cargo run -p qwen3-tts-cli -- speaker-bin --voice-clone-prompt prompt.pb --out speaker.bin [--model-dir DIR]\n\nIf --frames is omitted, synthesize/profile derive a text-length-based max frame budget.\n\nOr from the repo root (see .cargo/config.toml): cargo xtask bench … / cargo xtask profile …"
     );
 }

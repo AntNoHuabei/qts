@@ -9,7 +9,7 @@ Rust workspace for on-device **Qwen3 TTS** using [ggml-org/ggml](https://github.
 | `ggml-sys` | CMake + bindgen FFI to `vendor/ggml` ([ggml](https://github.com/ggml-org/ggml) Git submodule) |
 | `ggml` | Thin wrappers + `sys` re-export |
 | `qwen3-tts` | Pure Rust `rlib` for GGUF loading, speaker encoding, and synthesis |
-| `qwen3-tts-cli` | Command-line interface for generating `speaker.bin` and WAV output |
+| `qwen3-tts-cli` | Command-line interface for synthesis, profiling, and optional `speaker.bin` extraction from voice-clone prompts |
 
 ## Prerequisites
 
@@ -135,18 +135,13 @@ cargo run -p qwen3-tts-cli -- speaker-bin \
   --out target/hello.from-prompt.speaker.bin
 ```
 
-The CLI can also materialize that embedding as a standalone `speaker.bin` so it can be cached and reused:
+You can reuse a `speaker.bin` from `export-speaker-bin` (above) or from `speaker-bin` on a prompt:
 
 ```bash
-cargo run -p qwen3-tts-cli -- speaker-bin \
-  --model-dir models/volko76-q4k-q8 \
-  --wav testdata/hello.wav \
-  --out target/hello.speaker.bin
-
 cargo run -p qwen3-tts-cli -- synthesize \
   --model-dir models/volko76-q4k-q8 \
   --text "hello" \
-  --speaker-bin target/hello.speaker.bin \
+  --speaker-bin target/hello.python.speaker.bin \
   --out target/hello-from-speaker-bin.wav
 ```
 
