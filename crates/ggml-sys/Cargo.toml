@@ -13,7 +13,7 @@ build = "build.rs"
 name = "ggml_sys"
 
 [features]
-default = []
+default = ["metal", "blas", "vulkan"]
 # Map to ggml CMake options (see VERSIONS.md). Enable only backends you need.
 metal = []
 cuda = []

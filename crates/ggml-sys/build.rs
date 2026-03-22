@@ -39,22 +39,21 @@ fn main() {
         cfg.define("GGML_NATIVE", "OFF");
     }
 
-    // ggml defaults Metal + BLAS on Apple; pin CPU-only unless features ask for them.
-    if target.contains("apple") {
-        if feature_enabled("metal") {
-            cfg.define("GGML_METAL", "ON");
-            cfg.define("GGML_METAL_EMBED_LIBRARY", "ON");
-        } else {
-            cfg.define("GGML_METAL", "OFF");
-        }
-        if feature_enabled("blas") {
-            cfg.define("GGML_BLAS", "ON");
-        } else {
-            cfg.define("GGML_BLAS", "OFF");
-            cfg.define("GGML_ACCELERATE", "OFF");
-        }
-    } else if feature_enabled("blas") {
+    // Metal is Apple-only; silently skip on other targets even if the feature is enabled.
+    if feature_enabled("metal") && target.contains("apple") {
+        cfg.define("GGML_METAL", "ON");
+        cfg.define("GGML_METAL_EMBED_LIBRARY", "ON");
+    } else {
+        cfg.define("GGML_METAL", "OFF");
+    }
+
+    if feature_enabled("blas") {
         cfg.define("GGML_BLAS", "ON");
+        if target.contains("apple") {
+            cfg.define("GGML_ACCELERATE", "ON");
+        }
+    } else {
+        cfg.define("GGML_BLAS", "OFF");
     }
 
     map_feature_cmake(&mut cfg, "cuda", "GGML_CUDA");
@@ -141,6 +140,9 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=MetalKit");
         println!("cargo:rustc-link-lib=framework=Foundation");
     }
+    if feature_enabled("blas") && target.contains("apple") {
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+    }
 
     if target.contains("apple") {
         println!("cargo:rustc-link-lib=c++");
@@ -175,7 +177,7 @@ fn map_feature_cmake(cfg: &mut cmake::Config, feature: &str, cmake_opt: &str) {
 
 fn validate_features(target: &str) {
     if feature_enabled("metal") && !target.contains("apple") {
-        panic!("ggml-sys: `metal` feature is only supported on Apple targets (got {target})");
+        println!("cargo:warning=ggml-sys: `metal` feature ignored on non-Apple target ({target})");
     }
     if feature_enabled("cuda") && target.contains("apple") {
         panic!("ggml-sys: `cuda` feature is not supported on Apple targets");

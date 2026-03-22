@@ -428,6 +428,12 @@ impl Qwen3TtsEngine {
     /// frames the codebook tokens are sent to a vocoder worker that decodes them in
     /// parallel on CPU. When the transformer finishes the last chunk is flushed and
     /// all audio is concatenated.
+    ///
+    /// To avoid audible clicks at chunk boundaries the vocoder thread uses
+    /// **overlap-and-add**: each chunk (after the first) is decoded with a few
+    /// extra context frames from the previous chunk prepended, then the
+    /// overlapping audio region is linearly crossfaded with the previous
+    /// chunk's tail.
     fn synthesize_pipelined(
         &self,
         req: &SynthesizeRequest,
@@ -443,18 +449,10 @@ impl Qwen3TtsEngine {
 
         let chunk_size = req.vocoder_chunk_size;
         let thread_count = req.thread_count;
-        // Give the vocoder fewer threads to reduce contention with the
-        // transformer's code predictor (both use CPU). On systems with many
-        // cores (like Apple Silicon) this is a reasonable compromise.
         let vocoder_thread_count = (thread_count / 2).max(1);
 
-        // Bounded channel — at most 2 chunks buffered so the vocoder thread
-        // doesn't fall too far behind (back-pressure).
         let (chunk_tx, chunk_rx) = mpsc::sync_channel::<VocoderChunk>(2);
 
-        // Prompt frames are decoded by the vocoder as part of the first chunk
-        // that includes them. We feed them separately so the streaming rollout
-        // only emits generated (non-prompt) frames.
         let prompt_chunk = if prefix_frame_count > 0 {
             let codes = prompt_frames
                 .iter()
@@ -472,10 +470,15 @@ impl Qwen3TtsEngine {
 
         std::thread::scope(|s| {
             let vocoder = &self.vocoder;
+            let n_codebooks = vocoder.config().n_codebooks as usize;
 
             let vocoder_handle = s.spawn(move || -> Result<(Vec<f32>, std::time::Duration), Qwen3TtsError> {
+                const OVERLAP_FRAMES: usize = 1;
+
                 let t_voc_start = Instant::now();
                 let mut all_pcm = Vec::<f32>::new();
+                let mut prev_codes: Vec<i32> = Vec::new();
+                let mut prev_n_frames: usize = 0;
 
                 if let Some(prompt_chunk) = prompt_chunk {
                     let audio = vocoder.decode(
@@ -484,11 +487,45 @@ impl Qwen3TtsEngine {
                         vocoder_thread_count,
                     )?;
                     all_pcm.extend_from_slice(&audio);
+                    prev_n_frames = prompt_chunk.n_frames;
+                    prev_codes = prompt_chunk.codes;
                 }
 
                 while let Ok(chunk) = chunk_rx.recv() {
-                    let audio = vocoder.decode(&chunk.codes, chunk.n_frames, vocoder_thread_count)?;
-                    all_pcm.extend_from_slice(&audio);
+                    let ctx_frames = OVERLAP_FRAMES.min(prev_n_frames);
+
+                    let audio = if ctx_frames > 0 {
+                        let ctx_start = prev_codes.len() - ctx_frames * n_codebooks;
+                        let mut combined =
+                            Vec::with_capacity(ctx_frames * n_codebooks + chunk.codes.len());
+                        combined.extend_from_slice(&prev_codes[ctx_start..]);
+                        combined.extend_from_slice(&chunk.codes);
+                        vocoder.decode(
+                            &combined,
+                            ctx_frames + chunk.n_frames,
+                            vocoder_thread_count,
+                        )?
+                    } else {
+                        vocoder.decode(&chunk.codes, chunk.n_frames, vocoder_thread_count)?
+                    };
+
+                    if ctx_frames > 0 && !all_pcm.is_empty() {
+                        let total_frames = ctx_frames + chunk.n_frames;
+                        let overlap_samples =
+                            (audio.len() * ctx_frames / total_frames).min(all_pcm.len());
+                        let start = all_pcm.len() - overlap_samples;
+                        for i in 0..overlap_samples {
+                            let t = (i as f32 + 0.5) / overlap_samples as f32;
+                            all_pcm[start + i] =
+                                all_pcm[start + i] * (1.0 - t) + audio[i] * t;
+                        }
+                        all_pcm.extend_from_slice(&audio[overlap_samples..]);
+                    } else {
+                        all_pcm.extend_from_slice(&audio);
+                    }
+
+                    prev_n_frames = chunk.n_frames;
+                    prev_codes = chunk.codes;
                 }
 
                 Ok((all_pcm, t_voc_start.elapsed()))

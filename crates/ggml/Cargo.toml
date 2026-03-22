@@ -8,9 +8,10 @@ repository.workspace = true
 description = "Thin safe wrappers over ggml-sys for Qwen TTS Native."
 
 [features]
-default = []
+default = ["metal", "blas", "vulkan"]
 metal = ["ggml-sys/metal"]
 vulkan = ["ggml-sys/vulkan"]
+blas = ["ggml-sys/blas"]
 native = ["ggml-sys/native"]
 
 [dependencies]

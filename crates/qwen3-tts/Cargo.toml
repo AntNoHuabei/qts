@@ -8,11 +8,12 @@ repository.workspace = true
 description = "Qwen3 TTS inference (GGUF + GGML); Rust API for host apps and gdext."
 
 [features]
-default = []
+default = ["metal", "blas", "vulkan"]
 # Optional Hugging Face cache download helpers (URLs in docs/models.md).
 hf = ["dep:hf-hub"]
 metal = ["ggml/metal"]
 vulkan = ["ggml/vulkan"]
+blas = ["ggml/blas"]
 native = ["ggml/native"]
 
 [dependencies]
