@@ -9,7 +9,10 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use hound::{SampleFormat, WavSpec, WavWriter};
-use qwen3_tts::{Qwen3TtsEngine, SynthesizeRequest};
+use qwen3_tts::{
+    PrefillConditioning, Qwen3TtsEngine, SynthesizeRequest, TensorF32, TensorI32,
+    VoiceClonePromptV2, VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+};
 
 fn require_model_dir() -> PathBuf {
     std::env::var("QWEN3_TTS_MODEL_DIR")
@@ -86,11 +89,27 @@ fn integration_reference_wav_changes_conditioning() {
     let zero_speaker = vec![0.0f32; hidden_size];
     let baseline_prefill = engine
         .transformer()
-        .build_prefill_inputs(&tokens, Some(&zero_speaker), 2050, 1)
+        .build_prefill_inputs(
+            PrefillConditioning {
+                text_tokens: &tokens,
+                speaker_embd: Some(&zero_speaker),
+                ref_codebook_0: &[],
+                language_id: 2050,
+            },
+            1,
+        )
         .expect("baseline prefill");
     let conditioned_prefill = engine
         .transformer()
-        .build_prefill_inputs(&tokens, Some(&speaker), 2050, 1)
+        .build_prefill_inputs(
+            PrefillConditioning {
+                text_tokens: &tokens,
+                speaker_embd: Some(&speaker),
+                ref_codebook_0: &[],
+                language_id: 2050,
+            },
+            1,
+        )
         .expect("conditioned prefill");
     assert_ne!(
         baseline_prefill.prefill_embd,
@@ -124,4 +143,80 @@ fn integration_reference_wav_changes_conditioning() {
     );
     assert!(!baseline_audio.pcm_f32.is_empty());
     assert!(!conditioned_audio.pcm_f32.is_empty());
+}
+
+#[test]
+#[ignore = "set QWEN3_TTS_MODEL_DIR to run"]
+fn integration_voice_clone_prompt_xvector_mode() {
+    let dir = require_model_dir();
+    let engine = Qwen3TtsEngine::from_model_dir(&dir).expect("load");
+    let reference_wav = synthetic_voice_like_wav(16_000, 1.25);
+    let speaker = engine
+        .encode_reference_speaker(&reference_wav)
+        .expect("encode reference speaker");
+    let prompt = VoiceClonePromptV2 {
+        schema_version: VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+        source: "integration-test".into(),
+        model_id: "local".into(),
+        speaker_encoder_sample_rate_hz: 16_000,
+        x_vector_only_mode: true,
+        icl_mode: false,
+        ref_text: String::new(),
+        ref_code: None,
+        ref_spk_embedding: Some(TensorF32 {
+            shape: vec![speaker.len() as u32],
+            values: speaker,
+        }),
+    };
+    let req = SynthesizeRequest {
+        text: "hello".into(),
+        max_audio_frames: 4,
+        ..Default::default()
+    };
+    let result = engine
+        .synthesize_with_voice_clone_prompt(&req, &prompt)
+        .expect("synthesize xvector prompt");
+    assert_eq!(result.sample_rate_hz, 24_000);
+    assert!(result.generated_frames > 0);
+    assert!(!result.pcm_f32.is_empty());
+}
+
+#[test]
+#[ignore = "set QWEN3_TTS_MODEL_DIR to run"]
+fn integration_voice_clone_prompt_icl_mode() {
+    let dir = require_model_dir();
+    let engine = Qwen3TtsEngine::from_model_dir(&dir).expect("load");
+    let reference_wav = synthetic_voice_like_wav(16_000, 1.25);
+    let speaker = engine
+        .encode_reference_speaker(&reference_wav)
+        .expect("encode reference speaker");
+    let n_codebooks = engine.transformer().config().n_codebooks as usize;
+    let prompt = VoiceClonePromptV2 {
+        schema_version: VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+        source: "integration-test".into(),
+        model_id: "local".into(),
+        speaker_encoder_sample_rate_hz: 16_000,
+        x_vector_only_mode: false,
+        icl_mode: true,
+        ref_text: "hello".into(),
+        ref_code: Some(TensorI32 {
+            shape: vec![2, n_codebooks as u32],
+            values: vec![0; 2 * n_codebooks],
+        }),
+        ref_spk_embedding: Some(TensorF32 {
+            shape: vec![speaker.len() as u32],
+            values: speaker,
+        }),
+    };
+    let req = SynthesizeRequest {
+        text: "world".into(),
+        max_audio_frames: 4,
+        ..Default::default()
+    };
+    let result = engine
+        .synthesize_with_voice_clone_prompt(&req, &prompt)
+        .expect("synthesize icl prompt");
+    assert_eq!(result.sample_rate_hz, 24_000);
+    assert!(result.generated_frames > 0);
+    assert!(!result.pcm_f32.is_empty());
 }

@@ -1,18 +1,14 @@
-"""Export a stage-1 voice clone prompt using upstream qwen-tts.
-
-This module intentionally preserves more fields than qwen3-tts-native uses today.
-Stage 1 only consumes `ref_spk_embedding`, but `ref_code`, `ref_text`, and ICL flags
-are written too so stage 2 can reuse the same artifact.
-"""
+"""Export a stage-2 protobuf voice clone prompt using upstream qwen-tts."""
 
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "qwen3_tts.voice_clone_prompt.v1"
+from qwen3_tts_native_scripts import voice_clone_prompt_pb2
+
+SCHEMA_VERSION = 2
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,7 +21,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Reference audio path/URL/base64/path-like accepted by qwen-tts.",
     )
-    parser.add_argument("--out", required=True, help="Output JSON path.")
+    parser.add_argument("--out", required=True, help="Output protobuf .pb path.")
     parser.add_argument(
         "--ref-text",
         default=None,
@@ -45,17 +41,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def tensor_payload(tensor: Any) -> dict[str, Any]:
+def tensor_i32_payload(tensor: Any) -> voice_clone_prompt_pb2.TensorI32:
     cpu = tensor.detach().cpu()
-    return {
-        "shape": list(cpu.shape),
-        "values": [int(value) for value in cpu.reshape(-1).tolist()],
-    }
+    return voice_clone_prompt_pb2.TensorI32(
+        shape=list(cpu.shape),
+        values=[int(value) for value in cpu.reshape(-1).tolist()],
+    )
 
 
-def tensor_f32_list(tensor: Any) -> list[float]:
+def tensor_f32_payload(tensor: Any) -> voice_clone_prompt_pb2.TensorF32:
     cpu = tensor.detach().cpu().reshape(-1)
-    return [float(value) for value in cpu.tolist()]
+    return voice_clone_prompt_pb2.TensorF32(
+        shape=list(cpu.shape),
+        values=[float(value) for value in cpu.tolist()],
+    )
 
 
 def build_prompt_payload(
@@ -66,7 +65,7 @@ def build_prompt_payload(
     x_vector_only_mode: bool,
     device: str,
     dtype: str,
-) -> dict[str, Any]:
+) -> voice_clone_prompt_pb2.VoiceClonePromptV2:
     if not x_vector_only_mode and not ref_text:
         raise SystemExit("--ref-text is required unless --x-vector-only-mode is set")
 
@@ -91,19 +90,21 @@ def build_prompt_payload(
         raise SystemExit(f"expected exactly one prompt item, got {len(prompt_items)}")
 
     item = prompt_items[0]
-    return {
-        "schema": SCHEMA,
-        "source": "QwenLM/Qwen3-TTS create_voice_clone_prompt",
-        "model_id": model_name_or_path,
-        "speaker_encoder_sample_rate_hz": getattr(
-            model.model, "speaker_encoder_sample_rate", None
+    prompt = voice_clone_prompt_pb2.VoiceClonePromptV2(
+        schema_version=SCHEMA_VERSION,
+        source="QwenLM/Qwen3-TTS create_voice_clone_prompt",
+        model_id=model_name_or_path,
+        speaker_encoder_sample_rate_hz=int(
+            getattr(model.model, "speaker_encoder_sample_rate", 0) or 0
         ),
-        "x_vector_only_mode": bool(item.x_vector_only_mode),
-        "icl_mode": bool(item.icl_mode),
-        "ref_text": item.ref_text,
-        "ref_code": None if item.ref_code is None else tensor_payload(item.ref_code),
-        "ref_spk_embedding": tensor_f32_list(item.ref_spk_embedding),
-    }
+        x_vector_only_mode=bool(item.x_vector_only_mode),
+        icl_mode=bool(item.icl_mode),
+        ref_text=item.ref_text or "",
+        ref_spk_embedding=tensor_f32_payload(item.ref_spk_embedding),
+    )
+    if item.ref_code is not None:
+        prompt.ref_code.CopyFrom(tensor_i32_payload(item.ref_code))
+    return prompt
 
 
 def resolve_dtype(name: str) -> Any:
@@ -138,11 +139,11 @@ def main() -> None:
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    out_path.write_bytes(payload.SerializeToString())
     print(
         f"wrote voice clone prompt: path={out_path} "
-        f"embedding_dim={len(payload['ref_spk_embedding'])} "
-        f"has_ref_code={payload['ref_code'] is not None}"
+        f"embedding_dim={len(payload.ref_spk_embedding.values)} "
+        f"has_ref_code={payload.HasField('ref_code')}"
     )
 
 

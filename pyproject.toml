@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Python helper scripts for qwen3-tts-native."
 requires-python = ">=3.12"
 dependencies = [
+    "grpcio-tools",
+    "protobuf",
     "qwen-tts",
 ]
 scripts = { export-voice-clone-prompt = "qwen3_tts_native_scripts.export_voice_clone_prompt:main", export-speaker-bin = "qwen3_tts_native_scripts.export_speaker_bin:main" }

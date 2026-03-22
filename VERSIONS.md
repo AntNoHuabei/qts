@@ -60,12 +60,12 @@ cargo build -p ggml-sys
 | Feature | Effect |
 |---------|--------|
 | `hf` | Hugging Face download helpers. |
-| `metal` | Prefer Metal at runtime on Apple builds; fall back to CPU if Metal init fails. |
-| `vulkan` | Prefer Vulkan at runtime on non-Apple builds; fall back to CPU if Vulkan init fails. |
+| `metal` | Enables Metal in GGML. Runtime: with `QWEN3_TTS_BACKEND=auto` (default), Apple builds prefer Metal then CPU; set `QWEN3_TTS_BACKEND=metal` to require Metal. |
+| `vulkan` | Enables Vulkan in GGML on all targets. Runtime: `auto` uses Vulkan only on **non-Apple** (then CPU fallback). On **Apple**, set **`QWEN3_TTS_BACKEND=vulkan`** to select Vulkan (MoltenVK); otherwise `auto` will not pick Vulkan. |
 | `native` | Enable host-CPU-specific ggml kernels for less portable but faster CPU binaries. |
 
 ## Vulkan prerequisites
 
 - Linux: install a Vulkan loader / headers plus `glslc` before building `--features vulkan`.
 - Windows: install the Vulkan SDK so CMake can find both Vulkan and `glslc`.
-- Apple: the project currently keeps Metal as the preferred GPU backend; enabling `vulkan` does not change runtime selection there.
+- Apple: use **`QWEN3_TTS_BACKEND`** to pick the GGML primary backend (`auto` \| `cpu` \| `metal` \| `vulkan`). `cargo xtask profile <cpu|metal|vulkan>` sets this env for the CLI child so profiling matches the intended backend.

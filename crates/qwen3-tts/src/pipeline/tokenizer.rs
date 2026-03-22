@@ -37,6 +37,14 @@ pub struct TextTokenizer {
 }
 
 impl TextTokenizer {
+    fn assistant_prefix_tokens(&self) -> [i32; 3] {
+        [
+            self.config.bos_token_id,
+            self.assistant_token_id,
+            self.newline_token_id,
+        ]
+    }
+
     pub fn load_from_gguf(file: &GgufFile) -> Result<Self, Qwen3TtsError> {
         let tokens = file
             .get_arr_str("tokenizer.ggml.tokens")
@@ -141,15 +149,28 @@ impl TextTokenizer {
     #[must_use]
     pub fn encode_for_tts(&self, text: &str) -> Vec<i32> {
         let mut tokens = Vec::new();
-        tokens.push(self.config.bos_token_id);
-        tokens.push(self.assistant_token_id);
-        tokens.push(self.newline_token_id);
+        tokens.extend_from_slice(&self.assistant_prefix_tokens());
         tokens.extend(self.encode(text));
         tokens.push(self.config.eos_token_id);
         tokens.push(self.newline_token_id);
-        tokens.push(self.config.bos_token_id);
-        tokens.push(self.assistant_token_id);
+        tokens.extend_from_slice(&self.assistant_prefix_tokens());
+        tokens
+    }
+
+    #[must_use]
+    pub fn encode_ref_for_tts(&self, text: &str) -> Vec<i32> {
+        let mut tokens = Vec::new();
+        tokens.extend_from_slice(&self.assistant_prefix_tokens());
+        tokens.extend(self.encode(text));
+        tokens.push(self.config.eos_token_id);
         tokens.push(self.newline_token_id);
+        tokens
+    }
+
+    #[must_use]
+    pub fn encode_for_voice_clone(&self, ref_text: &str, text: &str) -> Vec<i32> {
+        let mut tokens = self.encode_ref_for_tts(ref_text);
+        tokens.extend(self.encode_for_tts(text));
         tokens
     }
 

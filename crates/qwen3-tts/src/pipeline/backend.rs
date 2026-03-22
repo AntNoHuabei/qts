@@ -9,13 +9,94 @@ use ggml::sys;
 
 use crate::Qwen3TtsError;
 
+/// `ggml_backend_reg_by_name` argument for the Metal backend (device names are `MTL0`, … — not `"Metal"`).
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn ggml_reg_mtl() -> &'static CStr {
+    CStr::from_bytes_with_nul(b"MTL\0").expect("MTL reg name")
+}
+
+/// `ggml_backend_reg_by_name` argument for the Vulkan backend (per-device names are `Vulkan0`, …).
+#[cfg(feature = "vulkan")]
+fn ggml_reg_vulkan() -> &'static CStr {
+    CStr::from_bytes_with_nul(b"Vulkan\0").expect("Vulkan reg name")
+}
+
+#[cfg(any(
+    all(feature = "metal", target_vendor = "apple"),
+    feature = "vulkan"
+))]
+fn gpu_device_index() -> Result<usize, Qwen3TtsError> {
+    let Ok(s) = std::env::var("QWEN3_TTS_GPU_DEVICE") else {
+        return Ok(0);
+    };
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(0);
+    }
+    s.parse().map_err(|_| {
+        Qwen3TtsError::InvalidInput(format!(
+            "QWEN3_TTS_GPU_DEVICE must be a non-negative integer, got {s:?}"
+        ))
+    })
+}
+
+/// Parsed `QWEN3_TTS_BACKEND` — which GGML primary backend to use (independent of which backends
+/// were linked into the binary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendChoice {
+    /// Prefer Metal on Apple (if `metal` feature), else Vulkan on non-Apple (if `vulkan` feature), else CPU.
+    Auto,
+    Cpu,
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
+    Metal,
+    #[cfg(feature = "vulkan")]
+    Vulkan,
+}
+
+fn parse_qwen3_tts_backend() -> Result<BackendChoice, Qwen3TtsError> {
+    let var = match std::env::var("QWEN3_TTS_BACKEND") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return Ok(BackendChoice::Auto),
+    };
+    match var.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(BackendChoice::Auto),
+        "cpu" => Ok(BackendChoice::Cpu),
+        "metal" => {
+            #[cfg(all(feature = "metal", target_vendor = "apple"))]
+            {
+                Ok(BackendChoice::Metal)
+            }
+            #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
+            {
+                Err(Qwen3TtsError::InvalidInput(
+                    "QWEN3_TTS_BACKEND=metal is only valid on Apple targets with the `metal` feature"
+                        .into(),
+                ))
+            }
+        }
+        "vulkan" => {
+            #[cfg(feature = "vulkan")]
+            {
+                Ok(BackendChoice::Vulkan)
+            }
+            #[cfg(not(feature = "vulkan"))]
+            {
+                Err(Qwen3TtsError::InvalidInput(
+                    "QWEN3_TTS_BACKEND=vulkan requires building with --features vulkan".into(),
+                ))
+            }
+        }
+        other => Err(Qwen3TtsError::InvalidInput(format!(
+            "QWEN3_TTS_BACKEND: unknown value '{other}' (expected auto, cpu, metal, vulkan)"
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendKind {
     Cpu,
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     Metal,
-    #[cfg(all(feature = "vulkan", not(target_vendor = "apple")))]
-    Vulkan,
 }
 
 impl BackendKind {
@@ -24,8 +105,6 @@ impl BackendKind {
             Self::Cpu => "CPU",
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             Self::Metal => "Metal",
-            #[cfg(all(feature = "vulkan", not(target_vendor = "apple")))]
-            Self::Vulkan => "Vulkan",
         }
     }
 }
@@ -37,6 +116,8 @@ struct BackendSetInner {
     primary: OwnedBackend,
     cpu_fallback: Option<OwnedBackend>,
     primary_galloc: RefCell<OwnedGallocr>,
+    /// Vulkan's `ggml_vk_conv_transpose_1d` requires F32 weights/activations; GGUF kernels are often quantized.
+    vulkan_conv_transpose_cast_quant: bool,
 }
 
 impl BackendSet {
@@ -46,13 +127,43 @@ impl BackendSet {
             sys::ggml_cpu_init();
         }
 
+        match parse_qwen3_tts_backend()? {
+            BackendChoice::Auto => Self::auto_select_backend(),
+            BackendChoice::Cpu => {
+                let primary = OwnedBackend::cpu()?;
+                if backend_debug_enabled() {
+                    eprintln!("[backend-debug] selected {}", BackendKind::Cpu.as_str());
+                }
+                Self::with_primary(primary, None, false)
+            }
+            #[cfg(all(feature = "metal", target_vendor = "apple"))]
+            BackendChoice::Metal => Self::require_reg_backend(ggml_reg_mtl(), "Metal", false),
+            #[cfg(feature = "vulkan")]
+            BackendChoice::Vulkan => Self::require_reg_backend(ggml_reg_vulkan(), "Vulkan", true),
+        }
+    }
+
+    pub(crate) fn cpu_only() -> Result<Self, Qwen3TtsError> {
+        unsafe {
+            sys::ggml_backend_load_all();
+            sys::ggml_cpu_init();
+        }
+        let primary = OwnedBackend::cpu()?;
+        Self::with_primary(primary, None, false)
+    }
+
+    /// Automatic preference: Apple → Metal (if enabled) → CPU. Non-Apple → Vulkan (if enabled) → CPU.
+    /// On macOS, Vulkan is **not** tried here; use `QWEN3_TTS_BACKEND=vulkan` to force it.
+    fn auto_select_backend() -> Result<Self, Qwen3TtsError> {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
-        if let Some(backends) = Self::try_init_primary(BackendKind::Metal, b"Metal\0")? {
+        if let Some(backends) =
+            Self::try_optional_reg(ggml_reg_mtl(), BackendKind::Metal.as_str(), false)?
+        {
             return Ok(backends);
         }
 
         #[cfg(all(feature = "vulkan", not(target_vendor = "apple")))]
-        if let Some(backends) = Self::try_init_primary(BackendKind::Vulkan, b"Vulkan\0")? {
+        if let Some(backends) = Self::try_optional_reg(ggml_reg_vulkan(), "Vulkan", true)? {
             return Ok(backends);
         }
 
@@ -60,43 +171,76 @@ impl BackendSet {
         if backend_debug_enabled() {
             eprintln!("[backend-debug] selected {}", BackendKind::Cpu.as_str());
         }
-        Self::with_primary(primary, None)
+        Self::with_primary(primary, None, false)
     }
 
     #[cfg(any(
         all(feature = "metal", target_vendor = "apple"),
         all(feature = "vulkan", not(target_vendor = "apple"))
     ))]
-    fn try_init_primary(kind: BackendKind, name: &[u8]) -> Result<Option<Self>, Qwen3TtsError> {
-        if let Some(primary) = OwnedBackend::init_by_name(name)? {
+    fn try_optional_reg(
+        reg: &CStr,
+        label: &str,
+        vulkan_conv_transpose_cast_quant: bool,
+    ) -> Result<Option<Self>, Qwen3TtsError> {
+        if let Some(primary) = OwnedBackend::init_from_reg(reg, label, false)? {
             if backend_debug_enabled() {
-                eprintln!("[backend-debug] selected {}", kind.as_str());
+                eprintln!("[backend-debug] selected {label}");
             }
             return Ok(Some(Self::with_primary(
                 primary,
                 Some(OwnedBackend::cpu()?),
+                vulkan_conv_transpose_cast_quant,
             )?));
         }
 
         if backend_debug_enabled() {
-            eprintln!(
-                "[backend-debug] {} unavailable, falling back to CPU",
-                kind.as_str()
-            );
+            eprintln!("[backend-debug] {label} unavailable, falling back");
         }
         Ok(None)
+    }
+
+    #[cfg(any(
+        all(feature = "metal", target_vendor = "apple"),
+        feature = "vulkan"
+    ))]
+    fn require_reg_backend(
+        reg: &CStr,
+        label: &str,
+        vulkan_conv_transpose_cast_quant: bool,
+    ) -> Result<Self, Qwen3TtsError> {
+        let primary = OwnedBackend::init_from_reg(reg, label, true)?.ok_or_else(|| {
+            Qwen3TtsError::InvalidInput(format!(
+                "QWEN3_TTS_BACKEND requested {label}, but GPU backend init failed (see QWEN3_TTS_GPU_DEVICE, drivers, or SDK)"
+            ))
+        })?;
+        if backend_debug_enabled() {
+            eprintln!("[backend-debug] selected {label} (QWEN3_TTS_BACKEND)");
+        }
+        Self::with_primary(
+            primary,
+            Some(OwnedBackend::cpu()?),
+            vulkan_conv_transpose_cast_quant,
+        )
     }
 
     fn with_primary(
         primary: OwnedBackend,
         cpu_fallback: Option<OwnedBackend>,
+        vulkan_conv_transpose_cast_quant: bool,
     ) -> Result<Self, Qwen3TtsError> {
         let primary_galloc = RefCell::new(OwnedGallocr::new(primary.as_ptr())?);
         Ok(Self(Rc::new(BackendSetInner {
             primary,
             cpu_fallback,
             primary_galloc,
+            vulkan_conv_transpose_cast_quant,
         })))
+    }
+
+    /// When true, vocoder graphs should `ggml_cast` quantized conv-transpose weights/inputs to F32 before the op (Vulkan limitation).
+    pub(crate) fn vulkan_conv_transpose_cast_quant_weights(&self) -> bool {
+        self.0.vulkan_conv_transpose_cast_quant
     }
 
     pub(crate) fn primary_ptr(&self) -> sys::ggml_backend_t {
@@ -129,13 +273,52 @@ impl OwnedBackend {
         Ok(Self { raw, is_cpu: true })
     }
 
+    /// Initialize via `ggml_backend_reg_by_name` + `ggml_backend_dev_init`.
+    ///
+    /// `ggml_backend_init_by_name` matches **per-device** ids (`Vulkan0`, `MTL0`, …), not registry
+    /// names (`Vulkan`, `MTL`), so we use the registry API instead.
     #[cfg(any(
         all(feature = "metal", target_vendor = "apple"),
-        all(feature = "vulkan", not(target_vendor = "apple"))
+        feature = "vulkan"
     ))]
-    fn init_by_name(name: &[u8]) -> Result<Option<Self>, Qwen3TtsError> {
-        let raw = unsafe { sys::ggml_backend_init_by_name(name.as_ptr().cast(), std::ptr::null()) };
-        Ok(NonNull::new(raw).map(|raw| Self { raw, is_cpu: false }))
+    fn init_from_reg(reg: &CStr, label: &str, require: bool) -> Result<Option<Self>, Qwen3TtsError> {
+        let device_index = gpu_device_index()?;
+
+        let reg_ptr = unsafe { sys::ggml_backend_reg_by_name(reg.as_ptr()) };
+        if reg_ptr.is_null() {
+            return Ok(None);
+        }
+
+        let n = unsafe { sys::ggml_backend_reg_dev_count(reg_ptr) };
+        if n == 0 {
+            return Ok(None);
+        }
+
+        if device_index >= n {
+            return Err(Qwen3TtsError::InvalidInput(format!(
+                "QWEN3_TTS_GPU_DEVICE={device_index} is out of range for {label} (available: 0..{})",
+                n.saturating_sub(1)
+            )));
+        }
+
+        let dev = unsafe { sys::ggml_backend_reg_dev_get(reg_ptr, device_index) };
+        if dev.is_null() {
+            return Ok(None);
+        }
+        let raw = unsafe { sys::ggml_backend_dev_init(dev, std::ptr::null()) };
+        let Some(raw) = NonNull::new(raw) else {
+            if require {
+                return Err(Qwen3TtsError::InvalidInput(format!(
+                    "QWEN3_TTS_BACKEND requested {label}, but ggml_backend_dev_init failed for device index {device_index}"
+                )));
+            }
+            return Ok(None);
+        };
+
+        Ok(Some(Self {
+            raw,
+            is_cpu: false,
+        }))
     }
 
     fn as_ptr(&self) -> sys::ggml_backend_t {
@@ -242,6 +425,67 @@ pub(crate) fn slice_as_bytes_mut<T>(slice: &mut [T]) -> &mut [u8] {
     }
 }
 
+/// F32 bias for [`sys::ggml_soft_max_ext`], matching GGML CPU `ggml_compute_forward_diag_mask_f32` / `ggml_diag_mask_inf`.
+/// Metal does not implement `GGML_OP_DIAG_MASK_INF`; fusing into softmax avoids that op.
+pub(crate) fn packed_softmax_diag_mask_f32(ne: [i64; 4], n_past: i32) -> Vec<f32> {
+    let n0 = ne[0].max(0) as usize;
+    let n1 = ne[1].max(0) as usize;
+    let n2 = ne[2].max(0) as usize;
+    let n3 = ne[3].max(0) as usize;
+    let total = n0.saturating_mul(n1).saturating_mul(n2).saturating_mul(n3);
+    let mut out = vec![0.0f32; total];
+    let np = n_past.max(0) as usize;
+    for i3 in 0..n3 {
+        for i2 in 0..n2 {
+            for j in 0..n1 {
+                for i in 0..n0 {
+                    let v = if i >= np && i > np.saturating_add(j) {
+                        f32::NEG_INFINITY
+                    } else {
+                        0.0
+                    };
+                    let idx = i + n0 * (j + n1 * (i2 + n2 * i3));
+                    if let Some(slot) = out.get_mut(idx) {
+                        *slot = v;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One shared mask leaf per graph (same `kq` layout for every layer). Caller must [`TensorUpload`] the packed bytes.
+pub(crate) unsafe fn ggml_soft_max_ext_with_diag_mask_cache(
+    ctx: *mut sys::ggml_context,
+    kq: *mut sys::ggml_tensor,
+    n_past: i32,
+    cache: &mut Option<(*mut sys::ggml_tensor, Vec<f32>)>,
+) -> *mut sys::ggml_tensor {
+    let mask_ptr = match cache {
+        None => {
+            let ne = (*kq).ne;
+            let data = packed_softmax_diag_mask_f32(ne, n_past);
+            let t = sys::ggml_new_tensor_4d(
+                ctx,
+                sys::ggml_type_GGML_TYPE_F32,
+                ne[0],
+                ne[1],
+                ne[2],
+                ne[3],
+            );
+            assert!(
+                !t.is_null(),
+                "ggml_new_tensor_4d failed for softmax causal mask"
+            );
+            *cache = Some((t, data));
+            t
+        }
+        Some((mask_t, _)) => *mask_t,
+    };
+    sys::ggml_soft_max_ext(ctx, kq, mask_ptr, 1.0, 0.0)
+}
+
 pub(crate) fn execute_graph(
     backends: &BackendSet,
     graph: NonNull<sys::ggml_cgraph>,
@@ -259,6 +503,29 @@ pub(crate) fn execute_graph(
             "failed to allocate backend graph for {error_message}"
         )));
     }
+    run_graph_impl(backends, graph, uploads, downloads, error_message)
+}
+
+/// Re-run a previously allocated graph with new input data (skip `ggml_gallocr_alloc_graph`).
+pub(crate) fn rerun_graph(
+    backends: &BackendSet,
+    graph: NonNull<sys::ggml_cgraph>,
+    uploads: &[TensorUpload<'_>],
+    downloads: &mut [TensorDownload<'_>],
+    thread_count: usize,
+    error_message: &str,
+) -> Result<(), Qwen3TtsError> {
+    backends.configure_threads(thread_count);
+    run_graph_impl(backends, graph, uploads, downloads, error_message)
+}
+
+fn run_graph_impl(
+    backends: &BackendSet,
+    graph: NonNull<sys::ggml_cgraph>,
+    uploads: &[TensorUpload<'_>],
+    downloads: &mut [TensorDownload<'_>],
+    error_message: &str,
+) -> Result<(), Qwen3TtsError> {
     for upload in uploads {
         unsafe {
             sys::ggml_backend_tensor_set(

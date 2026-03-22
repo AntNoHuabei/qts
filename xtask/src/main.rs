@@ -6,6 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
         Some("bench") => run_bench(args.collect()),
+        Some("profile") => run_profile(args.collect()),
         _ => {
             print_usage();
             Ok(())
@@ -85,6 +86,63 @@ fn run_bench(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             &top_p,
             &criterion_args,
         )?;
+    }
+
+    Ok(())
+}
+
+fn run_profile(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    if args
+        .iter()
+        .any(|a| matches!(a.as_str(), "--help" | "-h"))
+    {
+        print_profile_help();
+        return Ok(());
+    }
+
+    let workspace_root = workspace_root()?;
+    let mut backend = String::from("cpu");
+    let mut forwarded = args;
+    if let Some(first) = forwarded.first() {
+        if matches!(
+            first.as_str(),
+            "cpu" | "metal" | "vulkan" | "all" | "both"
+        ) {
+            backend = forwarded.remove(0);
+        }
+    }
+
+    let backends = match backend.as_str() {
+        "cpu" => vec!["cpu"],
+        "metal" => vec!["metal"],
+        "vulkan" => vec!["vulkan"],
+        "all" => vec!["cpu", "metal", "vulkan"],
+        "both" => vec!["cpu", "metal"],
+        _ => return Err(format!("unsupported backend: {backend}").into()),
+    };
+
+    for backend in backends {
+        let mut command = Command::new("cargo");
+        command.current_dir(&workspace_root);
+        command.args(["run", "-p", "qwen3-tts-cli"]);
+        if backend != "cpu" {
+            command.args(["--features", backend]);
+        }
+        // Decouple Cargo features from GGML backend selection: on macOS, Vulkan is only used when
+        // explicitly requested (see `QWEN3_TTS_BACKEND` in qwen3-tts `backend.rs`).
+        command.env("QWEN3_TTS_BACKEND", backend);
+        command.arg("--");
+        command.arg("profile");
+        command.args(&forwarded);
+
+        eprintln!(
+            "running synthesis profile: cargo_features={backend} QWEN3_TTS_BACKEND={backend}"
+        );
+
+        let status = command.status()?;
+        if !status.success() {
+            return Err(format!("profile failed for backend={backend}").into());
+        }
     }
 
     Ok(())
@@ -174,6 +232,17 @@ fn value_arg(
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -p xtask -- bench [cpu|metal|vulkan|all] [--model-dir PATH] [--text TEXT] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [-- <criterion args>]"
+        "usage:\n  cargo xtask bench [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [-- <criterion args>]\n  cargo xtask profile [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] [... same flags as synthesize ...]\n\nTry: cargo xtask profile --help"
+    );
+}
+
+fn print_profile_help() {
+    eprintln!(
+        "cargo xtask profile — run qwen3-tts-cli profile with optional backend feature\n\n\
+         usage:\n  cargo xtask profile [cpu|metal|vulkan|all|both] [-- ARGS_FOR_CLI...]\n\n\
+         The first token selects both `cargo --features` and sets QWEN3_TTS_BACKEND for the child \
+         (so macOS + vulkan actually uses the Vulkan GGML backend, not only links it).\n\n\
+         Examples:\n  cargo xtask profile cpu --model-dir models/volko76-q4k-q8 --text hello --frames 32 --runs 3\n  cargo xtask profile metal --model-dir \"$QWEN3_TTS_MODEL_DIR\" --text hello --frames 64 --out /tmp/p.wav\n  cargo xtask profile vulkan --model-dir \"$QWEN3_TTS_MODEL_DIR\" --text hello --frames 64\n\n\
+         All flags after the optional backend token are passed to `qwen3-tts-cli profile`."
     );
 }

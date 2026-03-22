@@ -82,11 +82,11 @@ Documented GGUF links and directory layout: [docs/models.md](docs/models.md).
 - No extra speaker-model file is required; the library derives a deterministic speaker embedding from reference audio at runtime.
 - If `reference_wav_bytes` is absent, synthesis keeps the previous zero-speaker fallback.
 
-For better alignment with upstream `QwenLM/Qwen3-TTS`, stage 1 also supports importing a Python-exported voice-clone prompt and consuming only its `ref_spk_embedding` on the native side.
+For better alignment with upstream `QwenLM/Qwen3-TTS`, the native path also supports a stage-2 protobuf voice-clone prompt that carries the full upstream prompt semantics.
 
-### Stage 1: Python prompt export, native speaker consumption
+### Stage 2: Protobuf prompt export and native consumption
 
-Use the repository's `uv`-managed Python environment to export a prompt JSON from `create_voice_clone_prompt(...)`:
+Use the repository's `uv`-managed Python environment to export a single protobuf prompt from `create_voice_clone_prompt(...)`:
 
 ```bash
 uv sync
@@ -95,7 +95,7 @@ uv run export-voice-clone-prompt \
   --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
   --ref-audio testdata/hello.wav \
   --ref-text "hello" \
-  --out target/hello.voice-clone-prompt.json
+  --out target/hello.voice-clone-prompt.pb
 ```
 
 The legacy script path still works too:
@@ -115,18 +115,23 @@ uv run export-speaker-bin \
   --out target/hello.python.speaker.bin
 ```
 
-Then consume that prompt from `qwen3-tts-cli`. In stage 1, the native engine reads the JSON and uses only `ref_spk_embedding`; `ref_code` and `ref_text` are preserved for future work but are not yet injected into the transformer:
+Then consume that prompt from `qwen3-tts-cli`. In stage 2, the native engine reads the protobuf and uses:
+
+- `ref_spk_embedding`
+- `ref_code`
+- `ref_text`
+- `icl_mode` / `x_vector_only_mode`
 
 ```bash
 cargo run -p qwen3-tts-cli -- synthesize \
   --model-dir models/volko76-q4k-q8 \
   --text "hello" \
-  --voice-clone-prompt target/hello.voice-clone-prompt.json \
+  --voice-clone-prompt target/hello.voice-clone-prompt.pb \
   --out target/hello-from-prompt.wav
 
 cargo run -p qwen3-tts-cli -- speaker-bin \
   --model-dir models/volko76-q4k-q8 \
-  --voice-clone-prompt target/hello.voice-clone-prompt.json \
+  --voice-clone-prompt target/hello.voice-clone-prompt.pb \
   --out target/hello.from-prompt.speaker.bin
 ```
 
@@ -145,28 +150,41 @@ cargo run -p qwen3-tts-cli -- synthesize \
   --out target/hello-from-speaker-bin.wav
 ```
 
-### Stage 2 Goal
-
-The next milestone is to consume the full upstream voice-clone prompt on the native side:
-
-- `ref_spk_embedding`
-- `ref_code`
-- `ref_text`
-- `icl_mode` / `x_vector_only_mode`
-
-That will let `qwen3-tts-native` move from speaker-only conditioning toward the upstream Base model's full voice-clone behavior instead of the current stage-1 compatibility path.
-
 ## Tests
 
 Fast tests run in CI; model-backed tests are opt-in: [docs/testing.md](docs/testing.md).
 
-Criterion benchmarks can be driven through `xtask`, including backend-specific runs:
+Criterion benchmarks and synthesis profiling are driven through the `xtask` Cargo alias (see [`.cargo/config.toml`](.cargo/config.toml)):
 
 ```bash
-cargo run -p xtask -- bench cpu
-cargo run -p xtask -- bench metal
-cargo run -p xtask -- bench vulkan
+cargo xtask bench cpu
+cargo xtask bench metal
+cargo xtask bench vulkan
 ```
+
+Stage timings (tokenizer, prefill build, codec rollout / transformer, vocoder, etc.) for a real synthesis pass:
+
+```bash
+cargo xtask profile cpu --model-dir models/volko76-q4k-q8 --text "hello" --frames 64 --runs 3
+cargo xtask profile metal --model-dir models/volko76-q4k-q8 --text "hello" --frames 64
+cargo xtask profile vulkan --model-dir models/volko76-q4k-q8 --text "hello" --frames 64
+```
+
+`cargo xtask profile` sets **`QWEN3_TTS_BACKEND`** for the child to match the first token (`cpu` / `metal` / `vulkan`), so **Cargo features and the actual GGML primary backend stay aligned** (including Vulkan on macOS when you choose the `vulkan` profile).
+
+For `cargo run -p qwen3-tts-cli` directly, set the backend explicitly, for example:
+
+```bash
+QWEN3_TTS_BACKEND=vulkan cargo run -p qwen3-tts-cli --features vulkan -- profile --text "hello" --model-dir models/volko76-q4k-q8 --frames 64
+```
+
+This runs `qwen3-tts-cli profile`, which prints per-stage milliseconds and percentage of total wall time. Use `--out run1.wav` to keep audio from the first run while profiling.
+
+**Backend selection:** `auto` (default) prefers **Metal → CPU** on Apple, and **Vulkan → CPU** on other platforms. On macOS, **Vulkan is not auto-selected**; use `QWEN3_TTS_BACKEND=vulkan` (or `cargo xtask profile vulkan`) when you want MoltenVK.
+
+GGML picks GPU devices by **registry** name plus index: use **`QWEN3_TTS_GPU_DEVICE`** (default `0`) to choose among multiple Vulkan or Metal adapters (`Vulkan0` / `MTL0`, …).
+
+With **`QWEN3_TTS_BACKEND=vulkan`**, the vocoder inserts **`ggml_cast` to F32** around `CONV_TRANSPOSE_1D` when weights are quantized, because GGML’s Vulkan kernel for that op currently requires F32 tensors (see `ggml_vk_conv_transpose_1d` in upstream ggml).
 
 ## Godot / gdext
 

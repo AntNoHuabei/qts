@@ -52,15 +52,27 @@ Python or upstream `compare_e2e.py`-style checks should stay out of default PR C
 
 ## Benchmarks
 
-Use `xtask` to run Criterion with the intended backend feature enabled:
+Use the `cargo xtask` alias (see `.cargo/config.toml`) to run Criterion with the intended backend feature enabled:
 
 ```bash
-cargo run -p xtask -- bench cpu
-cargo run -p xtask -- bench metal
-cargo run -p xtask -- bench vulkan
+cargo xtask bench cpu
+cargo xtask bench metal
+cargo xtask bench vulkan
 ```
 
 The Vulkan path requires a working Vulkan SDK / loader and `glslc` on the machine performing the build.
+
+Runtime backend is controlled by **`QWEN3_TTS_BACKEND`** (`auto`, `cpu`, `metal`, `vulkan`). `cargo xtask profile vulkan` sets `QWEN3_TTS_BACKEND=vulkan` so macOS can use MoltenVK when the binary is built with `--features vulkan`.
+
+### Synthesis stage profile (wall clock)
+
+To see approximate time spent in tokenizer vs transformer (codec rollout) vs vocoder for one or more end-to-end runs:
+
+```bash
+cargo xtask profile cpu --model-dir "$QWEN3_TTS_MODEL_DIR" --text "hello" --frames 32 --runs 5
+```
+
+Optional: `--out target/profile-run1.wav` writes WAV from the first run only. The table is printed to stderr; use `--runs N` to average stage times over multiple iterations (useful after a warmup run with `--runs 1` first if you care about steady state).
 
 ## CLI smoke checks
 
@@ -79,18 +91,26 @@ cargo run -p qwen3-tts-cli -- synthesize \
   --out target/hello.wav
 ```
 
-Stage-1 prompt import can be smoke-tested with a minimal prompt JSON that contains a valid `ref_spk_embedding`, or with the upstream exporter:
+Stage-2 prompt import can be smoke-tested with a protobuf prompt exported by the upstream helper:
 
 ```bash
 uv sync
-uv run export-voice-clone-prompt --help
-uv run export-speaker-bin --help
+uv run export-voice-clone-prompt \
+  --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --ref-audio testdata/hello.wav \
+  --ref-text "hello" \
+  --out target/hello.voice-clone-prompt.pb
 
 cargo run -p qwen3-tts-cli -- synthesize \
   --model-dir "$QWEN3_TTS_MODEL_DIR" \
   --text "hello" \
-  --voice-clone-prompt target/hello.voice-clone-prompt.json \
+  --voice-clone-prompt target/hello.voice-clone-prompt.pb \
   --out target/hello.from-prompt.wav
+
+cargo run -p qwen3-tts-cli -- speaker-bin \
+  --model-dir "$QWEN3_TTS_MODEL_DIR" \
+  --voice-clone-prompt target/hello.voice-clone-prompt.pb \
+  --out target/hello.from-prompt.speaker.bin
 ```
 
 ## `testdata/`

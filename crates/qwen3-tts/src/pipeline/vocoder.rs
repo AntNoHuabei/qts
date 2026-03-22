@@ -6,10 +6,99 @@ use std::ptr::NonNull;
 use ggml::sys;
 
 use super::backend::{
-    execute_graph, graph_metadata_mem_size, slice_as_bytes, slice_as_bytes_mut, BackendSet,
-    OwnedBuffer, TensorDownload, TensorUpload,
+    execute_graph, ggml_soft_max_ext_with_diag_mask_cache, graph_metadata_mem_size, slice_as_bytes,
+    slice_as_bytes_mut, BackendSet, OwnedBuffer, TensorDownload, TensorUpload,
 };
 use crate::{model::GgufFile, Qwen3TtsError};
+
+/// Vulkan `ggml_vk_conv_transpose_1d` asserts F32 for kernel and input; quantized GGUF weights violate that.
+unsafe fn ggml_conv_transpose_1d_vulkan_compat(
+    ctx: *mut sys::ggml_context,
+    kernel: *mut sys::ggml_tensor,
+    input: *mut sys::ggml_tensor,
+    s0: i32,
+    p0: i32,
+    d0: i32,
+    vulkan_cast_quant: bool,
+) -> *mut sys::ggml_tensor {
+    if !vulkan_cast_quant {
+        return sys::ggml_conv_transpose_1d(ctx, kernel, input, s0, p0, d0);
+    }
+    let f32 = sys::ggml_type_GGML_TYPE_F32;
+    let orig_k_ty = (*kernel).type_ as u32;
+    let orig_x_ty = (*input).type_ as u32;
+    let cast_k = (*kernel).type_ != f32;
+    let cast_x = (*input).type_ != f32;
+    let mut k = kernel;
+    let mut inp = input;
+    if cast_k {
+        k = sys::ggml_cast(ctx, k, f32);
+    }
+    if cast_x {
+        inp = sys::ggml_cast(ctx, inp, f32);
+    }
+    sys::ggml_conv_transpose_1d(ctx, k, inp, s0, p0, d0)
+}
+
+/// Metal does not implement `GGML_OP_PAD`. Emulate left-only zero padding by using the
+/// convolution's symmetric padding and slicing away the extra right-padded outputs.
+unsafe fn ggml_conv_1d_left_pad_compat(
+    ctx: *mut sys::ggml_context,
+    kernel: *mut sys::ggml_tensor,
+    input: *mut sys::ggml_tensor,
+    s0: i32,
+    lp0: i32,
+    d0: i32,
+) -> *mut sys::ggml_tensor {
+    let out = sys::ggml_conv_1d(ctx, kernel, input, s0, lp0, d0);
+    if lp0 == 0 {
+        return out;
+    }
+    let kernel_size = (*kernel).ne[0];
+    let input_len = (*input).ne[0];
+    let target_len = (input_len + lp0 as i64 - d0 as i64 * (kernel_size - 1) - 1) / s0 as i64 + 1;
+    let sliced = sys::ggml_view_3d(
+        ctx,
+        out,
+        target_len,
+        (*out).ne[1],
+        (*out).ne[2],
+        (*out).nb[1],
+        (*out).nb[2],
+        0,
+    );
+    sys::ggml_cont(ctx, sliced)
+}
+
+/// Depthwise variant of [`ggml_conv_1d_left_pad_compat`].
+unsafe fn ggml_conv_1d_dw_left_pad_compat(
+    ctx: *mut sys::ggml_context,
+    kernel: *mut sys::ggml_tensor,
+    input: *mut sys::ggml_tensor,
+    s0: i32,
+    lp0: i32,
+    d0: i32,
+) -> *mut sys::ggml_tensor {
+    let out = sys::ggml_conv_1d_dw(ctx, kernel, input, s0, lp0, d0);
+    if lp0 == 0 {
+        return out;
+    }
+    let kernel_size = (*kernel).ne[0];
+    let input_len = (*input).ne[0];
+    let target_len = (input_len + lp0 as i64 - d0 as i64 * (kernel_size - 1) - 1) / s0 as i64 + 1;
+    let sliced = sys::ggml_view_3d(
+        ctx,
+        out,
+        target_len,
+        (*out).ne[1],
+        (*out).ne[2],
+        (*out).nb[1],
+        (*out).nb[2],
+        0,
+    );
+    sys::ggml_cont(ctx, sliced)
+}
+// #endregion
 
 #[derive(Debug, Clone)]
 pub struct VocoderConfig {
@@ -67,7 +156,7 @@ impl Vocoder {
             cfg.codebook_size as u32,
         ) as i32;
 
-        let weights = VocoderWeights::load(file, &cfg, BackendSet::new()?)?;
+        let weights = VocoderWeights::load(file, &cfg, BackendSet::cpu_only()?)?;
         Ok(Self {
             config: cfg,
             weights,
@@ -207,15 +296,13 @@ impl Vocoder {
         };
 
         let latent_for_conv = unsafe { sys::ggml_cont(ctx.as_ptr(), latent) };
-        let latent_padded =
-            unsafe { sys::ggml_pad_ext(ctx.as_ptr(), latent_for_conv, 2, 0, 0, 0, 0, 0, 0, 0) };
         let mut cur = unsafe {
-            sys::ggml_conv_1d(
+            ggml_conv_1d_left_pad_compat(
                 ctx.as_ptr(),
                 self.weights.pre_conv_w.as_ptr(),
-                latent_padded,
+                latent_for_conv,
                 1,
-                0,
+                2,
                 1,
             )
         };
@@ -253,9 +340,16 @@ impl Vocoder {
             cur = unsafe { sys::ggml_add(ctx.as_ptr(), cur, input_bias.as_ptr()) };
         }
 
+        let mut attn_softmax_mask: Option<(*mut sys::ggml_tensor, Vec<f32>)> = None;
         for layer in &self.weights.pre_tfm_layers {
-            cur =
-                self.apply_pre_tfm_layer(ctx.as_ptr(), cur, layer, n_frames, positions.as_ptr())?;
+            cur = self.apply_pre_tfm_layer(
+                ctx.as_ptr(),
+                cur,
+                layer,
+                n_frames,
+                positions.as_ptr(),
+                &mut attn_softmax_mask,
+            )?;
         }
 
         if let Some(norm) = self.weights.pre_tfm_norm_w {
@@ -288,14 +382,13 @@ impl Vocoder {
             cur = self.apply_upsample_block(ctx.as_ptr(), cur, block)?;
         }
 
-        cur = unsafe { sys::ggml_pad_ext(ctx.as_ptr(), cur, 6, 0, 0, 0, 0, 0, 0, 0) };
         cur = unsafe {
-            sys::ggml_conv_1d(
+            ggml_conv_1d_left_pad_compat(
                 ctx.as_ptr(),
                 self.weights.dec0_conv_w.as_ptr(),
                 cur,
                 1,
-                0,
+                6,
                 1,
             )
         };
@@ -322,14 +415,13 @@ impl Vocoder {
             cur = self.apply_snake(ctx.as_ptr(), cur, alpha.as_ptr(), beta.as_ptr());
         }
 
-        cur = unsafe { sys::ggml_pad_ext(ctx.as_ptr(), cur, 6, 0, 0, 0, 0, 0, 0, 0) };
         cur = unsafe {
-            sys::ggml_conv_1d(
+            ggml_conv_1d_left_pad_compat(
                 ctx.as_ptr(),
                 self.weights.dec6_conv_w.as_ptr(),
                 cur,
                 1,
-                0,
+                6,
                 1,
             )
         };
@@ -347,7 +439,7 @@ impl Vocoder {
 
         let n_samples = unsafe { (*cur).ne[0] as usize };
         let mut audio = vec![0.0f32; n_samples];
-        let mut uploads = Vec::with_capacity(cb_tensors.len() + 1);
+        let mut uploads = Vec::with_capacity(cb_tensors.len() + 2);
         uploads.push(TensorUpload {
             tensor: positions.as_ptr(),
             bytes: slice_as_bytes(pos_values.as_slice()),
@@ -356,6 +448,12 @@ impl Vocoder {
             uploads.push(TensorUpload {
                 tensor: tensor.as_ptr(),
                 bytes: slice_as_bytes(values.as_slice()),
+            });
+        }
+        if let Some((t, data)) = &attn_softmax_mask {
+            uploads.push(TensorUpload {
+                tensor: *t,
+                bytes: slice_as_bytes(data.as_slice()),
             });
         }
         execute_graph(
@@ -414,6 +512,7 @@ impl Vocoder {
         layer: &PreTfmLayerWeights,
         n_frames: usize,
         positions: *mut sys::ggml_tensor,
+        softmax_mask_cache: &mut Option<(*mut sys::ggml_tensor, Vec<f32>)>,
     ) -> Result<*mut sys::ggml_tensor, Qwen3TtsError> {
         let head_dim = self.config.latent_dim / self.config.n_heads;
         let residual = x;
@@ -491,8 +590,7 @@ impl Vocoder {
         let mut v = unsafe { sys::ggml_permute(ctx, v_cur, 0, 2, 1, 3) };
         let mut kq = unsafe { sys::ggml_mul_mat(ctx, k, q) };
         kq = unsafe { sys::ggml_scale(ctx, kq, 1.0 / (head_dim as f32).sqrt()) };
-        kq = unsafe { sys::ggml_diag_mask_inf(ctx, kq, 0) };
-        kq = unsafe { sys::ggml_soft_max(ctx, kq) };
+        kq = unsafe { ggml_soft_max_ext_with_diag_mask_cache(ctx, kq, 0, softmax_mask_cache) };
         v = unsafe { sys::ggml_cont(ctx, sys::ggml_transpose(ctx, v)) };
         let mut kqv = unsafe { sys::ggml_mul_mat(ctx, v, kq) };
         kqv = unsafe { sys::ggml_permute(ctx, kqv, 0, 2, 1, 3) };
@@ -533,7 +631,18 @@ impl Vocoder {
         let seq_len = unsafe { (*x).ne[0] };
         let channels = unsafe { (*x).ne[1] };
         let mut x_2d = unsafe { sys::ggml_reshape_2d(ctx, x, seq_len, channels) };
-        x_2d = unsafe { sys::ggml_conv_transpose_1d(ctx, block.conv_w.as_ptr(), x_2d, 2, 0, 1) };
+        let vk_cast = self.weights.vulkan_conv_transpose_cast_quant_weights();
+        x_2d = unsafe {
+            ggml_conv_transpose_1d_vulkan_compat(
+                ctx,
+                block.conv_w.as_ptr(),
+                x_2d,
+                2,
+                0,
+                1,
+                vk_cast,
+            )
+        };
         let new_seq_len = unsafe { (*x_2d).ne[0] };
         let mut x = unsafe { sys::ggml_reshape_3d(ctx, x_2d, new_seq_len, channels, 1) };
         if let Some(conv_b) = block.conv_b {
@@ -548,8 +657,7 @@ impl Vocoder {
 
         let residual = x;
         if let Some(dwconv_w) = block.dwconv_w {
-            x = unsafe { sys::ggml_pad_ext(ctx, x, 6, 0, 0, 0, 0, 0, 0, 0) };
-            x = unsafe { sys::ggml_conv_1d_dw(ctx, dwconv_w.as_ptr(), x, 1, 0, 1) };
+            x = unsafe { ggml_conv_1d_dw_left_pad_compat(ctx, dwconv_w.as_ptr(), x, 1, 6, 1) };
             if let Some(dwconv_b) = block.dwconv_b {
                 x = unsafe {
                     sys::ggml_add(
@@ -600,8 +708,9 @@ impl Vocoder {
         }
         let out_channels = unsafe { (*block.conv1_w.as_ptr()).ne[2] };
         let padding = 6 * block.dilation;
-        x = unsafe { sys::ggml_pad_ext(ctx, x, padding, 0, 0, 0, 0, 0, 0, 0) };
-        x = unsafe { sys::ggml_conv_1d(ctx, block.conv1_w.as_ptr(), x, 1, 0, block.dilation) };
+        x = unsafe {
+            ggml_conv_1d_left_pad_compat(ctx, block.conv1_w.as_ptr(), x, 1, padding, block.dilation)
+        };
         if let Some(conv1_b) = block.conv1_b {
             x = unsafe {
                 sys::ggml_add(
@@ -645,8 +754,17 @@ impl Vocoder {
         let kernel_size = unsafe { (*block.conv_t_w.as_ptr()).ne[0] as i32 };
 
         let x_2d = unsafe { sys::ggml_reshape_2d(ctx, x, seq_len, in_channels) };
+        let vk_cast = self.weights.vulkan_conv_transpose_cast_quant_weights();
         let x_2d = unsafe {
-            sys::ggml_conv_transpose_1d(ctx, block.conv_t_w.as_ptr(), x_2d, upsample_rate, 0, 1)
+            ggml_conv_transpose_1d_vulkan_compat(
+                ctx,
+                block.conv_t_w.as_ptr(),
+                x_2d,
+                upsample_rate,
+                0,
+                1,
+                vk_cast,
+            )
         };
         let new_seq_len = unsafe { (*x_2d).ne[0] };
         let mut x = unsafe { sys::ggml_reshape_3d(ctx, x_2d, new_seq_len, out_channels, 1) };
@@ -710,6 +828,11 @@ struct VocoderWeights {
 }
 
 impl VocoderWeights {
+    fn vulkan_conv_transpose_cast_quant_weights(&self) -> bool {
+        self._backends
+            .vulkan_conv_transpose_cast_quant_weights()
+    }
+
     fn load(
         file: &GgufFile,
         cfg: &VocoderConfig,

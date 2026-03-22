@@ -52,11 +52,11 @@ def main() -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("wb") as handle:
-        for value in payload["ref_spk_embedding"]:
+        for value in payload.ref_spk_embedding.values:
             handle.write(struct.pack("<f", float(value)))
     print(
         f"wrote speaker.bin: path={out_path} "
-        f"embedding_dim={len(payload['ref_spk_embedding'])}"
+        f"embedding_dim={len(payload.ref_spk_embedding.values)}"
     )
 
 

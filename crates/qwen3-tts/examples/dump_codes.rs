@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
-use qwen3_tts::{Qwen3TtsEngine, SynthesizeRequest};
+use qwen3_tts::{PrefillConditioning, Qwen3TtsEngine, SynthesizeRequest};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -32,15 +32,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokens = engine.encode_for_tts(&req.text);
     let zero_speaker = vec![0.0f32; engine.transformer().config().hidden_size as usize];
     let prepared_inputs = engine.transformer().build_prefill_inputs(
-        &tokens,
-        Some(&zero_speaker),
-        req.language_id,
+        PrefillConditioning {
+            text_tokens: &tokens,
+            speaker_embd: Some(&zero_speaker),
+            ref_codebook_0: &[],
+            language_id: req.language_id,
+        },
         req.thread_count,
     )?;
     let rollout = engine.transformer().rollout_codec_frames_recompute(
         &prepared_inputs.prefill_embd,
         &prepared_inputs.trailing_text_hidden,
         &prepared_inputs.tts_pad_embed,
+        &[],
         req.thread_count,
         req.max_audio_frames,
         req.repetition_penalty,
