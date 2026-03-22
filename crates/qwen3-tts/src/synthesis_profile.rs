@@ -3,6 +3,8 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use crate::pipeline::tts_transformer::CodecRolloutSubTimings;
+
 /// Per-stage wall times for a single [`crate::Qwen3TtsEngine::synthesize_with_profile`] call.
 ///
 /// When pipelining is disabled, stages are sequential and their sum approximates
@@ -30,6 +32,8 @@ pub struct SynthesisStageTimings {
     /// speaker encode + tokenize + prefill + first frame prediction).
     /// This is the theoretical minimum latency for streaming playback.
     pub first_frame_latency: Duration,
+    /// Sub-component breakdown within the `codec_rollout` stage.
+    pub codec_rollout_detail: CodecRolloutSubTimings,
     /// Number of PCM samples in the final output (after prefix trim).
     pub generated_samples: usize,
     /// Output sample rate (Hz).
@@ -73,6 +77,12 @@ impl SynthesisStageTimings {
             post: avg(|s| s.post),
             pipeline_overlap: avg(|s| s.pipeline_overlap),
             first_frame_latency: avg(|s| s.first_frame_latency),
+            codec_rollout_detail: CodecRolloutSubTimings {
+                talker_prefill: avg(|s| s.codec_rollout_detail.talker_prefill),
+                talker_steps: avg(|s| s.codec_rollout_detail.talker_steps),
+                code_pred_total: avg(|s| s.codec_rollout_detail.code_pred_total),
+                kv_writeback: avg(|s| s.codec_rollout_detail.kv_writeback),
+            },
             generated_samples: avg_usize(|s| s.generated_samples),
             sample_rate_hz: samples[0].sample_rate_hz,
         })
@@ -109,6 +119,22 @@ impl SynthesisStageTimings {
                 100.0 * ms / total_ms.max(f64::EPSILON)
             };
             let _ = writeln!(out, "  {name:<28} {ms:>10.3} ms  ({pct:>5.1}%)");
+        }
+        let d = &self.codec_rollout_detail;
+        let has_detail = !d.talker_prefill.is_zero()
+            || !d.talker_steps.is_zero()
+            || !d.code_pred_total.is_zero()
+            || !d.kv_writeback.is_zero();
+        if has_detail {
+            let sub_rows: [(&str, Duration); 4] = [
+                ("  talker_prefill", d.talker_prefill),
+                ("  talker_steps", d.talker_steps),
+                ("  code_pred_total", d.code_pred_total),
+                ("  kv_writeback", d.kv_writeback),
+            ];
+            for (name, sd) in sub_rows {
+                let _ = writeln!(out, "    {name:<26} {:>10.3} ms", duration_ms(sd));
+            }
         }
         if !self.pipeline_overlap.is_zero() {
             let overlap_ms = duration_ms(self.pipeline_overlap);

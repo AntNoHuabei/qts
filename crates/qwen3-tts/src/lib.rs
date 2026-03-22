@@ -17,8 +17,8 @@ pub use model::{load_and_validate, GgufFile, ModelPaths};
 pub use pipeline::speaker_encoder::{SpeakerEncoder, SpeakerEncoderConfig};
 pub use pipeline::tokenizer::{TextTokenizer, TokenizerConfig};
 pub use pipeline::tts_transformer::{
-    CodecRollout, PrefillConditioning, PrefillForwardOutputs, PreparedPrefillInputs,
-    SelectedCodecFrame, TtsTransformer, TtsTransformerConfig, VocoderChunk,
+    CodecRollout, CodecRolloutSubTimings, PrefillConditioning, PrefillForwardOutputs,
+    PreparedPrefillInputs, SelectedCodecFrame, TtsTransformer, TtsTransformerConfig, VocoderChunk,
 };
 pub use pipeline::vocoder::{Vocoder, VocoderConfig, VocoderGraphTemplate};
 pub use synthesis_profile::SynthesisStageTimings;
@@ -401,6 +401,7 @@ impl Qwen3TtsEngine {
             t.codec_rollout = codec_rollout_dur;
             t.vocoder_decode = vocoder_decode;
             t.post = post;
+            t.codec_rollout_detail = codec_rollout.sub_timings;
             t.first_frame_latency =
                 speaker_encode + tokenize + prefill_build + codec_rollout.first_frame_elapsed;
             t.generated_samples = pcm_f32.len();
@@ -584,6 +585,7 @@ impl Qwen3TtsEngine {
                 t.codec_rollout = codec_rollout_dur;
                 t.vocoder_decode = vocoder_decode;
                 t.post = post;
+                t.codec_rollout_detail = codec_rollout.sub_timings;
                 let sequential_sum = codec_rollout_dur + vocoder_decode;
                 t.pipeline_overlap = sequential_sum.saturating_sub(pipeline_wall_clock);
                 t.first_frame_latency =
