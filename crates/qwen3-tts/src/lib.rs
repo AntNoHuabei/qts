@@ -41,6 +41,9 @@ pub struct SynthesizeRequest {
     pub repetition_penalty: f32,
     /// Codec language id (e.g. 2050=en, 2055=zh, 2058=ja).
     pub language_id: i32,
+    /// Number of CPU threads for vocoder decode when pipelining is enabled.
+    /// Defaults to 4. Set to 0 to derive a backend-agnostic fallback from `thread_count`.
+    pub vocoder_thread_count: usize,
     /// When > 0, pipeline transformer (GPU) and vocoder (CPU) by processing
     /// vocoder chunks of this many frames in a background thread while the
     /// transformer continues generating. Set to 0 to disable (sequential).
@@ -59,6 +62,7 @@ impl Default for SynthesizeRequest {
             thread_count: 4,
             repetition_penalty: 1.05,
             language_id: 2050,
+            vocoder_thread_count: 4,
             vocoder_chunk_size: 0,
         }
     }
@@ -442,7 +446,11 @@ impl Qwen3TtsEngine {
 
         let chunk_size = req.vocoder_chunk_size;
         let thread_count = req.thread_count;
-        let vocoder_thread_count = (thread_count / 2).max(1);
+        let vocoder_thread_count = if req.vocoder_thread_count > 0 {
+            req.vocoder_thread_count
+        } else {
+            (thread_count / 2).max(1)
+        };
 
         let (chunk_tx, chunk_rx) = mpsc::sync_channel::<VocoderChunk>(2);
 

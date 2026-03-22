@@ -81,6 +81,7 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
     let mut top_p = 1.0f32;
     let mut repetition_penalty = 1.05f32;
     let mut language_id = 2050i32;
+    let mut vocoder_thread_count = 4usize;
     let mut vocoder_chunk_size = 0usize;
 
     let mut idx = 0;
@@ -133,6 +134,9 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
             "--language-id" => {
                 language_id = parse_value_arg(&args, &mut idx, "--language-id")?;
             }
+            "--vocoder-threads" => {
+                vocoder_thread_count = parse_value_arg(&args, &mut idx, "--vocoder-threads")?;
+            }
             "--chunk-size" => {
                 vocoder_chunk_size = parse_value_arg(&args, &mut idx, "--chunk-size")?;
             }
@@ -170,6 +174,7 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
         thread_count,
         repetition_penalty,
         language_id,
+        vocoder_thread_count,
         vocoder_chunk_size,
     };
 
@@ -205,7 +210,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
     {
         eprintln!(
             "qwen3-tts-cli profile — print per-stage synthesis timings (wall clock)\n\n\
-             usage:\n  profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--reference-wav PATH | --speaker-bin PATH | --voice-clone-prompt PATH]\n\n\
+             usage:\n  profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--reference-wav PATH | --speaker-bin PATH | --voice-clone-prompt PATH]\n\n\
              GGML backend: set env QWEN3_TTS_BACKEND to auto|cpu|metal|vulkan (default auto). On macOS, auto prefers Metal then CPU; use vulkan for MoltenVK when built with --features vulkan.\n\n\
              If --frames is omitted, the CLI derives a text-length-based max frame budget.\n\
              --runs N averages stage times over N full synthesize passes (default 1).\n\
@@ -228,6 +233,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
     let mut repetition_penalty = 1.05f32;
     let mut language_id = 2050i32;
     let mut runs = 1usize;
+    let mut vocoder_thread_count = 4usize;
     let mut vocoder_chunk_size = 0usize;
 
     let mut idx = 0;
@@ -283,6 +289,9 @@ fn run_profile(args: Vec<String>) -> Result<()> {
             "--runs" => {
                 runs = parse_value_arg(&args, &mut idx, "--runs")?;
             }
+            "--vocoder-threads" => {
+                vocoder_thread_count = parse_value_arg(&args, &mut idx, "--vocoder-threads")?;
+            }
             "--chunk-size" => {
                 vocoder_chunk_size = parse_value_arg(&args, &mut idx, "--chunk-size")?;
             }
@@ -323,6 +332,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
         thread_count,
         repetition_penalty,
         language_id,
+        vocoder_thread_count,
         vocoder_chunk_size,
     };
 
@@ -443,6 +453,6 @@ where
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  cargo run -p qwen3-tts-cli -- synthesize --text TEXT --out OUT.wav [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N]\n  cargo run -p qwen3-tts-cli -- profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] (same tuning flags as synthesize)\n  cargo run -p qwen3-tts-cli -- speaker-bin --voice-clone-prompt prompt.pb --out speaker.bin [--model-dir DIR]\n\nIf --frames is omitted, synthesize/profile derive a text-length-based max frame budget.\n\nOr from the repo root (see .cargo/config.toml): cargo xtask bench … / cargo xtask profile …"
+        "usage:\n  cargo run -p qwen3-tts-cli -- synthesize --text TEXT --out OUT.wav [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N]\n  cargo run -p qwen3-tts-cli -- profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] (same tuning flags as synthesize)\n  cargo run -p qwen3-tts-cli -- speaker-bin --voice-clone-prompt prompt.pb --out speaker.bin [--model-dir DIR]\n\nIf --frames is omitted, synthesize/profile derive a text-length-based max frame budget.\n\nOr from the repo root (see .cargo/config.toml): cargo xtask bench … / cargo xtask profile …"
     );
 }

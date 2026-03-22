@@ -8,7 +8,7 @@ use ggml::sys;
 use rand::Rng;
 
 use super::backend::{
-    execute_graph, ggml_soft_max_ext_with_diag_mask_cache, graph_metadata_mem_size, rerun_graph,
+    execute_graph, ggml_soft_max_ext_with_diag_mask_cache, graph_metadata_mem_size,
     slice_as_bytes, slice_as_bytes_mut, BackendSet, OwnedBuffer, TensorDownload, TensorUpload,
 };
 use crate::model::GgufFile;
@@ -149,6 +149,17 @@ struct CodePredStepOutputs {
 }
 
 impl TtsTransformer {
+    fn recent_codebook0_tokens_from_frames(frames: &[SelectedCodecFrame]) -> Vec<i32> {
+        frames.iter().map(|frame| frame.codebook_0_token).collect()
+    }
+
+    fn recent_codebook0_tokens_from_prompt(prompt_frames: &[Vec<i32>]) -> Vec<i32> {
+        prompt_frames
+            .iter()
+            .filter_map(|frame| frame.first().copied())
+            .collect()
+    }
+
     pub fn load_from_gguf(file: &GgufFile) -> Result<Self, Qwen3TtsError> {
         let mut cfg = TtsTransformerConfig::default();
         cfg.text_vocab_size = get_u32_any(
@@ -983,10 +994,7 @@ impl TtsTransformer {
         for frame in prompt_frames {
             self.validate_codebook_frame(frame)?;
         }
-        let prompt_recent_tokens = prompt_frames
-            .iter()
-            .filter_map(|frame| frame.first().copied())
-            .collect::<Vec<_>>();
+        let prompt_recent_tokens = Self::recent_codebook0_tokens_from_prompt(prompt_frames);
         let first = self.select_codec_frame_from_prefill(
             &prefill_outputs,
             repetition_penalty,
@@ -1049,10 +1057,7 @@ impl TtsTransformer {
 
         while frames.len() < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
-            let recent_tokens = frames
-                .iter()
-                .map(|frame| frame.codebook_0_token)
-                .collect::<Vec<_>>();
+            let recent_tokens = Self::recent_codebook0_tokens_from_frames(&frames);
             let prev_token = frames
                 .last()
                 .map(|frame| frame.codebook_0_token)
@@ -1145,8 +1150,6 @@ impl TtsTransformer {
             self.config.n_codebooks as usize,
             self.code_pred._backends.clone(),
         )?;
-        let mut cp_prefill_tmpl = self.build_code_pred_prefill_template(&code_pred_cache)?;
-        let mut cp_step_tmpls = self.build_code_pred_step_templates(&code_pred_cache)?;
 
         let t_prefill = Instant::now();
         let first_outputs = self.forward_prefill_cached(prefill_embd, thread_count, &cache)?;
@@ -1159,10 +1162,7 @@ impl TtsTransformer {
                 *logit = f32::NEG_INFINITY;
             }
         }
-        let prompt_recent_tokens = prompt_frames
-            .iter()
-            .filter_map(|frame| frame.first().copied())
-            .collect::<Vec<_>>();
+        let prompt_recent_tokens = Self::recent_codebook0_tokens_from_prompt(prompt_frames);
         let first_codebook_0 = select_token(
             &logits,
             repetition_penalty,
@@ -1189,7 +1189,7 @@ impl TtsTransformer {
 
         let mut code_pred_dur = Duration::ZERO;
         let t_cp = Instant::now();
-        let first_codes = self.predict_remaining_codebooks_templated(
+        let first_codes = self.predict_remaining_codebooks_kv_with_cache(
             &first_outputs.hidden_state,
             first_codebook_0,
             thread_count,
@@ -1197,8 +1197,6 @@ impl TtsTransformer {
             top_k,
             top_p,
             &code_pred_cache,
-            &mut cp_prefill_tmpl,
-            &mut cp_step_tmpls,
         )?;
         code_pred_dur += t_cp.elapsed();
 
@@ -1220,18 +1218,12 @@ impl TtsTransformer {
         let first_frame_elapsed = t_rollout_start.elapsed();
         let mut n_past = prefill_len;
 
-        let n_kv_max = prefill_len + max_frames + 1;
-        let mut step_tmpl = self.build_step_graph_template(&cache, n_kv_max)?;
-
         let mut talker_steps_dur = Duration::ZERO;
         let mut kv_writeback_dur = Duration::ZERO;
 
         while frames.len() < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
-            let recent_tokens = frames
-                .iter()
-                .map(|frame| frame.codebook_0_token)
-                .collect::<Vec<_>>();
+            let recent_tokens = Self::recent_codebook0_tokens_from_frames(&frames);
             let trailing_idx = generated_frames.saturating_sub(1);
             let trailing_row = if trailing_idx < trailing_len {
                 &trailing_text_hidden[trailing_idx * hidden_size..(trailing_idx + 1) * hidden_size]
@@ -1249,16 +1241,11 @@ impl TtsTransformer {
                 thread_count,
             )?;
             let t_step = Instant::now();
-            let step_outputs = self.forward_step_with_template(
-                &mut step_tmpl,
-                &step_embd,
-                n_past,
-                thread_count,
-                &cache,
-            )?;
+            let step_outputs =
+                self.forward_step_cached(&step_embd, n_past, thread_count, &cache)?;
             let step_elapsed = t_step.elapsed();
             kv_writeback_dur += step_outputs.kv_writeback_elapsed;
-            talker_steps_dur += step_elapsed - step_outputs.kv_writeback_elapsed;
+            talker_steps_dur += step_elapsed.saturating_sub(step_outputs.kv_writeback_elapsed);
 
             let mut logits = step_outputs.logits;
             for (token, logit) in logits.iter_mut().enumerate().skip(suppress_start) {
@@ -1278,7 +1265,7 @@ impl TtsTransformer {
                 break;
             }
             let t_cp = Instant::now();
-            let codebook_tokens = self.predict_remaining_codebooks_templated(
+            let codebook_tokens = self.predict_remaining_codebooks_kv_with_cache(
                 &step_outputs.hidden_state,
                 codebook_0_token,
                 thread_count,
@@ -1286,8 +1273,6 @@ impl TtsTransformer {
                 top_k,
                 top_p,
                 &code_pred_cache,
-                &mut cp_prefill_tmpl,
-                &mut cp_step_tmpls,
             )?;
             code_pred_dur += t_cp.elapsed();
 
@@ -1363,8 +1348,6 @@ impl TtsTransformer {
             self.config.n_codebooks as usize,
             self.code_pred._backends.clone(),
         )?;
-        let mut cp_prefill_tmpl = self.build_code_pred_prefill_template(&code_pred_cache)?;
-        let mut cp_step_tmpls = self.build_code_pred_step_templates(&code_pred_cache)?;
 
         let t_prefill = Instant::now();
         let first_outputs = self.forward_prefill_cached(prefill_embd, thread_count, &cache)?;
@@ -1377,10 +1360,7 @@ impl TtsTransformer {
                 *logit = f32::NEG_INFINITY;
             }
         }
-        let prompt_recent_tokens = prompt_frames
-            .iter()
-            .filter_map(|frame| frame.first().copied())
-            .collect::<Vec<_>>();
+        let prompt_recent_tokens = Self::recent_codebook0_tokens_from_prompt(prompt_frames);
         let first_codebook_0 = select_token(
             &logits,
             repetition_penalty,
@@ -1407,7 +1387,7 @@ impl TtsTransformer {
 
         let mut code_pred_dur = Duration::ZERO;
         let t_cp = Instant::now();
-        let first_codes = self.predict_remaining_codebooks_templated(
+        let first_codes = self.predict_remaining_codebooks_kv_with_cache(
             &first_outputs.hidden_state,
             first_codebook_0,
             thread_count,
@@ -1415,8 +1395,6 @@ impl TtsTransformer {
             top_k,
             top_p,
             &code_pred_cache,
-            &mut cp_prefill_tmpl,
-            &mut cp_step_tmpls,
         )?;
         code_pred_dur += t_cp.elapsed();
 
@@ -1438,9 +1416,6 @@ impl TtsTransformer {
         let first_frame_elapsed = t_rollout_start.elapsed();
         let mut n_past = prefill_len;
 
-        let n_kv_max = prefill_len + max_frames + 1;
-        let mut step_tmpl = self.build_step_graph_template(&cache, n_kv_max)?;
-
         let prefix_frame_count = prompt_frames.len();
         let chunk_size = chunk_size.max(1);
         let mut unsent_start = prefix_frame_count;
@@ -1459,10 +1434,7 @@ impl TtsTransformer {
 
         while frames.len() < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
-            let recent_tokens = frames
-                .iter()
-                .map(|frame| frame.codebook_0_token)
-                .collect::<Vec<_>>();
+            let recent_tokens = Self::recent_codebook0_tokens_from_frames(&frames);
             let trailing_idx = generated_frames.saturating_sub(1);
             let trailing_row = if trailing_idx < trailing_len {
                 &trailing_text_hidden[trailing_idx * hidden_size..(trailing_idx + 1) * hidden_size]
@@ -1480,16 +1452,11 @@ impl TtsTransformer {
                 thread_count,
             )?;
             let t_step = Instant::now();
-            let step_outputs = self.forward_step_with_template(
-                &mut step_tmpl,
-                &step_embd,
-                n_past,
-                thread_count,
-                &cache,
-            )?;
+            let step_outputs =
+                self.forward_step_cached(&step_embd, n_past, thread_count, &cache)?;
             let step_elapsed = t_step.elapsed();
             kv_writeback_dur += step_outputs.kv_writeback_elapsed;
-            talker_steps_dur += step_elapsed - step_outputs.kv_writeback_elapsed;
+            talker_steps_dur += step_elapsed.saturating_sub(step_outputs.kv_writeback_elapsed);
 
             let mut logits = step_outputs.logits;
             for (token, logit) in logits.iter_mut().enumerate().skip(suppress_start) {
@@ -1509,7 +1476,7 @@ impl TtsTransformer {
                 break;
             }
             let t_cp = Instant::now();
-            let codebook_tokens = self.predict_remaining_codebooks_templated(
+            let codebook_tokens = self.predict_remaining_codebooks_kv_with_cache(
                 &step_outputs.hidden_state,
                 codebook_0_token,
                 thread_count,
@@ -1517,8 +1484,6 @@ impl TtsTransformer {
                 top_k,
                 top_p,
                 &code_pred_cache,
-                &mut cp_prefill_tmpl,
-                &mut cp_step_tmpls,
             )?;
             code_pred_dur += t_cp.elapsed();
 
@@ -3342,994 +3307,6 @@ impl TtsTransformer {
 /// Pre-built, pre-allocated step graph whose tensor shapes are independent of `n_past`.
 ///
 /// Attention reads `K_cache[0..n_kv_max-1]` (the cache slots filled so far **plus** garbage
-/// beyond `n_past-1`) and concatenates the freshly computed `K_cur` at the end to form a
-/// fixed-size `[n_kv_max]` key/value sequence.  A softmax mask (uploaded each step) zeroes out
-/// all garbage positions, so their contents never affect the output.
-///
-/// After each graph execution the caller writes K_cur / V_cur back into the cache at the
-/// correct `n_past` offset via `ggml_backend_tensor_set` — no in-graph `ggml_cpy` to a
-/// variable-offset view is needed.
-struct StepGraphTemplate {
-    _ctx: ComputeContext,
-    graph: NonNull<sys::ggml_cgraph>,
-    /// Input: step embedding `[hidden_size, 1]`.
-    inp_step: *mut sys::ggml_tensor,
-    /// Input: position `[1]` (i32).
-    inp_pos: *mut sys::ggml_tensor,
-    /// Input: softmax causal mask – fixed shape, content varies per step.
-    mask: *mut sys::ggml_tensor,
-    /// Output: hidden state `[hidden_size]`.
-    out_hidden: *mut sys::ggml_tensor,
-    /// Output: logits `[codec_vocab_size]`.
-    out_logits: *mut sys::ggml_tensor,
-    /// Per-layer K output `[head_dim, n_kv_heads, 1]` (F32, for external cache write-back).
-    layer_k_out: Vec<*mut sys::ggml_tensor>,
-    /// Per-layer V output (same shape as K).
-    layer_v_out: Vec<*mut sys::ggml_tensor>,
-    /// n_kv_max used when building this template.
-    n_kv_max: usize,
-    /// Whether the graph has been allocated (first run via `execute_graph`, subsequent via `rerun_graph`).
-    allocated: bool,
-}
-
-impl TtsTransformer {
-    /// Build a fixed-shape step graph that can be re-run for every decode step without
-    /// rebuilding or reallocating.
-    fn build_step_graph_template(
-        &self,
-        cache: &TalkerKvCache,
-        n_kv_max: usize,
-    ) -> Result<StepGraphTemplate, Qwen3TtsError> {
-        let hidden_size = self.config.hidden_size as usize;
-        let n_layers = self.config.n_layers as usize;
-        let head_dim = self.config.head_dim as i64;
-        let n_kv_heads = self.config.n_key_value_heads as i64;
-        let n_heads = self.config.n_attention_heads as i64;
-
-        let graph_nodes = 4096;
-        let ctx = ComputeContext::new_graph(graph_nodes)?;
-        let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
-        let graph = NonNull::new(graph).ok_or_else(|| {
-            Qwen3TtsError::InvalidInput("failed to allocate step-template graph".into())
-        })?;
-
-        let inp_step = unsafe {
-            sys::ggml_new_tensor_2d(
-                ctx.as_ptr(),
-                sys::ggml_type_GGML_TYPE_F32,
-                hidden_size as i64,
-                1,
-            )
-        };
-        let inp_pos = unsafe {
-            sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, 1)
-        };
-
-        // Fixed-shape mask: [n_kv_max, 1, n_heads, 1] — will be filled per step.
-        let mask = unsafe {
-            sys::ggml_new_tensor_4d(
-                ctx.as_ptr(),
-                sys::ggml_type_GGML_TYPE_F32,
-                n_kv_max as i64,
-                1,
-                1,
-                1,
-            )
-        };
-
-        let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
-
-        let mut layer_k_out = Vec::with_capacity(n_layers);
-        let mut layer_v_out = Vec::with_capacity(n_layers);
-        let mut inp_l = inp_step;
-
-        for (layer_idx, layer) in self.talker.layers.iter().enumerate() {
-            // --- RMS norm + Q/K/V projections ---
-            let mut cur =
-                unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
-            cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.attn_norm.as_ptr()) };
-
-            let mut q_cur =
-                unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_q.as_ptr(), cur) };
-            let mut k_cur =
-                unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_k.as_ptr(), cur) };
-            let mut v_cur =
-                unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_v.as_ptr(), cur) };
-
-            q_cur = unsafe {
-                sys::ggml_reshape_3d(ctx.as_ptr(), q_cur, head_dim, n_heads, 1)
-            };
-            k_cur = unsafe {
-                sys::ggml_reshape_3d(ctx.as_ptr(), k_cur, head_dim, n_kv_heads, 1)
-            };
-            v_cur = unsafe {
-                sys::ggml_reshape_3d(ctx.as_ptr(), v_cur, head_dim, n_kv_heads, 1)
-            };
-
-            if let Some(attn_q_norm) = layer.attn_q_norm {
-                q_cur = unsafe {
-                    sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps)
-                };
-                q_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), q_cur, attn_q_norm.as_ptr()) };
-            }
-            if let Some(attn_k_norm) = layer.attn_k_norm {
-                k_cur = unsafe {
-                    sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps)
-                };
-                k_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), k_cur, attn_k_norm.as_ptr()) };
-            }
-
-            q_cur = unsafe {
-                sys::ggml_rope_ext(
-                    ctx.as_ptr(), q_cur, inp_pos, std::ptr::null_mut(),
-                    self.config.head_dim, sys::GGML_ROPE_TYPE_NEOX as i32, 0,
-                    self.config.rope_theta, 1.0, 0.0, 1.0, 0.0, 0.0,
-                )
-            };
-            k_cur = unsafe {
-                sys::ggml_rope_ext(
-                    ctx.as_ptr(), k_cur, inp_pos, std::ptr::null_mut(),
-                    self.config.head_dim, sys::GGML_ROPE_TYPE_NEOX as i32, 0,
-                    self.config.rope_theta, 1.0, 0.0, 1.0, 0.0, 0.0,
-                )
-            };
-
-            // Mark K_cur / V_cur as outputs (after ggml_cont for download-ability).
-            let k_out = unsafe { sys::ggml_cont(ctx.as_ptr(), k_cur) };
-            let v_out = unsafe { sys::ggml_cont(ctx.as_ptr(), v_cur) };
-            unsafe {
-                sys::ggml_build_forward_expand(graph.as_ptr(), k_out);
-                sys::ggml_build_forward_expand(graph.as_ptr(), v_out);
-            }
-            layer_k_out.push(k_out);
-            layer_v_out.push(v_out);
-
-            // --- Attention: concat cached K/V with current K_cur/V_cur ---
-            let k_cache_ptr = cache.k_cache[layer_idx].as_ptr();
-            let v_cache_ptr = cache.v_cache[layer_idx].as_ptr();
-
-            // View first (n_kv_max - 1) cache entries.
-            let k_cached = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(), k_cache_ptr,
-                    head_dim, n_kv_heads, (n_kv_max - 1) as i64,
-                    (*k_cache_ptr).nb[1], (*k_cache_ptr).nb[2], 0,
-                )
-            };
-            let v_cached = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(), v_cache_ptr,
-                    head_dim, n_kv_heads, (n_kv_max - 1) as i64,
-                    (*v_cache_ptr).nb[1], (*v_cache_ptr).nb[2], 0,
-                )
-            };
-
-            // Need F32 for concat (cache is F16, k_cur is F32).
-            let k_cached_f32 =
-                unsafe { sys::ggml_cast(ctx.as_ptr(), k_cached, sys::ggml_type_GGML_TYPE_F32) };
-            let v_cached_f32 =
-                unsafe { sys::ggml_cast(ctx.as_ptr(), v_cached, sys::ggml_type_GGML_TYPE_F32) };
-
-            // Concatenate along dim 2 (sequence dim): [head_dim, n_kv_heads, n_kv_max]
-            let mut k_all =
-                unsafe { sys::ggml_concat(ctx.as_ptr(), k_cached_f32, k_cur, 2) };
-            let mut v_all =
-                unsafe { sys::ggml_concat(ctx.as_ptr(), v_cached_f32, v_cur, 2) };
-
-            // Permute for attention: [head_dim, n_kv_max, n_kv_heads]
-            let q = unsafe { sys::ggml_permute(ctx.as_ptr(), q_cur, 0, 2, 1, 3) };
-            k_all = unsafe { sys::ggml_permute(ctx.as_ptr(), k_all, 0, 2, 1, 3) };
-            v_all = unsafe { sys::ggml_permute(ctx.as_ptr(), v_all, 0, 2, 1, 3) };
-
-            let mut kq = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), k_all, q) };
-            kq = unsafe { sys::ggml_scale(ctx.as_ptr(), kq, kq_scale) };
-            // Add the externally-filled mask and softmax.
-            kq = unsafe { sys::ggml_soft_max_ext(ctx.as_ptr(), kq, mask, 1.0, 0.0) };
-
-            v_all = unsafe {
-                sys::ggml_cont(ctx.as_ptr(), sys::ggml_transpose(ctx.as_ptr(), v_all))
-            };
-            let mut kqv = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), v_all, kq) };
-            kqv = unsafe { sys::ggml_permute(ctx.as_ptr(), kqv, 0, 2, 1, 3) };
-            cur = unsafe {
-                sys::ggml_cont_2d(
-                    ctx.as_ptr(), kqv,
-                    (self.config.n_attention_heads * self.config.head_dim) as i64, 1,
-                )
-            };
-
-            // --- Projection + residual ---
-            cur =
-                unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_output.as_ptr(), cur) };
-            cur = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_l) };
-            let inp_ff = cur;
-
-            // --- FFN ---
-            cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_ff, self.config.rms_norm_eps) };
-            cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.ffn_norm.as_ptr()) };
-            let mut gate =
-                unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_gate.as_ptr(), cur) };
-            let up = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_up.as_ptr(), cur) };
-            gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
-            cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
-            let ffn_down_f32 = unsafe {
-                sys::ggml_cast(
-                    ctx.as_ptr(),
-                    layer.ffn_down.as_ptr(),
-                    sys::ggml_type_GGML_TYPE_F32,
-                )
-            };
-            cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
-            inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
-        }
-
-        // --- Output head ---
-        let mut hidden_state =
-            unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
-        hidden_state = unsafe {
-            sys::ggml_mul(ctx.as_ptr(), hidden_state, self.talker.output_norm.as_ptr())
-        };
-        hidden_state = unsafe { sys::ggml_cont(ctx.as_ptr(), hidden_state) };
-        let mut logits = unsafe {
-            sys::ggml_mul_mat(ctx.as_ptr(), self.talker.codec_head.as_ptr(), hidden_state)
-        };
-        logits = unsafe { sys::ggml_cont(ctx.as_ptr(), logits) };
-        unsafe {
-            sys::ggml_build_forward_expand(graph.as_ptr(), hidden_state);
-            sys::ggml_build_forward_expand(graph.as_ptr(), logits);
-        }
-
-        Ok(StepGraphTemplate {
-            _ctx: ctx,
-            graph,
-            inp_step,
-            inp_pos,
-            mask,
-            out_hidden: hidden_state,
-            out_logits: logits,
-            layer_k_out,
-            layer_v_out,
-            n_kv_max,
-            allocated: false,
-        })
-    }
-
-    /// Execute one decode step using a pre-built template, then write K/V back to cache.
-    fn forward_step_with_template(
-        &self,
-        tmpl: &mut StepGraphTemplate,
-        step_embd: &[f32],
-        n_past: usize,
-        thread_count: usize,
-        cache: &TalkerKvCache,
-    ) -> Result<StepForwardOutputs, Qwen3TtsError> {
-        let hidden_size = self.config.hidden_size as usize;
-        let pos = n_past as i32;
-
-        // Build the softmax mask for this step.
-        // The concatenated K has shape [n_kv_max]:
-        //   indices 0..n_past-1  → cache slots 0..n_past-1 (valid)
-        //   indices n_past..n_kv_max-2 → cache garbage (mask -inf)
-        //   index n_kv_max-1     → K_cur (valid, current step)
-        let n = tmpl.n_kv_max;
-        let mut mask_data = vec![0.0f32; n];
-        for i in 0..n {
-            if i < n_past || i == n - 1 {
-                mask_data[i] = 0.0;
-            } else {
-                mask_data[i] = f32::NEG_INFINITY;
-            }
-        }
-
-        let mut hidden = vec![0.0f32; hidden_size];
-        let mut logits_data = vec![0.0f32; self.config.codec_vocab_size as usize];
-
-        let uploads = [
-            TensorUpload { tensor: tmpl.inp_step, bytes: slice_as_bytes(step_embd) },
-            TensorUpload { tensor: tmpl.inp_pos, bytes: slice_as_bytes(std::slice::from_ref(&pos)) },
-            TensorUpload { tensor: tmpl.mask, bytes: slice_as_bytes(&mask_data) },
-        ];
-
-        // Run graph (first call allocates, subsequent calls reuse).
-        {
-            let mut downloads = [
-                TensorDownload {
-                    tensor: tmpl.out_hidden,
-                    bytes: slice_as_bytes_mut(hidden.as_mut_slice()),
-                },
-                TensorDownload {
-                    tensor: tmpl.out_logits,
-                    bytes: slice_as_bytes_mut(logits_data.as_mut_slice()),
-                },
-            ];
-            if !tmpl.allocated {
-                execute_graph(
-                    &cache._backends,
-                    tmpl.graph,
-                    &uploads,
-                    &mut downloads,
-                    thread_count,
-                    "step-template graph execution failed",
-                )?;
-                tmpl.allocated = true;
-            } else {
-                rerun_graph(
-                    &cache._backends,
-                    tmpl.graph,
-                    &uploads,
-                    &mut downloads,
-                    thread_count,
-                    "step-template graph re-run failed",
-                )?;
-            }
-        }
-
-        // Batch all downloads first, then convert once, then batch uploads.
-        let t_kv = Instant::now();
-        let n_layers = self.config.n_layers as usize;
-        let kv_elems =
-            (self.config.head_dim as usize) * (self.config.n_key_value_heads as usize);
-        let kv_f32_bytes = kv_elems * std::mem::size_of::<f32>();
-        let kv_f16_bytes = kv_elems * std::mem::size_of::<u16>();
-        let total_slots = n_layers * 2;
-        let mut kv_f32_all = vec![0.0f32; total_slots * kv_elems];
-        let mut kv_f16_all = vec![0u16; total_slots * kv_elems];
-
-        for layer_idx in 0..n_layers {
-            let k_slot = layer_idx * 2;
-            let v_slot = k_slot + 1;
-            unsafe {
-                sys::ggml_backend_tensor_get(
-                    tmpl.layer_k_out[layer_idx],
-                    kv_f32_all[k_slot * kv_elems..].as_mut_ptr().cast(),
-                    0,
-                    kv_f32_bytes,
-                );
-                sys::ggml_backend_tensor_get(
-                    tmpl.layer_v_out[layer_idx],
-                    kv_f32_all[v_slot * kv_elems..].as_mut_ptr().cast(),
-                    0,
-                    kv_f32_bytes,
-                );
-            }
-        }
-
-        for (dst, &src) in kv_f16_all.iter_mut().zip(kv_f32_all.iter()) {
-            *dst = unsafe { sys::ggml_fp32_to_fp16(src) };
-        }
-
-        for layer_idx in 0..n_layers {
-            let k_cache = cache.k_cache[layer_idx].as_ptr();
-            let v_cache = cache.v_cache[layer_idx].as_ptr();
-            let offset_k = n_past * unsafe { (*k_cache).nb[2] };
-            let offset_v = n_past * unsafe { (*v_cache).nb[2] };
-            let k_slot = layer_idx * 2;
-            let v_slot = k_slot + 1;
-            unsafe {
-                sys::ggml_backend_tensor_set(
-                    v_cache,
-                    kv_f16_all[v_slot * kv_elems..].as_ptr().cast(),
-                    offset_v,
-                    kv_f16_bytes,
-                );
-                sys::ggml_backend_tensor_set(
-                    k_cache,
-                    kv_f16_all[k_slot * kv_elems..].as_ptr().cast(),
-                    offset_k,
-                    kv_f16_bytes,
-                );
-            }
-        }
-        let kv_writeback_elapsed = t_kv.elapsed();
-
-        Ok(StepForwardOutputs {
-            hidden_state: hidden,
-            logits: logits_data,
-            kv_writeback_elapsed,
-        })
-    }
-}
-
-/// Pre-built, pre-allocated code-predictor step graph for a single `generation_step`.
-///
-/// Each template bakes in the embedding table and output head for its generation step.
-/// The attention uses a fixed `n_kv_max`-sized cache view with an externally supplied
-/// softmax mask (same pattern as [`StepGraphTemplate`]).
-struct CodePredStepTemplate {
-    _ctx: ComputeContext,
-    graph: NonNull<sys::ggml_cgraph>,
-    inp_code: *mut sys::ggml_tensor,
-    inp_pos: *mut sys::ggml_tensor,
-    mask: *mut sys::ggml_tensor,
-    out_logits: *mut sys::ggml_tensor,
-    layer_k_out: Vec<*mut sys::ggml_tensor>,
-    layer_v_out: Vec<*mut sys::ggml_tensor>,
-    n_kv_max: usize,
-    allocated: bool,
-}
-
-/// Pre-built, pre-allocated code-predictor prefill graph (fixed 2-token shape).
-struct CodePredPrefillTemplate {
-    _ctx: ComputeContext,
-    graph: NonNull<sys::ggml_cgraph>,
-    inp_hidden: *mut sys::ggml_tensor,
-    inp_cb0_embd: *mut sys::ggml_tensor,
-    inp_pos: *mut sys::ggml_tensor,
-    out_logits: *mut sys::ggml_tensor,
-    allocated: bool,
-}
-
-impl TtsTransformer {
-    /// Build one code-predictor step template per autoregressive step after prefill.
-    ///
-    /// `heads[0]` is used by the fixed 2-token prefill path, so the step templates cover
-    /// `generation_step = 1..heads.len()-1`.
-    fn build_code_pred_step_templates(
-        &self,
-        cache: &CodePredKvCache,
-    ) -> Result<Vec<CodePredStepTemplate>, Qwen3TtsError> {
-        let n_steps = self.code_pred.heads.len().saturating_sub(1);
-        let n_kv_max = cache.n_ctx;
-        let hidden_size = self.config.hidden_size as usize;
-        let head_dim = self.config.head_dim as i64;
-        let n_kv_heads = self.config.n_key_value_heads as i64;
-        let n_heads = self.config.n_attention_heads as i64;
-        let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
-        let n_layers = self.config.code_pred_layers as usize;
-
-        let mut templates = Vec::with_capacity(n_steps);
-
-        // `generation_step = 0` is handled by the prefill; these templates start at step 1.
-        for gen_step in 1..=n_steps {
-            let embd_idx = gen_step - 1;
-            if embd_idx >= self.code_pred.embeddings.len() || gen_step >= self.code_pred.heads.len() {
-                return Err(Qwen3TtsError::InvalidInput(
-                    "code predictor template index out of range".into(),
-                ));
-            }
-
-            let graph_nodes = 2048;
-            let ctx = ComputeContext::new_graph(graph_nodes)?;
-            let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
-            let graph = NonNull::new(graph).ok_or_else(|| {
-                Qwen3TtsError::InvalidInput("failed to allocate code predictor step-template graph".into())
-            })?;
-
-            let inp_code = unsafe {
-                sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, 1)
-            };
-            let inp_pos = unsafe {
-                sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, 1)
-            };
-            let mask = unsafe {
-                sys::ggml_new_tensor_4d(
-                    ctx.as_ptr(),
-                    sys::ggml_type_GGML_TYPE_F32,
-                    n_kv_max as i64,
-                    1, 1, 1,
-                )
-            };
-
-            let weight = self.code_pred.embeddings[embd_idx];
-            let mut inp_l = unsafe {
-                sys::ggml_get_rows(ctx.as_ptr(), weight.as_ptr(), inp_code)
-            };
-            inp_l = unsafe {
-                sys::ggml_reshape_2d(ctx.as_ptr(), inp_l, hidden_size as i64, 1)
-            };
-
-            let mut layer_k_out = Vec::with_capacity(n_layers);
-            let mut layer_v_out = Vec::with_capacity(n_layers);
-
-            for (layer_idx, layer) in self.code_pred.layers.iter().enumerate() {
-                let mut cur = unsafe {
-                    sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps)
-                };
-                cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.attn_norm.as_ptr()) };
-
-                let mut q_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_q.as_ptr(), cur) };
-                let mut k_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_k.as_ptr(), cur) };
-                let mut v_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_v.as_ptr(), cur) };
-
-                q_cur = unsafe { sys::ggml_reshape_3d(ctx.as_ptr(), q_cur, head_dim, n_heads, 1) };
-                k_cur = unsafe { sys::ggml_reshape_3d(ctx.as_ptr(), k_cur, head_dim, n_kv_heads, 1) };
-                v_cur = unsafe { sys::ggml_reshape_3d(ctx.as_ptr(), v_cur, head_dim, n_kv_heads, 1) };
-
-                if let Some(attn_q_norm) = layer.attn_q_norm {
-                    q_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
-                    q_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), q_cur, attn_q_norm.as_ptr()) };
-                }
-                if let Some(attn_k_norm) = layer.attn_k_norm {
-                    k_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
-                    k_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), k_cur, attn_k_norm.as_ptr()) };
-                }
-
-                q_cur = unsafe {
-                    sys::ggml_rope_ext(
-                        ctx.as_ptr(), q_cur, inp_pos, std::ptr::null_mut(),
-                        self.config.head_dim, sys::GGML_ROPE_TYPE_NEOX as i32, 0,
-                        self.config.rope_theta, 1.0, 0.0, 1.0, 0.0, 0.0,
-                    )
-                };
-                k_cur = unsafe {
-                    sys::ggml_rope_ext(
-                        ctx.as_ptr(), k_cur, inp_pos, std::ptr::null_mut(),
-                        self.config.head_dim, sys::GGML_ROPE_TYPE_NEOX as i32, 0,
-                        self.config.rope_theta, 1.0, 0.0, 1.0, 0.0, 0.0,
-                    )
-                };
-
-                let k_out = unsafe { sys::ggml_cont(ctx.as_ptr(), k_cur) };
-                let v_out = unsafe { sys::ggml_cont(ctx.as_ptr(), v_cur) };
-                unsafe {
-                    sys::ggml_build_forward_expand(graph.as_ptr(), k_out);
-                    sys::ggml_build_forward_expand(graph.as_ptr(), v_out);
-                }
-                layer_k_out.push(k_out);
-                layer_v_out.push(v_out);
-
-                let k_cache_ptr = cache.k_cache[layer_idx].as_ptr();
-                let v_cache_ptr = cache.v_cache[layer_idx].as_ptr();
-
-                let k_cached = unsafe {
-                    sys::ggml_view_3d(
-                        ctx.as_ptr(), k_cache_ptr,
-                        head_dim, n_kv_heads, (n_kv_max - 1) as i64,
-                        (*k_cache_ptr).nb[1], (*k_cache_ptr).nb[2], 0,
-                    )
-                };
-                let v_cached = unsafe {
-                    sys::ggml_view_3d(
-                        ctx.as_ptr(), v_cache_ptr,
-                        head_dim, n_kv_heads, (n_kv_max - 1) as i64,
-                        (*v_cache_ptr).nb[1], (*v_cache_ptr).nb[2], 0,
-                    )
-                };
-
-                let k_cached_f32 = unsafe {
-                    sys::ggml_cast(ctx.as_ptr(), k_cached, sys::ggml_type_GGML_TYPE_F32)
-                };
-                let v_cached_f32 = unsafe {
-                    sys::ggml_cast(ctx.as_ptr(), v_cached, sys::ggml_type_GGML_TYPE_F32)
-                };
-
-                let mut k_all = unsafe { sys::ggml_concat(ctx.as_ptr(), k_cached_f32, k_cur, 2) };
-                let mut v_all = unsafe { sys::ggml_concat(ctx.as_ptr(), v_cached_f32, v_cur, 2) };
-
-                let q = unsafe { sys::ggml_permute(ctx.as_ptr(), q_cur, 0, 2, 1, 3) };
-                k_all = unsafe { sys::ggml_permute(ctx.as_ptr(), k_all, 0, 2, 1, 3) };
-                v_all = unsafe { sys::ggml_permute(ctx.as_ptr(), v_all, 0, 2, 1, 3) };
-
-                let mut kq = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), k_all, q) };
-                kq = unsafe { sys::ggml_scale(ctx.as_ptr(), kq, kq_scale) };
-                kq = unsafe { sys::ggml_soft_max_ext(ctx.as_ptr(), kq, mask, 1.0, 0.0) };
-
-                v_all = unsafe {
-                    sys::ggml_cont(ctx.as_ptr(), sys::ggml_transpose(ctx.as_ptr(), v_all))
-                };
-                let mut kqv = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), v_all, kq) };
-                kqv = unsafe { sys::ggml_permute(ctx.as_ptr(), kqv, 0, 2, 1, 3) };
-                cur = unsafe {
-                    sys::ggml_cont_2d(
-                        ctx.as_ptr(), kqv,
-                        (self.config.n_attention_heads * self.config.head_dim) as i64, 1,
-                    )
-                };
-
-                cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_output.as_ptr(), cur) };
-                cur = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_l) };
-                let inp_ff = cur;
-
-                cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_ff, self.config.rms_norm_eps) };
-                cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.ffn_norm.as_ptr()) };
-                let mut gate = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_gate.as_ptr(), cur) };
-                let up = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_up.as_ptr(), cur) };
-                gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
-                cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
-                let ffn_down_f32 = unsafe {
-                    sys::ggml_cast(ctx.as_ptr(), layer.ffn_down.as_ptr(), sys::ggml_type_GGML_TYPE_F32)
-                };
-                cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
-                inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
-            }
-
-            let mut out = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
-            out = unsafe { sys::ggml_mul(ctx.as_ptr(), out, self.code_pred.output_norm.as_ptr()) };
-            let mut logits = unsafe {
-                sys::ggml_mul_mat(ctx.as_ptr(), self.code_pred.heads[gen_step].as_ptr(), out)
-            };
-            logits = unsafe { sys::ggml_cont(ctx.as_ptr(), logits) };
-            unsafe { sys::ggml_build_forward_expand(graph.as_ptr(), logits) };
-
-            templates.push(CodePredStepTemplate {
-                _ctx: ctx,
-                graph,
-                inp_code,
-                inp_pos,
-                mask,
-                out_logits: logits,
-                layer_k_out,
-                layer_v_out,
-                n_kv_max,
-                allocated: false,
-            });
-        }
-
-        Ok(templates)
-    }
-
-    fn forward_code_pred_step_templated(
-        &self,
-        tmpl: &mut CodePredStepTemplate,
-        prev_code: i32,
-        n_past: usize,
-        thread_count: usize,
-        cache: &CodePredKvCache,
-    ) -> Result<CodePredStepOutputs, Qwen3TtsError> {
-        let pos = n_past as i32;
-        let n = tmpl.n_kv_max;
-        let mut mask_data = vec![0.0f32; n];
-        for i in 0..n {
-            mask_data[i] = if i < n_past || i == n - 1 { 0.0 } else { f32::NEG_INFINITY };
-        }
-
-        let mut logits_data = vec![0.0f32; self.config.code_pred_vocab_size as usize];
-
-        let uploads = [
-            TensorUpload { tensor: tmpl.inp_code, bytes: slice_as_bytes(std::slice::from_ref(&prev_code)) },
-            TensorUpload { tensor: tmpl.inp_pos, bytes: slice_as_bytes(std::slice::from_ref(&pos)) },
-            TensorUpload { tensor: tmpl.mask, bytes: slice_as_bytes(&mask_data) },
-        ];
-
-        {
-            let mut downloads = [TensorDownload {
-                tensor: tmpl.out_logits,
-                bytes: slice_as_bytes_mut(logits_data.as_mut_slice()),
-            }];
-            if !tmpl.allocated {
-                execute_graph(
-                    &cache._backends, tmpl.graph, &uploads, &mut downloads, thread_count,
-                    "code predictor step-template graph execution failed",
-                )?;
-                tmpl.allocated = true;
-            } else {
-                rerun_graph(
-                    &cache._backends, tmpl.graph, &uploads, &mut downloads, thread_count,
-                    "code predictor step-template graph re-run failed",
-                )?;
-            }
-        }
-
-        // Batch all downloads first, then convert once, then batch uploads.
-        let n_layers = self.config.code_pred_layers as usize;
-        let kv_elems = (self.config.head_dim as usize) * (self.config.n_key_value_heads as usize);
-        let kv_f32_bytes = kv_elems * std::mem::size_of::<f32>();
-        let kv_f16_bytes = kv_elems * std::mem::size_of::<u16>();
-        let total_slots = n_layers * 2;
-        let mut kv_f32_all = vec![0.0f32; total_slots * kv_elems];
-        let mut kv_f16_all = vec![0u16; total_slots * kv_elems];
-
-        for layer_idx in 0..n_layers {
-            let k_slot = layer_idx * 2;
-            let v_slot = k_slot + 1;
-            unsafe {
-                sys::ggml_backend_tensor_get(
-                    tmpl.layer_k_out[layer_idx],
-                    kv_f32_all[k_slot * kv_elems..].as_mut_ptr().cast(),
-                    0,
-                    kv_f32_bytes,
-                );
-                sys::ggml_backend_tensor_get(
-                    tmpl.layer_v_out[layer_idx],
-                    kv_f32_all[v_slot * kv_elems..].as_mut_ptr().cast(),
-                    0,
-                    kv_f32_bytes,
-                );
-            }
-        }
-
-        for (dst, &src) in kv_f16_all.iter_mut().zip(kv_f32_all.iter()) {
-            *dst = unsafe { sys::ggml_fp32_to_fp16(src) };
-        }
-
-        for layer_idx in 0..n_layers {
-            let k_cache = cache.k_cache[layer_idx].as_ptr();
-            let v_cache = cache.v_cache[layer_idx].as_ptr();
-            let offset_k = n_past * unsafe { (*k_cache).nb[2] };
-            let offset_v = n_past * unsafe { (*v_cache).nb[2] };
-            let k_slot = layer_idx * 2;
-            let v_slot = k_slot + 1;
-            unsafe {
-                sys::ggml_backend_tensor_set(
-                    k_cache,
-                    kv_f16_all[k_slot * kv_elems..].as_ptr().cast(),
-                    offset_k,
-                    kv_f16_bytes,
-                );
-                sys::ggml_backend_tensor_set(
-                    v_cache,
-                    kv_f16_all[v_slot * kv_elems..].as_ptr().cast(),
-                    offset_v,
-                    kv_f16_bytes,
-                );
-            }
-        }
-
-        Ok(CodePredStepOutputs { logits: logits_data })
-    }
-
-    /// Predict remaining codebooks using pre-built graph templates.
-    fn predict_remaining_codebooks_templated(
-        &self,
-        hidden_state: &[f32],
-        codebook_0_token: i32,
-        thread_count: usize,
-        temperature: f32,
-        top_k: i32,
-        top_p: f32,
-        cache: &CodePredKvCache,
-        prefill_tmpl: &mut CodePredPrefillTemplate,
-        step_tmpls: &mut [CodePredStepTemplate],
-    ) -> Result<Vec<i32>, Qwen3TtsError> {
-        let templated_attempt = (|| -> Result<Vec<i32>, Qwen3TtsError> {
-            let hidden_size = self.config.hidden_size as usize;
-            if hidden_state.len() != hidden_size {
-                return Err(Qwen3TtsError::InvalidInput(
-                    "code predictor hidden state shape is invalid".into(),
-                ));
-            }
-
-            let mut codebook_tokens = Vec::with_capacity(self.config.n_codebooks as usize);
-            codebook_tokens.push(codebook_0_token);
-
-            let first = self.forward_code_pred_prefill_templated(
-                hidden_state, codebook_0_token, thread_count, cache, prefill_tmpl,
-            )?;
-            codebook_tokens.push(select_token(&first.logits, 1.0, temperature, top_k, top_p, &[])?);
-
-            while codebook_tokens.len() < self.config.n_codebooks as usize {
-                let generation_step = codebook_tokens.len() - 1;
-                let prev_code = *codebook_tokens.last().ok_or_else(|| {
-                    Qwen3TtsError::InvalidInput("code predictor lost previous code".into())
-                })?;
-                let tmpl_idx = generation_step - 1;
-                if tmpl_idx >= step_tmpls.len() {
-                    return Err(Qwen3TtsError::InvalidInput(
-                        "code predictor step template index out of range".into(),
-                    ));
-                }
-                let outputs = self.forward_code_pred_step_templated(
-                    &mut step_tmpls[tmpl_idx],
-                    prev_code,
-                    generation_step + 1,
-                    thread_count,
-                    cache,
-                )?;
-                codebook_tokens.push(select_token(
-                    &outputs.logits,
-                    1.0,
-                    temperature,
-                    top_k,
-                    top_p,
-                    &[],
-                )?);
-            }
-
-            Ok(codebook_tokens)
-        })();
-
-        match templated_attempt {
-            Ok(codebook_tokens) => Ok(codebook_tokens),
-            Err(_) => self.predict_remaining_codebooks_kv_with_cache(
-                hidden_state,
-                codebook_0_token,
-                thread_count,
-                temperature,
-                top_k,
-                top_p,
-                cache,
-            ),
-        }
-    }
-
-    /// Build a pre-allocated code-predictor prefill template (fixed 2-token shape).
-    fn build_code_pred_prefill_template(
-        &self,
-        cache: &CodePredKvCache,
-    ) -> Result<CodePredPrefillTemplate, Qwen3TtsError> {
-        let hidden_size = self.config.hidden_size as usize;
-        let head_dim = self.config.head_dim as i64;
-        let n_kv_heads = self.config.n_key_value_heads as i64;
-        let n_heads = self.config.n_attention_heads as i64;
-        let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
-
-        let graph_nodes = 2048;
-        let ctx = ComputeContext::new_graph(graph_nodes)?;
-        let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
-        let graph = NonNull::new(graph).ok_or_else(|| {
-            Qwen3TtsError::InvalidInput("failed to allocate code predictor prefill-template graph".into())
-        })?;
-
-        let inp_hidden = unsafe {
-            sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_F32, hidden_size as i64)
-        };
-        let inp_cb0_embd = unsafe {
-            sys::ggml_new_tensor_2d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_F32, hidden_size as i64, 1)
-        };
-        let inp_pos = unsafe {
-            sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, 2)
-        };
-
-        let hidden_2d = unsafe {
-            sys::ggml_reshape_2d(ctx.as_ptr(), inp_hidden, hidden_size as i64, 1)
-        };
-        let mut inp_l = unsafe { sys::ggml_concat(ctx.as_ptr(), hidden_2d, inp_cb0_embd, 1) };
-
-        let mut attn_softmax_mask: Option<(*mut sys::ggml_tensor, Vec<f32>)> = None;
-
-        for (layer_idx, layer) in self.code_pred.layers.iter().enumerate() {
-            let mut cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
-            cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.attn_norm.as_ptr()) };
-            let mut q_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_q.as_ptr(), cur) };
-            let mut k_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_k.as_ptr(), cur) };
-            let mut v_cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_v.as_ptr(), cur) };
-            q_cur = unsafe { sys::ggml_reshape_3d(ctx.as_ptr(), q_cur, head_dim, n_heads, 2) };
-            k_cur = unsafe { sys::ggml_reshape_3d(ctx.as_ptr(), k_cur, head_dim, n_kv_heads, 2) };
-            v_cur = unsafe { sys::ggml_reshape_3d(ctx.as_ptr(), v_cur, head_dim, n_kv_heads, 2) };
-
-            if let Some(attn_q_norm) = layer.attn_q_norm {
-                q_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), q_cur, self.config.rms_norm_eps) };
-                q_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), q_cur, attn_q_norm.as_ptr()) };
-            }
-            if let Some(attn_k_norm) = layer.attn_k_norm {
-                k_cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), k_cur, self.config.rms_norm_eps) };
-                k_cur = unsafe { sys::ggml_mul(ctx.as_ptr(), k_cur, attn_k_norm.as_ptr()) };
-            }
-
-            q_cur = unsafe {
-                sys::ggml_rope_ext(
-                    ctx.as_ptr(), q_cur, inp_pos, std::ptr::null_mut(),
-                    self.config.head_dim, sys::GGML_ROPE_TYPE_NEOX as i32, 0,
-                    self.config.rope_theta, 1.0, 0.0, 1.0, 0.0, 0.0,
-                )
-            };
-            k_cur = unsafe {
-                sys::ggml_rope_ext(
-                    ctx.as_ptr(), k_cur, inp_pos, std::ptr::null_mut(),
-                    self.config.head_dim, sys::GGML_ROPE_TYPE_NEOX as i32, 0,
-                    self.config.rope_theta, 1.0, 0.0, 1.0, 0.0, 0.0,
-                )
-            };
-
-            // Prefill writes K/V to cache via ggml_cpy (positions 0 and 1).
-            let k_cache_ptr = cache.k_cache[layer_idx].as_ptr();
-            let v_cache_ptr = cache.v_cache[layer_idx].as_ptr();
-            let k_cache_view = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(), k_cache_ptr,
-                    head_dim, n_kv_heads, 2,
-                    (*k_cache_ptr).nb[1], (*k_cache_ptr).nb[2], 0,
-                )
-            };
-            let v_cache_view = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(), v_cache_ptr,
-                    head_dim, n_kv_heads, 2,
-                    (*v_cache_ptr).nb[1], (*v_cache_ptr).nb[2], 0,
-                )
-            };
-            unsafe {
-                sys::ggml_build_forward_expand(graph.as_ptr(), sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view));
-                sys::ggml_build_forward_expand(graph.as_ptr(), sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view));
-            }
-
-            let q = unsafe { sys::ggml_permute(ctx.as_ptr(), q_cur, 0, 2, 1, 3) };
-            let k = unsafe { sys::ggml_permute(ctx.as_ptr(), k_cur, 0, 2, 1, 3) };
-            let mut v = unsafe { sys::ggml_permute(ctx.as_ptr(), v_cur, 0, 2, 1, 3) };
-
-            let mut kq = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), k, q) };
-            kq = unsafe { sys::ggml_scale(ctx.as_ptr(), kq, kq_scale) };
-            kq = unsafe {
-                ggml_soft_max_ext_with_diag_mask_cache(ctx.as_ptr(), kq, 0, &mut attn_softmax_mask)
-            };
-            v = unsafe { sys::ggml_cont(ctx.as_ptr(), sys::ggml_transpose(ctx.as_ptr(), v)) };
-            let mut kqv = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), v, kq) };
-            kqv = unsafe { sys::ggml_permute(ctx.as_ptr(), kqv, 0, 2, 1, 3) };
-            cur = unsafe {
-                sys::ggml_cont_2d(
-                    ctx.as_ptr(), kqv,
-                    (self.config.n_attention_heads * self.config.head_dim) as i64, 2,
-                )
-            };
-            cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.attn_output.as_ptr(), cur) };
-            cur = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_l) };
-            let inp_ff = cur;
-
-            cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_ff, self.config.rms_norm_eps) };
-            cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, layer.ffn_norm.as_ptr()) };
-            let mut gate = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_gate.as_ptr(), cur) };
-            let up = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_up.as_ptr(), cur) };
-            gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
-            cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
-            let ffn_down_f32 = unsafe {
-                sys::ggml_cast(ctx.as_ptr(), layer.ffn_down.as_ptr(), sys::ggml_type_GGML_TYPE_F32)
-            };
-            cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
-            inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
-        }
-
-        let mut cur = unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
-        cur = unsafe { sys::ggml_mul(ctx.as_ptr(), cur, self.code_pred.output_norm.as_ptr()) };
-        let last_hidden = unsafe {
-            sys::ggml_view_2d(
-                ctx.as_ptr(), cur, hidden_size as i64, 1,
-                (*cur).nb[1], hidden_size * std::mem::size_of::<f32>(),
-            )
-        };
-        let mut logits = unsafe {
-            sys::ggml_mul_mat(ctx.as_ptr(), self.code_pred.heads[0].as_ptr(), last_hidden)
-        };
-        logits = unsafe { sys::ggml_cont(ctx.as_ptr(), logits) };
-        unsafe { sys::ggml_build_forward_expand(graph.as_ptr(), logits) };
-
-        Ok(CodePredPrefillTemplate {
-            _ctx: ctx,
-            graph,
-            inp_hidden,
-            inp_cb0_embd,
-            inp_pos,
-            out_logits: logits,
-            allocated: false,
-        })
-    }
-
-    fn forward_code_pred_prefill_templated(
-        &self,
-        hidden_state: &[f32],
-        codebook_0_token: i32,
-        thread_count: usize,
-        cache: &CodePredKvCache,
-        tmpl: &mut CodePredPrefillTemplate,
-    ) -> Result<CodePredStepOutputs, Qwen3TtsError> {
-        if codebook_0_token < 0 || codebook_0_token >= self.config.codec_vocab_size {
-            return Err(Qwen3TtsError::InvalidInput(format!(
-                "codec token {codebook_0_token} out of range 0..{}",
-                self.config.codec_vocab_size - 1
-            )));
-        }
-
-        let cb0_embd = self.lookup_codec_embedding_rows(&[codebook_0_token], thread_count)?;
-        let positions = [0i32, 1i32];
-
-        let mut logits_data = vec![0.0f32; self.config.code_pred_vocab_size as usize];
-
-        let uploads = [
-            TensorUpload { tensor: tmpl.inp_hidden, bytes: slice_as_bytes(hidden_state) },
-            TensorUpload { tensor: tmpl.inp_cb0_embd, bytes: slice_as_bytes(&cb0_embd) },
-            TensorUpload { tensor: tmpl.inp_pos, bytes: slice_as_bytes(&positions) },
-        ];
-        let mut downloads = [TensorDownload {
-            tensor: tmpl.out_logits,
-            bytes: slice_as_bytes_mut(logits_data.as_mut_slice()),
-        }];
-
-        if !tmpl.allocated {
-            execute_graph(
-                &cache._backends, tmpl.graph, &uploads, &mut downloads, thread_count,
-                "code predictor prefill-template graph execution failed",
-            )?;
-            tmpl.allocated = true;
-        } else {
-            rerun_graph(
-                &cache._backends, tmpl.graph, &uploads, &mut downloads, thread_count,
-                "code predictor prefill-template graph re-run failed",
-            )?;
-        }
-
-        Ok(CodePredStepOutputs { logits: logits_data })
-    }
-}
-
 fn get_u32_any(file: &GgufFile, keys: &[&str], default: i32) -> i32 {
     for key in keys {
         if file.key_index(key).is_some() {
