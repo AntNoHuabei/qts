@@ -1959,6 +1959,7 @@ dependencies = [
  "libc",
  "qwen3-tts",
  "ratatui",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

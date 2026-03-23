@@ -32,6 +32,7 @@ cmake = "0.1"
 rustfft = "6.4.1"
 prost = "0.14"
 ort = "2.0.0-rc.9"
+windows-sys = "0.61"
 
 [profile.release]
 debug = "line-tables-only"

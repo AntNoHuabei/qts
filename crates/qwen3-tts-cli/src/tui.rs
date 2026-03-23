@@ -1,10 +1,14 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Stdout};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -24,6 +28,12 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{DuplicateHandle, GetCurrentProcess};
 
 use crate::cli_support::{
     default_model_dir, load_engine, parse_value_arg, value_arg, RuntimeBackendOverrides,
@@ -888,10 +898,12 @@ fn print_tui_usage() {
     );
 }
 
+#[cfg(unix)]
 struct StderrSilencer {
     saved_stderr: OwnedFd,
 }
 
+#[cfg(unix)]
 impl StderrSilencer {
     fn new() -> Result<Self> {
         let null = fs::OpenOptions::new()
@@ -914,11 +926,71 @@ impl StderrSilencer {
     }
 }
 
+#[cfg(unix)]
 impl Drop for StderrSilencer {
     fn drop(&mut self) {
         let stderr_fd = io::stderr().as_raw_fd();
         unsafe {
             libc::dup2(self.saved_stderr.as_raw_fd(), stderr_fd);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct StderrSilencer {
+    saved_stderr: OwnedHandle,
+    _null_stderr: fs::File,
+}
+
+#[cfg(windows)]
+impl StderrSilencer {
+    fn new() -> Result<Self> {
+        let null = fs::OpenOptions::new()
+            .write(true)
+            .open("NUL")
+            .context("failed to open NUL for stderr silencing")?;
+
+        let current_process = unsafe { GetCurrentProcess() };
+        let stderr_handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        if stderr_handle.is_null() || stderr_handle == INVALID_HANDLE_VALUE {
+            return Err(anyhow::anyhow!("failed to fetch stderr handle"));
+        }
+
+        let mut saved = std::ptr::null_mut();
+        let duplicated = unsafe {
+            DuplicateHandle(
+                current_process,
+                stderr_handle,
+                current_process,
+                &mut saved,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if duplicated == 0 || saved.is_null() {
+            return Err(anyhow::anyhow!("failed to duplicate stderr handle"));
+        }
+
+        let redirected = unsafe { SetStdHandle(STD_ERROR_HANDLE, null.as_raw_handle() as _) };
+        if redirected == 0 {
+            let _ = unsafe { OwnedHandle::from_raw_handle(saved as _) };
+            return Err(anyhow::anyhow!("failed to redirect stderr to NUL"));
+        }
+
+        let saved_stderr = unsafe { OwnedHandle::from_raw_handle(saved as _) };
+        Ok(Self {
+            saved_stderr,
+            _null_stderr: null,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StderrSilencer {
+    fn drop(&mut self) {
+        unsafe {
+            SetStdHandle(STD_ERROR_HANDLE, self.saved_stderr.as_raw_handle() as _);
         }
     }
 }
