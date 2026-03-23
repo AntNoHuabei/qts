@@ -29,13 +29,12 @@ jobs:
     timeout-minutes: 180
     steps:
       - name: Free Runner Space
-        # NOTE: Use a specific tag or commit shasum for immutability
-        uses: justinthelaw/maximize-github-runner-space@latest
+        uses: justinthelaw/maximize-github-runner-space@v0.8.0
         with:
           skip-components: rust,cached-python
           swapfile-size: 2G
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -43,11 +42,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 

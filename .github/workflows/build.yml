@@ -39,7 +39,7 @@ jobs:
             accel_label: vulkan
             blas_vendor: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
