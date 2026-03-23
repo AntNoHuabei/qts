@@ -17,5 +17,9 @@ native = ["qwen3-tts/native"]
 
 [dependencies]
 anyhow = "1.0.102"
+cpal = "0.16.0"
+crossterm = "0.29.0"
 hound = "3.5.1"
+libc = "0.2"
 qwen3-tts = { version = "0.1.0", path = "../qwen3-tts" }
+ratatui = "0.29.0"

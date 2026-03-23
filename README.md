@@ -145,6 +145,24 @@ cargo run -p qwen3-tts-cli -- synthesize \
   --out target/hello-from-speaker-bin.wav
 ```
 
+## Interactive TUI
+
+For interactive latency demos, the CLI also has a `tui` mode that loads the model once, lets you type successive utterances, and streams audio directly to the default output device through `cpal`.
+
+```bash
+cargo run -p qwen3-tts-cli -- tui \
+  --model-dir models/volko76-q4k-q8 \
+  --speaker-bin target/hello.python.speaker.bin \
+  --chunk-size 4
+```
+
+Notes:
+
+- Press `Enter` to synthesize the current line.
+- Press `Esc`, `Ctrl-C`, or type `:q` to quit.
+- `--chunk-size` controls how many codec frames are vocoded per playback chunk. Smaller values reduce startup latency, while larger values reduce scheduling overhead.
+- `--reference-wav`, `--speaker-bin`, and `--voice-clone-prompt` work the same way as in `synthesize`, but are loaded once up front and then reused for each prompt.
+
 ## Tests
 
 Fast tests run in CI; model-backed tests are opt-in: [docs/testing.md](docs/testing.md).

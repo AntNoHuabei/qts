@@ -6,12 +6,15 @@ use anyhow::{bail, Context, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use qwen3_tts::{Qwen3TtsEngine, SynthesisStageTimings, SynthesizeRequest};
 
+mod tui;
+
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
         Some("speaker-bin") => run_speaker_bin(args.collect()),
         Some("synthesize") => run_synthesize(args.collect()),
         Some("profile") => run_profile(args.collect()),
+        Some("tui") => tui::run(args.collect()),
         _ => {
             print_usage();
             Ok(())
@@ -453,6 +456,6 @@ where
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  cargo run -p qwen3-tts-cli -- synthesize --text TEXT --out OUT.wav [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N]\n  cargo run -p qwen3-tts-cli -- profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] (same tuning flags as synthesize)\n  cargo run -p qwen3-tts-cli -- speaker-bin --voice-clone-prompt prompt.pb --out speaker.bin [--model-dir DIR]\n\nIf --frames is omitted, synthesize/profile derive a text-length-based max frame budget.\n\nOr from the repo root (see .cargo/config.toml): cargo xtask bench … / cargo xtask profile …"
+        "usage:\n  cargo run -p qwen3-tts-cli -- synthesize --text TEXT --out OUT.wav [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N]\n  cargo run -p qwen3-tts-cli -- profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] (same tuning flags as synthesize)\n  cargo run -p qwen3-tts-cli -- speaker-bin --voice-clone-prompt prompt.pb --out speaker.bin [--model-dir DIR]\n  cargo run -p qwen3-tts-cli -- tui [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N]\n\nIf --frames is omitted, synthesize/profile derive a text-length-based max frame budget.\n\nOr from the repo root (see .cargo/config.toml): cargo xtask bench … / cargo xtask profile …"
     );
 }

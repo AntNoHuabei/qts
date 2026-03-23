@@ -7,7 +7,8 @@ use ggml::sys;
 
 use super::backend::{
     execute_graph, ggml_soft_max_ext_with_diag_mask_cache, graph_metadata_mem_size, rerun_graph,
-    slice_as_bytes, slice_as_bytes_mut, BackendSet, OwnedBuffer, TensorDownload, TensorUpload,
+    slice_as_bytes, slice_as_bytes_mut, BackendKind, BackendSet, OwnedBuffer, TensorDownload,
+    TensorUpload,
 };
 use crate::{model::GgufFile, Qwen3TtsError};
 
@@ -180,6 +181,11 @@ impl Vocoder {
             config: cfg,
             weights,
         })
+    }
+
+    #[must_use]
+    pub fn primary_backend_kind(&self) -> BackendKind {
+        self.weights._backends.primary_kind()
     }
 
     #[must_use]

@@ -21,6 +21,7 @@ pub use pipeline::tts_transformer::{
     PreparedPrefillInputs, SelectedCodecFrame, TtsTransformer, TtsTransformerConfig, VocoderChunk,
 };
 pub use pipeline::vocoder::{Vocoder, VocoderConfig, VocoderGraphTemplate};
+pub use pipeline::backend::BackendKind;
 pub use synthesis_profile::SynthesisStageTimings;
 pub use voice_clone_prompt::{
     TensorF32, TensorI32, VoiceClonePromptV2, VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
@@ -76,6 +77,37 @@ pub struct SynthesizeResult {
     pub generated_frames: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingSynthesizeResult {
+    pub sample_rate_hz: u32,
+    pub generated_frames: usize,
+    pub generated_samples: usize,
+}
+
+struct PreparedSynthesis<'a> {
+    prepared_inputs: PreparedPrefillInputs,
+    prompt_frames: Vec<Vec<i32>>,
+    prefix_frame_count: usize,
+    speaker_encode: std::time::Duration,
+    tokenize: std::time::Duration,
+    prefill_build: std::time::Duration,
+    _speaker_embedding: SpeakerEmbeddingStorage<'a>,
+}
+
+enum SpeakerEmbeddingStorage<'a> {
+    Borrowed(&'a [f32]),
+    Owned(Vec<f32>),
+}
+
+impl<'a> SpeakerEmbeddingStorage<'a> {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            Self::Borrowed(values) => values,
+            Self::Owned(values) => values,
+        }
+    }
+}
+
 pub struct Qwen3TtsEngine {
     paths: ModelPaths,
     tokenizer: TextTokenizer,
@@ -129,6 +161,11 @@ impl Qwen3TtsEngine {
     #[must_use]
     pub fn speaker_encoder(&self) -> &SpeakerEncoder {
         &self.speaker_encoder
+    }
+
+    #[must_use]
+    pub fn primary_backend_kind(&self) -> BackendKind {
+        self.transformer.primary_backend_kind()
     }
 
     #[must_use]
@@ -210,6 +247,43 @@ impl Qwen3TtsEngine {
         self.synthesize_impl(req, None, None, None)
     }
 
+    pub fn synthesize_streaming<S>(
+        &self,
+        req: &SynthesizeRequest,
+        sink: &mut S,
+    ) -> Result<StreamingSynthesizeResult, Qwen3TtsError>
+    where
+        S: StreamingSynthesis + Send,
+    {
+        self.synthesize_streaming_impl(req, None, None, sink, None)
+    }
+
+    pub fn synthesize_with_speaker_embedding_streaming<S>(
+        &self,
+        req: &SynthesizeRequest,
+        speaker_embedding: &[f32],
+        sink: &mut S,
+    ) -> Result<StreamingSynthesizeResult, Qwen3TtsError>
+    where
+        S: StreamingSynthesis + Send,
+    {
+        self.validate_speaker_embedding(speaker_embedding)?;
+        self.synthesize_streaming_impl(req, Some(speaker_embedding), None, sink, None)
+    }
+
+    pub fn synthesize_with_voice_clone_prompt_streaming<S>(
+        &self,
+        req: &SynthesizeRequest,
+        prompt: &VoiceClonePromptV2,
+        sink: &mut S,
+    ) -> Result<StreamingSynthesizeResult, Qwen3TtsError>
+    where
+        S: StreamingSynthesis + Send,
+    {
+        self.validate_speaker_embedding(prompt.speaker_embedding())?;
+        self.synthesize_streaming_impl(req, None, Some(prompt), sink, None)
+    }
+
     /// Same as [`Self::synthesize`], plus wall-clock timings per pipeline stage.
     pub fn synthesize_with_profile(
         &self,
@@ -251,38 +325,119 @@ impl Qwen3TtsEngine {
         voice_clone_prompt: Option<&VoiceClonePromptV2>,
         timings: Option<&mut SynthesisStageTimings>,
     ) -> Result<SynthesizeResult, Qwen3TtsError> {
-        let encoded_speaker;
-        let zero_speaker;
-        let prompt_speaker = voice_clone_prompt.map(VoiceClonePromptV2::speaker_embedding);
+        let prepared = self.prepare_synthesis(
+            req,
+            speaker_embedding_override,
+            voice_clone_prompt,
+        )?;
 
+        if req.vocoder_chunk_size > 0 {
+            self.synthesize_pipelined(
+                req,
+                &prepared.prepared_inputs,
+                &prepared.prompt_frames,
+                prepared.prefix_frame_count,
+                timings,
+                prepared.speaker_encode,
+                prepared.tokenize,
+                prepared.prefill_build,
+            )
+        } else {
+            self.synthesize_sequential(
+                req,
+                &prepared.prepared_inputs,
+                &prepared.prompt_frames,
+                prepared.prefix_frame_count,
+                timings,
+                prepared.speaker_encode,
+                prepared.tokenize,
+                prepared.prefill_build,
+            )
+        }
+    }
+
+    fn synthesize_streaming_impl<S>(
+        &self,
+        req: &SynthesizeRequest,
+        speaker_embedding_override: Option<&[f32]>,
+        voice_clone_prompt: Option<&VoiceClonePromptV2>,
+        sink: &mut S,
+        timings: Option<&mut SynthesisStageTimings>,
+    ) -> Result<StreamingSynthesizeResult, Qwen3TtsError>
+    where
+        S: StreamingSynthesis + Send,
+    {
+        let prepared = self.prepare_synthesis(
+            req,
+            speaker_embedding_override,
+            voice_clone_prompt,
+        )?;
+
+        if req.vocoder_chunk_size > 0 {
+            self.synthesize_pipelined_streaming(
+                req,
+                &prepared.prepared_inputs,
+                &prepared.prompt_frames,
+                prepared.prefix_frame_count,
+                sink,
+                timings,
+                prepared.speaker_encode,
+                prepared.tokenize,
+                prepared.prefill_build,
+            )
+        } else {
+            self.synthesize_sequential_streaming(
+                req,
+                &prepared.prepared_inputs,
+                &prepared.prompt_frames,
+                prepared.prefix_frame_count,
+                sink,
+                timings,
+                prepared.speaker_encode,
+                prepared.tokenize,
+                prepared.prefill_build,
+            )
+        }
+    }
+
+    fn prepare_synthesis<'a>(
+        &self,
+        req: &SynthesizeRequest,
+        speaker_embedding_override: Option<&'a [f32]>,
+        voice_clone_prompt: Option<&'a VoiceClonePromptV2>,
+    ) -> Result<PreparedSynthesis<'a>, Qwen3TtsError> {
         let mut speaker_encode = std::time::Duration::ZERO;
         let speaker_embedding = if let Some(speaker_embedding) = speaker_embedding_override {
-            speaker_embedding
-        } else if let Some(speaker_embedding) = prompt_speaker {
-            speaker_embedding
+            SpeakerEmbeddingStorage::Borrowed(speaker_embedding)
+        } else if let Some(speaker_embedding) =
+            voice_clone_prompt.map(VoiceClonePromptV2::speaker_embedding)
+        {
+            SpeakerEmbeddingStorage::Borrowed(speaker_embedding)
         } else if let Some(wav_bytes) = req.reference_wav_bytes.as_deref() {
             let t0 = Instant::now();
-            encoded_speaker = self.encode_reference_speaker(wav_bytes)?;
+            let encoded = self.encode_reference_speaker(wav_bytes)?;
             speaker_encode = t0.elapsed();
-            &encoded_speaker
+            SpeakerEmbeddingStorage::Owned(encoded)
         } else {
-            zero_speaker = vec![0.0f32; self.speaker_embedding_size()];
-            &zero_speaker
+            SpeakerEmbeddingStorage::Owned(vec![0.0f32; self.speaker_embedding_size()])
         };
 
         let t_tok = Instant::now();
         let (tokens, prompt_frames, ref_codebook_0, prefix_frame_count) =
             if let Some(prompt) = voice_clone_prompt {
-                let prompt_frames = prompt.ref_code_shape().map_or_else(Vec::new, |(frames, codebooks)| {
-                    let values = prompt.ref_code_values().unwrap_or(&[]);
-                    (0..frames)
-                        .map(|frame_idx| {
-                            let start = frame_idx * codebooks;
-                            let end = start + codebooks;
-                            values[start..end].to_vec()
-                        })
-                        .collect::<Vec<_>>()
-                });
+                let prompt_frames =
+                    prompt
+                        .ref_code_shape()
+                        .map_or_else(Vec::new, |(frames, codebooks)| {
+                            let values = prompt.ref_code_values().unwrap_or(&[]);
+                            (0..frames)
+                                .map(|frame_idx| {
+                                    let start = frame_idx * codebooks;
+                                    let end = start + codebooks;
+                                    values[start..end].to_vec()
+                                })
+                                .collect::<Vec<_>>()
+                        });
                 let ref_codebook_0 = prompt_frames
                     .iter()
                     .filter_map(|frame| frame.first().copied())
@@ -309,7 +464,7 @@ impl Qwen3TtsEngine {
         let prepared_inputs = self.transformer.build_prefill_inputs(
             PrefillConditioning {
                 text_tokens: &tokens,
-                speaker_embd: Some(speaker_embedding),
+                speaker_embd: Some(speaker_embedding.as_slice()),
                 ref_codebook_0: &ref_codebook_0,
                 language_id: req.language_id,
             },
@@ -317,29 +472,15 @@ impl Qwen3TtsEngine {
         )?;
         let prefill_build = t_prefill.elapsed();
 
-        if req.vocoder_chunk_size > 0 {
-            self.synthesize_pipelined(
-                req,
-                &prepared_inputs,
-                &prompt_frames,
-                prefix_frame_count,
-                timings,
-                speaker_encode,
-                tokenize,
-                prefill_build,
-            )
-        } else {
-            self.synthesize_sequential(
-                req,
-                &prepared_inputs,
-                &prompt_frames,
-                prefix_frame_count,
-                timings,
-                speaker_encode,
-                tokenize,
-                prefill_build,
-            )
-        }
+        Ok(PreparedSynthesis {
+            prepared_inputs,
+            prompt_frames,
+            prefix_frame_count,
+            speaker_encode,
+            tokenize,
+            prefill_build,
+            _speaker_embedding: speaker_embedding,
+        })
     }
 
     fn synthesize_sequential(
@@ -416,6 +557,39 @@ impl Qwen3TtsEngine {
             pcm_f32,
             sample_rate_hz,
             generated_frames,
+        })
+    }
+
+    fn synthesize_sequential_streaming<S>(
+        &self,
+        req: &SynthesizeRequest,
+        prepared_inputs: &PreparedPrefillInputs,
+        prompt_frames: &[Vec<i32>],
+        prefix_frame_count: usize,
+        sink: &mut S,
+        timings: Option<&mut SynthesisStageTimings>,
+        speaker_encode: std::time::Duration,
+        tokenize: std::time::Duration,
+        prefill_build: std::time::Duration,
+    ) -> Result<StreamingSynthesizeResult, Qwen3TtsError>
+    where
+        S: StreamingSynthesis + Send,
+    {
+        let result = self.synthesize_sequential(
+            req,
+            prepared_inputs,
+            prompt_frames,
+            prefix_frame_count,
+            timings,
+            speaker_encode,
+            tokenize,
+            prefill_build,
+        )?;
+        sink.push_pcm_chunk(&result.pcm_f32)?;
+        Ok(StreamingSynthesizeResult {
+            sample_rate_hz: result.sample_rate_hz,
+            generated_frames: result.generated_frames,
+            generated_samples: result.pcm_f32.len(),
         })
     }
 
@@ -610,6 +784,183 @@ impl Qwen3TtsEngine {
         })
     }
 
+    fn synthesize_pipelined_streaming<S>(
+        &self,
+        req: &SynthesizeRequest,
+        prepared_inputs: &PreparedPrefillInputs,
+        prompt_frames: &[Vec<i32>],
+        prefix_frame_count: usize,
+        sink: &mut S,
+        timings: Option<&mut SynthesisStageTimings>,
+        speaker_encode: std::time::Duration,
+        tokenize: std::time::Duration,
+        prefill_build: std::time::Duration,
+    ) -> Result<StreamingSynthesizeResult, Qwen3TtsError>
+    where
+        S: StreamingSynthesis + Send,
+    {
+        use std::sync::mpsc;
+
+        let chunk_size = req.vocoder_chunk_size;
+        let thread_count = req.thread_count;
+        let vocoder_thread_count = if req.vocoder_thread_count > 0 {
+            req.vocoder_thread_count
+        } else {
+            (thread_count / 2).max(1)
+        };
+
+        let (chunk_tx, chunk_rx) = mpsc::sync_channel::<VocoderChunk>(2);
+
+        let t_pipeline_start = Instant::now();
+
+        std::thread::scope(|s| {
+            let vocoder = &self.vocoder;
+            let n_codebooks = vocoder.config().n_codebooks as usize;
+
+            let vocoder_handle = s.spawn(
+                move || -> Result<(usize, std::time::Duration), Qwen3TtsError> {
+                    const OVERLAP_FRAMES: usize = 1;
+                    let standard_frames = OVERLAP_FRAMES + chunk_size;
+                    let t_voc_start = Instant::now();
+                    let mut total_samples = 0usize;
+                    let mut all_pcm = Vec::<f32>::new();
+                    let mut emitted_samples = 0usize;
+                    let mut prev_codes: Vec<i32> = Vec::new();
+                    let mut prev_n_frames: usize = 0;
+                    let mut template: Option<VocoderGraphTemplate> = None;
+
+                    while let Ok(chunk) = chunk_rx.recv() {
+                        let ctx_frames = OVERLAP_FRAMES.min(prev_n_frames);
+
+                        let mut combined_buf = Vec::new();
+                        let (codes_slice, decode_frames) = if ctx_frames > 0 {
+                            combined_buf.reserve(ctx_frames * n_codebooks + chunk.codes.len());
+                            let ctx_start = prev_codes.len() - ctx_frames * n_codebooks;
+                            combined_buf.extend_from_slice(&prev_codes[ctx_start..]);
+                            combined_buf.extend_from_slice(&chunk.codes);
+                            (combined_buf.as_slice(), ctx_frames + chunk.n_frames)
+                        } else {
+                            (chunk.codes.as_slice(), chunk.n_frames)
+                        };
+
+                        let audio = if decode_frames == standard_frames {
+                            if template.is_none() {
+                                template = Some(vocoder.build_decode_template(standard_frames)?);
+                            }
+                            vocoder.decode_with_template(
+                                template.as_mut().unwrap(),
+                                codes_slice,
+                                vocoder_thread_count,
+                            )?
+                        } else {
+                            vocoder.decode(codes_slice, decode_frames, vocoder_thread_count)?
+                        };
+
+                        let current_chunk_samples = if ctx_frames > 0 && !all_pcm.is_empty() {
+                            let total_frames = ctx_frames + chunk.n_frames;
+                            let overlap_samples =
+                                (audio.len() * ctx_frames / total_frames).min(all_pcm.len());
+                            let start = all_pcm.len() - overlap_samples;
+                            for i in 0..overlap_samples {
+                                let t = (i as f32 + 0.5) / overlap_samples as f32;
+                                all_pcm[start + i] =
+                                    all_pcm[start + i] * (1.0 - t) + audio[i] * t;
+                            }
+                            let appended = audio.len().saturating_sub(overlap_samples);
+                            all_pcm.extend_from_slice(&audio[overlap_samples..]);
+                            appended
+                        } else {
+                            let appended = audio.len();
+                            all_pcm.extend_from_slice(&audio);
+                            appended
+                        };
+
+                        let hold_back_frames = OVERLAP_FRAMES.min(chunk.n_frames);
+                        let hold_back_samples = if chunk.n_frames == 0 {
+                            0
+                        } else {
+                            current_chunk_samples
+                                .saturating_mul(hold_back_frames)
+                                .checked_div(chunk.n_frames)
+                                .unwrap_or(0)
+                                .min(all_pcm.len().saturating_sub(emitted_samples))
+                        };
+                        let finalized_end = all_pcm.len().saturating_sub(hold_back_samples);
+
+                        if finalized_end > emitted_samples {
+                            let finalized = &all_pcm[emitted_samples..finalized_end];
+                            total_samples += finalized.len();
+                            sink.push_pcm_chunk(finalized)?;
+                            emitted_samples = finalized_end;
+                        }
+
+                        prev_n_frames = chunk.n_frames;
+                        prev_codes = chunk.codes;
+                    }
+
+                    if all_pcm.len() > emitted_samples {
+                        let finalized = &all_pcm[emitted_samples..];
+                        total_samples += finalized.len();
+                        sink.push_pcm_chunk(finalized)?;
+                    }
+
+                    Ok((total_samples, t_voc_start.elapsed()))
+                },
+            );
+
+            let t_roll = Instant::now();
+            let codec_rollout = self.transformer.rollout_codec_frames_kv_streaming(
+                &prepared_inputs.prefill_embd,
+                &prepared_inputs.trailing_text_hidden,
+                &prepared_inputs.tts_pad_embed,
+                prompt_frames,
+                thread_count,
+                req.max_audio_frames,
+                req.repetition_penalty,
+                req.temperature,
+                req.top_k,
+                req.top_p,
+                chunk_size,
+                &chunk_tx,
+            );
+            let codec_rollout_dur = t_roll.elapsed();
+            drop(chunk_tx);
+
+            let codec_rollout = codec_rollout?;
+            let generated_frames = codec_rollout
+                .frames
+                .len()
+                .saturating_sub(prefix_frame_count);
+
+            let (generated_samples, vocoder_decode) = vocoder_handle.join().unwrap()?;
+
+            let pipeline_wall_clock = t_pipeline_start.elapsed();
+            let post = std::time::Duration::ZERO;
+            let sample_rate_hz = self.vocoder.config().sample_rate as u32;
+            if let Some(t) = timings {
+                t.speaker_encode = speaker_encode;
+                t.tokenize = tokenize;
+                t.prefill_build = prefill_build;
+                t.codec_rollout = codec_rollout_dur;
+                t.vocoder_decode = vocoder_decode;
+                t.post = post;
+                t.codec_rollout_detail = codec_rollout.sub_timings;
+                let sequential_sum = codec_rollout_dur + vocoder_decode;
+                t.pipeline_overlap = sequential_sum.saturating_sub(pipeline_wall_clock);
+                t.first_frame_latency =
+                    speaker_encode + tokenize + prefill_build + codec_rollout.first_frame_elapsed;
+                t.generated_samples = generated_samples;
+                t.sample_rate_hz = sample_rate_hz;
+            }
+
+            Ok(StreamingSynthesizeResult {
+                sample_rate_hz,
+                generated_frames,
+                generated_samples,
+            })
+        })
+    }
+
     fn validate_speaker_embedding(&self, speaker_embedding: &[f32]) -> Result<(), Qwen3TtsError> {
         let expected = self.speaker_embedding_size();
         if speaker_embedding.len() != expected {
@@ -621,9 +972,17 @@ impl Qwen3TtsEngine {
     }
 }
 
-/// Placeholder for future frame/chunk streaming (e.g. Godot audio stream).
 pub trait StreamingSynthesis {
-    fn next_pcm_chunk(&mut self) -> Option<Result<Vec<f32>, Qwen3TtsError>>;
+    fn push_pcm_chunk(&mut self, pcm_f32: &[f32]) -> Result<(), Qwen3TtsError>;
+}
+
+impl<F> StreamingSynthesis for F
+where
+    F: FnMut(&[f32]) -> Result<(), Qwen3TtsError>,
+{
+    fn push_pcm_chunk(&mut self, pcm_f32: &[f32]) -> Result<(), Qwen3TtsError> {
+        self(pcm_f32)
+    }
 }
 
 #[cfg(test)]

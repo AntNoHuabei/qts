@@ -92,18 +92,22 @@ fn parse_qwen3_tts_backend() -> Result<BackendChoice, Qwen3TtsError> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BackendKind {
+pub enum BackendKind {
     Cpu,
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     Metal,
+    #[cfg(feature = "vulkan")]
+    Vulkan,
 }
 
 impl BackendKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Cpu => "CPU",
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             Self::Metal => "Metal",
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan => "Vulkan",
         }
     }
 }
@@ -119,6 +123,7 @@ unsafe impl Sync for BackendSet {}
 
 struct BackendSetInner {
     primary: OwnedBackend,
+    primary_kind: BackendKind,
     cpu_fallback: Option<OwnedBackend>,
     primary_galloc: Mutex<OwnedGallocr>,
     /// Vulkan's `ggml_vk_conv_transpose_1d` requires F32 weights/activations; GGUF kernels are often quantized.
@@ -139,12 +144,16 @@ impl BackendSet {
                 if backend_debug_enabled() {
                     eprintln!("[backend-debug] selected {}", BackendKind::Cpu.as_str());
                 }
-                Self::with_primary(primary, None, false)
+                Self::with_primary(primary, BackendKind::Cpu, None, false)
             }
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
-            BackendChoice::Metal => Self::require_reg_backend(ggml_reg_mtl(), "Metal", false),
+            BackendChoice::Metal => {
+                Self::require_reg_backend(ggml_reg_mtl(), BackendKind::Metal, false)
+            }
             #[cfg(feature = "vulkan")]
-            BackendChoice::Vulkan => Self::require_reg_backend(ggml_reg_vulkan(), "Vulkan", true),
+            BackendChoice::Vulkan => {
+                Self::require_reg_backend(ggml_reg_vulkan(), BackendKind::Vulkan, true)
+            }
         }
     }
 
@@ -154,7 +163,7 @@ impl BackendSet {
             sys::ggml_cpu_init();
         }
         let primary = OwnedBackend::cpu()?;
-        Self::with_primary(primary, None, false)
+        Self::with_primary(primary, BackendKind::Cpu, None, false)
     }
 
     /// Automatic preference: Apple → Metal (if enabled) → CPU. Non-Apple → Vulkan (if enabled) → CPU.
@@ -162,13 +171,14 @@ impl BackendSet {
     fn auto_select_backend() -> Result<Self, Qwen3TtsError> {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         if let Some(backends) =
-            Self::try_optional_reg(ggml_reg_mtl(), BackendKind::Metal.as_str(), false)?
+            Self::try_optional_reg(ggml_reg_mtl(), BackendKind::Metal, false)?
         {
             return Ok(backends);
         }
 
         #[cfg(all(feature = "vulkan", not(target_vendor = "apple")))]
-        if let Some(backends) = Self::try_optional_reg(ggml_reg_vulkan(), "Vulkan", true)? {
+        if let Some(backends) = Self::try_optional_reg(ggml_reg_vulkan(), BackendKind::Vulkan, true)?
+        {
             return Ok(backends);
         }
 
@@ -176,7 +186,7 @@ impl BackendSet {
         if backend_debug_enabled() {
             eprintln!("[backend-debug] selected {}", BackendKind::Cpu.as_str());
         }
-        Self::with_primary(primary, None, false)
+        Self::with_primary(primary, BackendKind::Cpu, None, false)
     }
 
     #[cfg(any(
@@ -185,15 +195,17 @@ impl BackendSet {
     ))]
     fn try_optional_reg(
         reg: &CStr,
-        label: &str,
+        kind: BackendKind,
         vulkan_conv_transpose_cast_quant: bool,
     ) -> Result<Option<Self>, Qwen3TtsError> {
+        let label = kind.as_str();
         if let Some(primary) = OwnedBackend::init_from_reg(reg, label, false)? {
             if backend_debug_enabled() {
                 eprintln!("[backend-debug] selected {label}");
             }
             return Ok(Some(Self::with_primary(
                 primary,
+                kind,
                 Some(OwnedBackend::cpu()?),
                 vulkan_conv_transpose_cast_quant,
             )?));
@@ -211,9 +223,10 @@ impl BackendSet {
     ))]
     fn require_reg_backend(
         reg: &CStr,
-        label: &str,
+        kind: BackendKind,
         vulkan_conv_transpose_cast_quant: bool,
     ) -> Result<Self, Qwen3TtsError> {
+        let label = kind.as_str();
         let primary = OwnedBackend::init_from_reg(reg, label, true)?.ok_or_else(|| {
             Qwen3TtsError::InvalidInput(format!(
                 "QWEN3_TTS_BACKEND requested {label}, but GPU backend init failed (see QWEN3_TTS_GPU_DEVICE, drivers, or SDK)"
@@ -224,6 +237,7 @@ impl BackendSet {
         }
         Self::with_primary(
             primary,
+            kind,
             Some(OwnedBackend::cpu()?),
             vulkan_conv_transpose_cast_quant,
         )
@@ -231,12 +245,14 @@ impl BackendSet {
 
     fn with_primary(
         primary: OwnedBackend,
+        primary_kind: BackendKind,
         cpu_fallback: Option<OwnedBackend>,
         vulkan_conv_transpose_cast_quant: bool,
     ) -> Result<Self, Qwen3TtsError> {
         let primary_galloc = Mutex::new(OwnedGallocr::new(primary.as_ptr())?);
         Ok(Self(Arc::new(BackendSetInner {
             primary,
+            primary_kind,
             cpu_fallback,
             primary_galloc,
             vulkan_conv_transpose_cast_quant,
@@ -250,6 +266,10 @@ impl BackendSet {
 
     pub(crate) fn primary_ptr(&self) -> sys::ggml_backend_t {
         self.0.primary.as_ptr()
+    }
+
+    pub(crate) fn primary_kind(&self) -> BackendKind {
+        self.0.primary_kind
     }
 
     pub(crate) fn configure_threads(&self, thread_count: usize) {

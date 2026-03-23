@@ -9,7 +9,8 @@ use rand::Rng;
 
 use super::backend::{
     execute_graph, ggml_soft_max_ext_with_diag_mask_cache, graph_metadata_mem_size,
-    slice_as_bytes, slice_as_bytes_mut, BackendSet, OwnedBuffer, TensorDownload, TensorUpload,
+    slice_as_bytes, slice_as_bytes_mut, BackendKind, BackendSet, OwnedBuffer, TensorDownload,
+    TensorUpload,
 };
 use crate::model::GgufFile;
 use crate::Qwen3TtsError;
@@ -347,6 +348,11 @@ impl TtsTransformer {
     #[must_use]
     pub fn config(&self) -> &TtsTransformerConfig {
         &self.config
+    }
+
+    #[must_use]
+    pub fn primary_backend_kind(&self) -> BackendKind {
+        self.talker._backends.primary_kind()
     }
 
     pub fn build_prefill_inputs(
