@@ -11,7 +11,10 @@ pub struct ModelPaths {
 
 impl ModelPaths {
     pub fn new(main_gguf: PathBuf, vocoder_onnx: PathBuf) -> Self {
-        Self { main_gguf, vocoder_onnx }
+        Self {
+            main_gguf,
+            vocoder_onnx,
+        }
     }
 
     /// Resolve under a single directory using the conventional filenames.

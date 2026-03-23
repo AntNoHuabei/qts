@@ -148,13 +148,13 @@ impl SynthesisStageTimings {
             let _ = writeln!(
                 out,
                 "  {:<28} {:>10.3} ms",
-                "first_frame_latency", duration_ms(self.first_frame_latency)
+                "first_frame_latency",
+                duration_ms(self.first_frame_latency)
             );
         }
         let _ = writeln!(out, "  {:<28} {:>10.3} ms  (100.0%)", "total", total_ms);
         if self.sample_rate_hz > 0 && self.generated_samples > 0 {
-            let audio_secs =
-                self.generated_samples as f64 / self.sample_rate_hz as f64;
+            let audio_secs = self.generated_samples as f64 / self.sample_rate_hz as f64;
             let audio_ms = audio_secs * 1_000.0;
             let rtf = if audio_secs > 0.0 {
                 total.as_secs_f64() / audio_secs

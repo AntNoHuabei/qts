@@ -68,7 +68,10 @@ fn language_option_from_name(name: &str) -> Option<LanguageOption> {
 }
 
 fn language_option_from_id(id: i32) -> Option<LanguageOption> {
-    LANGUAGE_OPTIONS.iter().copied().find(|option| option.id == id)
+    LANGUAGE_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.id == id)
 }
 
 fn format_language(language_id: i32) -> String {
@@ -89,7 +92,10 @@ fn next_language_id(language_id: i32) -> i32 {
 }
 
 pub(crate) fn run(args: Vec<String>) -> Result<()> {
-    if args.iter().any(|arg| matches!(arg.as_str(), "--help" | "-h")) {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
         print_tui_usage();
         return Ok(());
     }
@@ -251,8 +257,11 @@ impl TuiConfig {
                     config.model_dir = PathBuf::from(value_arg(&args, &mut idx, "--model-dir")?);
                 }
                 "--reference-wav" => {
-                    config.reference_wav =
-                        Some(PathBuf::from(value_arg(&args, &mut idx, "--reference-wav")?));
+                    config.reference_wav = Some(PathBuf::from(value_arg(
+                        &args,
+                        &mut idx,
+                        "--reference-wav",
+                    )?));
                 }
                 "--speaker-bin" => {
                     config.speaker_bin =
@@ -289,11 +298,13 @@ impl TuiConfig {
                 }
                 "--language" => {
                     let value = value_arg(&args, &mut idx, "--language")?;
-                    config.language_id = language_option_from_name(&value).ok_or_else(|| {
-                        anyhow::anyhow!(
+                    config.language_id = language_option_from_name(&value)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
                             "unsupported value for --language: {value} (expected en, zh, or ja)"
                         )
-                    })?.id;
+                        })?
+                        .id;
                 }
                 "--vocoder-threads" => {
                     config.vocoder_thread_count =
@@ -310,7 +321,9 @@ impl TuiConfig {
             + usize::from(config.speaker_bin.is_some())
             + usize::from(config.voice_clone_prompt.is_some());
         if prompt_inputs > 1 {
-            bail!("--reference-wav, --speaker-bin, and --voice-clone-prompt are mutually exclusive");
+            bail!(
+                "--reference-wav, --speaker-bin, and --voice-clone-prompt are mutually exclusive"
+            );
         }
 
         Ok(config)
@@ -455,13 +468,19 @@ impl TerminalSession {
                 .split(area);
 
             let header = Paragraph::new(vec![
-                Line::from("Enter to synthesize. F2 cycles language. Esc/Ctrl-C quits. :q also exits."),
+                Line::from(
+                    "Enter to synthesize. F2 cycles language. Esc/Ctrl-C quits. :q also exits.",
+                ),
                 Line::from(app.backend_line.as_str()),
                 Line::from(app.config_line.as_str()),
                 Line::from(app.conditioning_line.as_str()),
                 Line::from(app.playback_line.as_str()),
             ])
-            .block(Block::default().title("Qwen3 TTS TUI").borders(Borders::ALL));
+            .block(
+                Block::default()
+                    .title("Qwen3 TTS TUI")
+                    .borders(Borders::ALL),
+            );
             frame.render_widget(header, sections[0]);
 
             let log_lines = if app.logs.is_empty() {
@@ -671,7 +690,9 @@ impl LinearResampler {
     }
 
     fn finish(&mut self) -> Vec<f32> {
-        self.last_sample.take().map_or_else(Vec::new, |sample| vec![sample])
+        self.last_sample
+            .take()
+            .map_or_else(Vec::new, |sample| vec![sample])
     }
 }
 
@@ -724,11 +745,8 @@ where
     Ok(stream)
 }
 
-fn write_output<T>(
-    output: &mut [T],
-    channels: usize,
-    queue: &Arc<(Mutex<PlaybackQueue>, Condvar)>,
-) where
+fn write_output<T>(output: &mut [T], channels: usize, queue: &Arc<(Mutex<PlaybackQueue>, Condvar)>)
+where
     T: SizedSample + FromSample<f32>,
 {
     let (lock, cvar) = &**queue;
@@ -766,7 +784,10 @@ impl PlaybackSummary {
     fn describe(&self) -> String {
         format!(
             "first_finalized_audio={:.1}ms synth={:.1}ms audio={:.2}s frames={}",
-            self.first_chunk_latency_ms, self.synthesis_ms, self.audio_seconds, self.generated_frames
+            self.first_chunk_latency_ms,
+            self.synthesis_ms,
+            self.audio_seconds,
+            self.generated_frames
         )
     }
 }
@@ -819,10 +840,7 @@ fn warmup_engine(
     playback: &PlaybackStream,
 ) -> Result<PlaybackSummary> {
     let mut request = config.make_request(WARMUP_TEXT);
-    request.max_audio_frames = request
-        .max_audio_frames
-        .min(WARMUP_MAX_AUDIO_FRAMES)
-        .max(1);
+    request.max_audio_frames = request.max_audio_frames.min(WARMUP_MAX_AUDIO_FRAMES).max(1);
 
     let start = Instant::now();
     let mut first_chunk_latency: Option<Duration> = None;

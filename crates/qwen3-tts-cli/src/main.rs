@@ -118,10 +118,7 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
 }
 
 fn run_profile(args: Vec<String>) -> Result<()> {
-    if args
-        .iter()
-        .any(|a| matches!(a.as_str(), "--help" | "-h"))
-    {
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         eprintln!(
             "qwen3-tts-cli profile — print per-stage synthesis timings (wall clock)\n\n\
              usage:\n  profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--reference-wav PATH | --speaker-bin PATH | --voice-clone-prompt PATH] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|coreml] [--vocoder-ep-fallback LIST]\n\n\
@@ -195,10 +192,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
         samples[0].format_table()
     } else {
         let avg = SynthesisStageTimings::average(&samples).expect("non-empty samples");
-        format!(
-            "averaged over {runs} runs\n{}",
-            avg.format_table()
-        )
+        format!("averaged over {runs} runs\n{}", avg.format_table())
     };
     eprint!("{summary}");
 

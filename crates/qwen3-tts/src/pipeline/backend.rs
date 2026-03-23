@@ -20,10 +20,7 @@ fn ggml_reg_vulkan() -> &'static CStr {
     CStr::from_bytes_with_nul(b"Vulkan\0").expect("Vulkan reg name")
 }
 
-#[cfg(any(
-    all(feature = "metal", target_vendor = "apple"),
-    feature = "vulkan"
-))]
+#[cfg(any(all(feature = "metal", target_vendor = "apple"), feature = "vulkan"))]
 fn gpu_device_index() -> Result<usize, Qwen3TtsError> {
     let Ok(s) = std::env::var("QWEN3_TTS_GPU_DEVICE") else {
         return Ok(0);
@@ -251,7 +248,9 @@ impl BackendSet {
                 #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
                 {
                     if backend_debug_enabled() {
-                        eprintln!("[backend-debug] skipping metal (not supported by this build/target)");
+                        eprintln!(
+                            "[backend-debug] skipping metal (not supported by this build/target)"
+                        );
                     }
                     Ok(None)
                 }
@@ -272,20 +271,18 @@ impl BackendSet {
         }
     }
 
-    #[cfg(any(
-        all(feature = "metal", target_vendor = "apple"),
-        feature = "vulkan"
-    ))]
-    fn try_optional_reg(
-        reg: &CStr,
-        kind: BackendKind,
-    ) -> Result<Option<Self>, Qwen3TtsError> {
+    #[cfg(any(all(feature = "metal", target_vendor = "apple"), feature = "vulkan"))]
+    fn try_optional_reg(reg: &CStr, kind: BackendKind) -> Result<Option<Self>, Qwen3TtsError> {
         let label = kind.as_str();
         if let Some(primary) = OwnedBackend::init_from_reg(reg, label, false)? {
             if backend_debug_enabled() {
                 eprintln!("[backend-debug] selected {label}");
             }
-            return Ok(Some(Self::with_primary(primary, kind, Some(OwnedBackend::cpu()?))?));
+            return Ok(Some(Self::with_primary(
+                primary,
+                kind,
+                Some(OwnedBackend::cpu()?),
+            )?));
         }
 
         if backend_debug_enabled() {
@@ -294,14 +291,8 @@ impl BackendSet {
         Ok(None)
     }
 
-    #[cfg(any(
-        all(feature = "metal", target_vendor = "apple"),
-        feature = "vulkan"
-    ))]
-    fn require_reg_backend(
-        reg: &CStr,
-        kind: BackendKind,
-    ) -> Result<Self, Qwen3TtsError> {
+    #[cfg(any(all(feature = "metal", target_vendor = "apple"), feature = "vulkan"))]
+    fn require_reg_backend(reg: &CStr, kind: BackendKind) -> Result<Self, Qwen3TtsError> {
         let label = kind.as_str();
         let primary = OwnedBackend::init_from_reg(reg, label, true)?.ok_or_else(|| {
             Qwen3TtsError::InvalidInput(format!(
@@ -366,11 +357,12 @@ impl OwnedBackend {
     ///
     /// `ggml_backend_init_by_name` matches **per-device** ids (`Vulkan0`, `MTL0`, …), not registry
     /// names (`Vulkan`, `MTL`), so we use the registry API instead.
-    #[cfg(any(
-        all(feature = "metal", target_vendor = "apple"),
-        feature = "vulkan"
-    ))]
-    fn init_from_reg(reg: &CStr, label: &str, require: bool) -> Result<Option<Self>, Qwen3TtsError> {
+    #[cfg(any(all(feature = "metal", target_vendor = "apple"), feature = "vulkan"))]
+    fn init_from_reg(
+        reg: &CStr,
+        label: &str,
+        require: bool,
+    ) -> Result<Option<Self>, Qwen3TtsError> {
         let device_index = gpu_device_index()?;
 
         let reg_ptr = unsafe { sys::ggml_backend_reg_by_name(reg.as_ptr()) };
@@ -404,10 +396,7 @@ impl OwnedBackend {
             return Ok(None);
         };
 
-        Ok(Some(Self {
-            raw,
-            is_cpu: false,
-        }))
+        Ok(Some(Self { raw, is_cpu: false }))
     }
 
     fn as_ptr(&self) -> sys::ggml_backend_t {

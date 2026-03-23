@@ -186,7 +186,9 @@ impl CommonSynthesisArgs {
             + usize::from(self.speaker_bin.is_some())
             + usize::from(self.voice_clone_prompt.is_some());
         if prompt_inputs > 1 {
-            bail!("--reference-wav, --speaker-bin, and --voice-clone-prompt are mutually exclusive");
+            bail!(
+                "--reference-wav, --speaker-bin, and --voice-clone-prompt are mutually exclusive"
+            );
         }
         Ok(())
     }
@@ -204,9 +206,9 @@ impl CommonSynthesisArgs {
         Ok(SynthesizeRequest {
             text,
             reference_wav_bytes: match self.reference_wav.as_ref() {
-                Some(path) => {
-                    Some(fs::read(path).with_context(|| format!("failed to read {}", path.display()))?)
-                }
+                Some(path) => Some(
+                    fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
+                ),
                 None => None,
             },
             temperature: self.temperature,

@@ -1,5 +1,5 @@
-use prost::Message;
 use crate::Qwen3TtsError;
+use prost::Message;
 
 pub const VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION: u32 = 2;
 
@@ -9,11 +9,7 @@ pub mod proto {
 
 pub use proto::{TensorF32, TensorI32, VoiceClonePromptV2};
 
-fn validate_shape(
-    shape: &[u32],
-    values_len: usize,
-    field_name: &str,
-) -> Result<(), Qwen3TtsError> {
+fn validate_shape(shape: &[u32], values_len: usize, field_name: &str) -> Result<(), Qwen3TtsError> {
     if shape.is_empty() {
         return Err(Qwen3TtsError::InvalidInput(format!(
             "{field_name}.shape must not be empty"
@@ -155,15 +151,15 @@ impl VoiceClonePromptV2 {
 
     #[must_use]
     pub fn ref_code_values(&self) -> Option<&[i32]> {
-        self.ref_code.as_ref().map(|tensor| tensor.values.as_slice())
+        self.ref_code
+            .as_ref()
+            .map(|tensor| tensor.values.as_slice())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TensorF32, TensorI32, VoiceClonePromptV2, VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
-    };
+    use super::{TensorF32, TensorI32, VoiceClonePromptV2, VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION};
 
     #[test]
     fn parses_prompt_protobuf() {

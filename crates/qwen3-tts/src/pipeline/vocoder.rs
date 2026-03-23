@@ -266,9 +266,10 @@ impl Vocoder {
         thread_count: usize,
     ) -> Result<Vec<f32>, Qwen3TtsError> {
         let n_codebooks = self.config.n_codebooks as usize;
-        let expected_codes = template.n_frames.checked_mul(n_codebooks).ok_or_else(|| {
-            Qwen3TtsError::InvalidInput("vocoder input shape overflow".into())
-        })?;
+        let expected_codes = template
+            .n_frames
+            .checked_mul(n_codebooks)
+            .ok_or_else(|| Qwen3TtsError::InvalidInput("vocoder input shape overflow".into()))?;
         if codes.len() != expected_codes {
             return Err(Qwen3TtsError::InvalidInput(format!(
                 "expected {} codec ids for {} frames with {} codebooks, got {}",
@@ -280,9 +281,10 @@ impl Vocoder {
         }
 
         let key = thread_count.max(1);
-        let mut sessions = self.sessions.lock().map_err(|_| {
-            Qwen3TtsError::InvalidInput("failed to lock ORT session cache".into())
-        })?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Qwen3TtsError::InvalidInput("failed to lock ORT session cache".into()))?;
         if !sessions.contains_key(&key) {
             let (session, actual_ep) = Self::build_session(&self.model_path, key)?;
             if actual_ep != self.execution_provider {

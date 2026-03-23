@@ -8,9 +8,8 @@ use ggml::sys;
 use rand::Rng;
 
 use super::backend::{
-    execute_graph, ggml_soft_max_ext_with_diag_mask_cache, graph_metadata_mem_size,
-    slice_as_bytes, slice_as_bytes_mut, BackendKind, BackendSet, OwnedBuffer, TensorDownload,
-    TensorUpload,
+    execute_graph, ggml_soft_max_ext_with_diag_mask_cache, graph_metadata_mem_size, slice_as_bytes,
+    slice_as_bytes_mut, BackendKind, BackendSet, OwnedBuffer, TensorDownload, TensorUpload,
 };
 use crate::model::GgufFile;
 use crate::Qwen3TtsError;
@@ -419,10 +418,9 @@ impl TtsTransformer {
             ]
         };
         let codec_tail_tokens = [self.config.codec_pad_id, self.config.codec_bos_id];
-        let mut all_codec_tokens =
-            Vec::with_capacity(
-                codec_prefill_tokens.len() + ref_codebook_0.len() + codec_tail_tokens.len(),
-            );
+        let mut all_codec_tokens = Vec::with_capacity(
+            codec_prefill_tokens.len() + ref_codebook_0.len() + codec_tail_tokens.len(),
+        );
         all_codec_tokens.extend_from_slice(&codec_prefill_tokens);
         all_codec_tokens.extend_from_slice(ref_codebook_0);
         all_codec_tokens.extend_from_slice(&codec_tail_tokens);
@@ -430,12 +428,14 @@ impl TtsTransformer {
         let codec_prefill_embed_len = codec_prefill_tokens.len() * hidden_size;
         let codec_prompt_embed_len = ref_codebook_0.len() * hidden_size;
         let codec_prefill_embed = &all_codec_embed[..codec_prefill_embed_len];
-        let codec_prompt_embed =
-            &all_codec_embed[codec_prefill_embed_len..codec_prefill_embed_len + codec_prompt_embed_len];
+        let codec_prompt_embed = &all_codec_embed
+            [codec_prefill_embed_len..codec_prefill_embed_len + codec_prompt_embed_len];
         let codec_tail_embed = &all_codec_embed[codec_prefill_embed_len + codec_prompt_embed_len..];
 
-        let codec_input_len =
-            codec_prefill_tokens.len() + ref_codebook_0.len() + usize::from(speaker_embd.is_some()) + 2;
+        let codec_input_len = codec_prefill_tokens.len()
+            + ref_codebook_0.len()
+            + usize::from(speaker_embd.is_some())
+            + 2;
         let mut codec_input_embedding = vec![0.0f32; codec_input_len * hidden_size];
         codec_input_embedding[..codec_prefill_embed.len()].copy_from_slice(&codec_prefill_embed);
         let mut dst_token = codec_prefill_tokens.len();
@@ -649,12 +649,7 @@ impl TtsTransformer {
             let mut kq = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), k, q) };
             kq = unsafe { sys::ggml_scale(ctx.as_ptr(), kq, kq_scale) };
             kq = unsafe {
-                ggml_soft_max_ext_with_diag_mask_cache(
-                    ctx.as_ptr(),
-                    kq,
-                    0,
-                    &mut attn_softmax_mask,
-                )
+                ggml_soft_max_ext_with_diag_mask_cache(ctx.as_ptr(), kq, 0, &mut attn_softmax_mask)
             };
 
             v = unsafe { sys::ggml_cont(ctx.as_ptr(), sys::ggml_transpose(ctx.as_ptr(), v)) };
@@ -992,7 +987,11 @@ impl TtsTransformer {
         top_p: f32,
     ) -> Result<CodecRollout, Qwen3TtsError> {
         if max_frames == 0 {
-            return Ok(CodecRollout { frames: Vec::new(), first_frame_elapsed: Duration::ZERO, sub_timings: CodecRolloutSubTimings::default() });
+            return Ok(CodecRollout {
+                frames: Vec::new(),
+                first_frame_elapsed: Duration::ZERO,
+                sub_timings: CodecRolloutSubTimings::default(),
+            });
         }
         let t_rollout_start = Instant::now();
 
@@ -1106,7 +1105,11 @@ impl TtsTransformer {
             frames.push(next_frame);
         }
 
-        Ok(CodecRollout { frames, first_frame_elapsed, sub_timings: CodecRolloutSubTimings::default() })
+        Ok(CodecRollout {
+            frames,
+            first_frame_elapsed,
+            sub_timings: CodecRolloutSubTimings::default(),
+        })
     }
 
     pub fn rollout_codec_frames_kv(
@@ -1123,7 +1126,11 @@ impl TtsTransformer {
         top_p: f32,
     ) -> Result<CodecRollout, Qwen3TtsError> {
         if max_frames == 0 {
-            return Ok(CodecRollout { frames: Vec::new(), first_frame_elapsed: Duration::ZERO, sub_timings: CodecRolloutSubTimings::default() });
+            return Ok(CodecRollout {
+                frames: Vec::new(),
+                first_frame_elapsed: Duration::ZERO,
+                sub_timings: CodecRolloutSubTimings::default(),
+            });
         }
         let t_rollout_start = Instant::now();
 
@@ -1189,7 +1196,10 @@ impl TtsTransformer {
                         logits: Vec::new(),
                     })
                     .collect(),
-                sub_timings: CodecRolloutSubTimings { talker_prefill: talker_prefill_dur, ..Default::default() },
+                sub_timings: CodecRolloutSubTimings {
+                    talker_prefill: talker_prefill_dur,
+                    ..Default::default()
+                },
             });
         }
 
@@ -1321,7 +1331,11 @@ impl TtsTransformer {
         chunk_tx: &std::sync::mpsc::SyncSender<VocoderChunk>,
     ) -> Result<CodecRollout, Qwen3TtsError> {
         if max_frames == 0 {
-            return Ok(CodecRollout { frames: Vec::new(), first_frame_elapsed: Duration::ZERO, sub_timings: CodecRolloutSubTimings::default() });
+            return Ok(CodecRollout {
+                frames: Vec::new(),
+                first_frame_elapsed: Duration::ZERO,
+                sub_timings: CodecRolloutSubTimings::default(),
+            });
         }
         let t_rollout_start = Instant::now();
 
@@ -1387,7 +1401,10 @@ impl TtsTransformer {
                         logits: Vec::new(),
                     })
                     .collect(),
-                sub_timings: CodecRolloutSubTimings { talker_prefill: talker_prefill_dur, ..Default::default() },
+                sub_timings: CodecRolloutSubTimings {
+                    talker_prefill: talker_prefill_dur,
+                    ..Default::default()
+                },
             });
         }
 
@@ -1426,14 +1443,23 @@ impl TtsTransformer {
         let chunk_size = chunk_size.max(1);
         let mut unsent_start = prefix_frame_count;
 
-        let flush_chunk = |frames: &[SelectedCodecFrame], start: usize, end: usize, tx: &std::sync::mpsc::SyncSender<VocoderChunk>| {
-            if end <= start { return; }
-            let codes = frames[start..end]
-                .iter()
-                .flat_map(|f| f.codebook_tokens.iter().copied())
-                .collect::<Vec<_>>();
-            let _ = tx.send(VocoderChunk { codes, n_frames: end - start });
-        };
+        let flush_chunk =
+            |frames: &[SelectedCodecFrame],
+             start: usize,
+             end: usize,
+             tx: &std::sync::mpsc::SyncSender<VocoderChunk>| {
+                if end <= start {
+                    return;
+                }
+                let codes = frames[start..end]
+                    .iter()
+                    .flat_map(|f| f.codebook_tokens.iter().copied())
+                    .collect::<Vec<_>>();
+                let _ = tx.send(VocoderChunk {
+                    codes,
+                    n_frames: end - start,
+                });
+            };
 
         let mut talker_steps_dur = Duration::ZERO;
         let mut kv_writeback_dur = Duration::ZERO;
@@ -1843,12 +1869,7 @@ impl TtsTransformer {
             let mut kq = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), k, q) };
             kq = unsafe { sys::ggml_scale(ctx.as_ptr(), kq, kq_scale) };
             kq = unsafe {
-                ggml_soft_max_ext_with_diag_mask_cache(
-                    ctx.as_ptr(),
-                    kq,
-                    0,
-                    &mut attn_softmax_mask,
-                )
+                ggml_soft_max_ext_with_diag_mask_cache(ctx.as_ptr(), kq, 0, &mut attn_softmax_mask)
             };
 
             v = unsafe { sys::ggml_cont(ctx.as_ptr(), sys::ggml_transpose(ctx.as_ptr(), v)) };
@@ -2052,7 +2073,8 @@ impl TtsTransformer {
         let hidden_2d = unsafe {
             sys::ggml_reshape_2d(ctx.as_ptr(), inp_hidden.as_ptr(), hidden_size as i64, 1)
         };
-        let mut inp_l = unsafe { sys::ggml_concat(ctx.as_ptr(), hidden_2d, inp_cb0_embd.as_ptr(), 1) };
+        let mut inp_l =
+            unsafe { sys::ggml_concat(ctx.as_ptr(), hidden_2d, inp_cb0_embd.as_ptr(), 1) };
         let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
         let mut attn_softmax_mask: Option<(*mut sys::ggml_tensor, Vec<f32>)> = None;
 
@@ -2180,12 +2202,7 @@ impl TtsTransformer {
             let mut kq = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), k, q) };
             kq = unsafe { sys::ggml_scale(ctx.as_ptr(), kq, kq_scale) };
             kq = unsafe {
-                ggml_soft_max_ext_with_diag_mask_cache(
-                    ctx.as_ptr(),
-                    kq,
-                    0,
-                    &mut attn_softmax_mask,
-                )
+                ggml_soft_max_ext_with_diag_mask_cache(ctx.as_ptr(), kq, 0, &mut attn_softmax_mask)
             };
             v = unsafe { sys::ggml_cont(ctx.as_ptr(), sys::ggml_transpose(ctx.as_ptr(), v)) };
             let mut kqv = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), v, kq) };
@@ -2894,12 +2911,7 @@ impl TtsTransformer {
             let mut kq = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), k, q) };
             kq = unsafe { sys::ggml_scale(ctx.as_ptr(), kq, kq_scale) };
             kq = unsafe {
-                ggml_soft_max_ext_with_diag_mask_cache(
-                    ctx.as_ptr(),
-                    kq,
-                    0,
-                    &mut attn_softmax_mask,
-                )
+                ggml_soft_max_ext_with_diag_mask_cache(ctx.as_ptr(), kq, 0, &mut attn_softmax_mask)
             };
 
             v = unsafe { sys::ggml_cont(ctx.as_ptr(), sys::ggml_transpose(ctx.as_ptr(), v)) };

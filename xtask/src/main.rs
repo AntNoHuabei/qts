@@ -94,10 +94,7 @@ fn run_bench(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_profile(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    if args
-        .iter()
-        .any(|a| matches!(a.as_str(), "--help" | "-h"))
-    {
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_profile_help();
         return Ok(());
     }
@@ -106,10 +103,7 @@ fn run_profile(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut backend = String::from("cpu");
     let mut forwarded = args;
     if let Some(first) = forwarded.first() {
-        if matches!(
-            first.as_str(),
-            "cpu" | "metal" | "vulkan" | "all" | "both"
-        ) {
+        if matches!(first.as_str(), "cpu" | "metal" | "vulkan" | "all" | "both") {
             backend = forwarded.remove(0);
         }
     }
@@ -250,10 +244,7 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let checksums = copied_files
         .iter()
         .map(|path| {
-            Ok::<_, Box<dyn std::error::Error>>((
-                file_name_string(path)?,
-                sha256_hex(path)?,
-            ))
+            Ok::<_, Box<dyn std::error::Error>>((file_name_string(path)?, sha256_hex(path)?))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -271,7 +262,10 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(hf_repo_dir) = hf_repo_dir {
         sync_release_to_hf_repo(&out_dir, &hf_repo_dir)?;
-        eprintln!("synced prepared release files into git repo: {}", hf_repo_dir.display());
+        eprintln!(
+            "synced prepared release files into git repo: {}",
+            hf_repo_dir.display()
+        );
     }
 
     eprintln!(
@@ -356,7 +350,13 @@ fn run_export_model_artifacts(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut command = Command::new("uv");
     command.current_dir(workspace_root);
-    command.args(["run", "export-model-artifacts", "--model", model, "--out-dir"]);
+    command.args([
+        "run",
+        "export-model-artifacts",
+        "--model",
+        model,
+        "--out-dir",
+    ]);
     command.arg(artifacts_dir);
     for main_type in release_main_types() {
         command.args(["--main-type", main_type]);
@@ -408,10 +408,16 @@ fn collect_release_artifacts(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::er
     if artifacts.is_empty() {
         return Err(format!("no release artifacts found in {}", dir.display()).into());
     }
-    if !artifacts.iter().any(|path| path.file_name().is_some_and(|n| n == "qwen3-tts-vocoder.onnx")) {
+    if !artifacts.iter().any(|path| {
+        path.file_name()
+            .is_some_and(|n| n == "qwen3-tts-vocoder.onnx")
+    }) {
         return Err(format!("missing qwen3-tts-vocoder.onnx in {}", dir.display()).into());
     }
-    if !artifacts.iter().any(|path| path.extension().is_some_and(|ext| ext == "gguf")) {
+    if !artifacts
+        .iter()
+        .any(|path| path.extension().is_some_and(|ext| ext == "gguf"))
+    {
         return Err(format!("missing qwen3-tts-0.6b-*.gguf in {}", dir.display()).into());
     }
 
@@ -534,8 +540,10 @@ fn remove_managed_release_files(dir: &Path) -> Result<(), Box<dyn std::error::Er
 }
 
 fn is_managed_release_file_name(name: &str) -> bool {
-    matches!(name, ".gitattributes" | "README.md" | "SHA256SUMS" | "qwen3-tts-vocoder.onnx")
-        || (name.starts_with("qwen3-tts-0.6b-") && name.ends_with(".gguf"))
+    matches!(
+        name,
+        ".gitattributes" | "README.md" | "SHA256SUMS" | "qwen3-tts-vocoder.onnx"
+    ) || (name.starts_with("qwen3-tts-0.6b-") && name.ends_with(".gguf"))
 }
 
 fn ensure_git_repo_root(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
