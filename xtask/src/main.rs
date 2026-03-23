@@ -206,7 +206,7 @@ fn run_single_bench(
 }
 
 fn default_model_dir(workspace_root: &Path) -> PathBuf {
-    workspace_root.join("models/volko76-q4k-q8")
+    workspace_root.join("models/qwen3-tts-bundle")
 }
 
 fn workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -242,7 +242,7 @@ fn print_profile_help() {
          usage:\n  cargo xtask profile [cpu|metal|vulkan|all|both] [-- ARGS_FOR_CLI...]\n\n\
          The first token selects both `cargo --features` and sets QWEN3_TTS_BACKEND for the child \
          (so macOS + vulkan actually uses the Vulkan GGML backend, not only links it).\n\n\
-         Examples:\n  cargo xtask profile cpu --model-dir models/volko76-q4k-q8 --text hello --frames 32 --runs 3\n  cargo xtask profile metal --model-dir \"$QWEN3_TTS_MODEL_DIR\" --text hello --frames 64 --out /tmp/p.wav\n  cargo xtask profile vulkan --model-dir \"$QWEN3_TTS_MODEL_DIR\" --text hello --frames 64\n\n\
+         Examples:\n  cargo xtask profile cpu --model-dir models/qwen3-tts-bundle --text hello --frames 32 --runs 3\n  cargo xtask profile metal --model-dir \"$QWEN3_TTS_MODEL_DIR\" --text hello --frames 64 --out /tmp/p.wav\n  cargo xtask profile vulkan --model-dir \"$QWEN3_TTS_MODEL_DIR\" --text hello --frames 64\n\n\
          All flags after the optional backend token are passed to `qwen3-tts-cli profile`."
     );
 }

@@ -1,7 +1,7 @@
 //! Layer-B style checks: requires real model artifacts on disk.
 //!
 //! ```text
-//! export QWEN3_TTS_MODEL_DIR=/path/to/models   # contains qwen3-tts-0.6b-f16.gguf + qwen3-tts-vocoder.onnx(.data)
+//! export QWEN3_TTS_MODEL_DIR=/path/to/models   # contains qwen3-tts-0.6b-f16.gguf + qwen3-tts-vocoder.onnx
 //! cargo test -p qwen3-tts integration_ -- --ignored --nocapture
 //! ```
 

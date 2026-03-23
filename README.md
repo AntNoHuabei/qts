@@ -126,13 +126,13 @@ Then consume that prompt from `qwen3-tts-cli`. In stage 2, the native engine rea
 
 ```bash
 cargo run -p qwen3-tts-cli -- synthesize \
-  --model-dir models/volko76-q4k-q8 \
+  --model-dir models/qwen3-tts-bundle \
   --text "hello" \
   --voice-clone-prompt target/hello.voice-clone-prompt.pb \
   --out target/hello-from-prompt.wav
 
 cargo run -p qwen3-tts-cli -- speaker-bin \
-  --model-dir models/volko76-q4k-q8 \
+  --model-dir models/qwen3-tts-bundle \
   --voice-clone-prompt target/hello.voice-clone-prompt.pb \
   --out target/hello.from-prompt.speaker.bin
 ```
@@ -141,7 +141,7 @@ You can reuse a `speaker.bin` from `export-speaker-bin` (above) or from `speaker
 
 ```bash
 cargo run -p qwen3-tts-cli -- synthesize \
-  --model-dir models/volko76-q4k-q8 \
+  --model-dir models/qwen3-tts-bundle \
   --text "hello" \
   --speaker-bin target/hello.python.speaker.bin \
   --out target/hello-from-speaker-bin.wav
@@ -153,7 +153,7 @@ For interactive latency demos, the CLI also has a `tui` mode that loads the mode
 
 ```bash
 cargo run -p qwen3-tts-cli -- tui \
-  --model-dir models/volko76-q4k-q8 \
+  --model-dir models/qwen3-tts-bundle \
   --speaker-bin target/hello.python.speaker.bin \
   --language en \
   --chunk-size 4
@@ -204,9 +204,9 @@ cargo xtask bench vulkan
 Stage timings (tokenizer, prefill build, codec rollout / transformer, vocoder, etc.) for a real synthesis pass:
 
 ```bash
-cargo xtask profile cpu --model-dir models/volko76-q4k-q8 --text "hello" --frames 64 --runs 3
-cargo xtask profile metal --model-dir models/volko76-q4k-q8 --text "hello" --frames 64
-cargo xtask profile vulkan --model-dir models/volko76-q4k-q8 --text "hello" --frames 64
+cargo xtask profile cpu --model-dir models/qwen3-tts-bundle --text "hello" --frames 64 --runs 3
+cargo xtask profile metal --model-dir models/qwen3-tts-bundle --text "hello" --frames 64
+cargo xtask profile vulkan --model-dir models/qwen3-tts-bundle --text "hello" --frames 64
 ```
 
 `cargo xtask profile` sets **`QWEN3_TTS_BACKEND`** for the child to match the first token (`cpu` / `metal` / `vulkan`), so **Cargo features and the actual GGML primary backend stay aligned** (including Vulkan on macOS when you choose the `vulkan` profile).
@@ -214,7 +214,7 @@ cargo xtask profile vulkan --model-dir models/volko76-q4k-q8 --text "hello" --fr
 For `cargo run -p qwen3-tts-cli` directly, set the backend explicitly, for example:
 
 ```bash
-QWEN3_TTS_BACKEND=vulkan cargo run -p qwen3-tts-cli --features vulkan -- profile --text "hello" --model-dir models/volko76-q4k-q8 --frames 64
+QWEN3_TTS_BACKEND=vulkan cargo run -p qwen3-tts-cli --features vulkan -- profile --text "hello" --model-dir models/qwen3-tts-bundle --frames 64
 ```
 
 This runs `qwen3-tts-cli profile`, which prints per-stage milliseconds and percentage of total wall time. Use `--out run1.wav` to keep audio from the first run while profiling.

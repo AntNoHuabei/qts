@@ -53,9 +53,12 @@ MAIN_TYPE_TO_FILE_TYPE = {
     "q4_k": gguf.LlamaFileType.MOSTLY_Q4_K_M,
 }
 
+SUPPORTED_MAIN_TYPES = ("f32", "f16", "q8_0")
+UNSUPPORTED_K_MAIN_TYPES = ("q4_k", "q5_k", "q6_k")
+
 
 class Qwen3MainGgufExporter:
-    """Export the talker, code predictor, speaker encoder, and tokenizer metadata to GGUF."""
+    """Export the talker, code predictor, and tokenizer metadata to GGUF."""
 
     TENSOR_MAP = {
         "talker.model.codec_embedding.weight": "talker.codec_embd.weight",
@@ -67,16 +70,6 @@ class Qwen3MainGgufExporter:
         "talker.text_projection.linear_fc2.weight": "talker.text_proj.fc2.weight",
         "talker.text_projection.linear_fc2.bias": "talker.text_proj.fc2.bias",
         "talker.code_predictor.model.norm.weight": "code_pred.output_norm.weight",
-        "speaker_encoder.blocks.0.conv.weight": "spk_enc.conv0.weight",
-        "speaker_encoder.blocks.0.conv.bias": "spk_enc.conv0.bias",
-        "speaker_encoder.asp.conv.weight": "spk_enc.asp.conv.weight",
-        "speaker_encoder.asp.conv.bias": "spk_enc.asp.conv.bias",
-        "speaker_encoder.asp.tdnn.conv.weight": "spk_enc.asp.tdnn.weight",
-        "speaker_encoder.asp.tdnn.conv.bias": "spk_enc.asp.tdnn.bias",
-        "speaker_encoder.mfa.conv.weight": "spk_enc.mfa.weight",
-        "speaker_encoder.mfa.conv.bias": "spk_enc.mfa.bias",
-        "speaker_encoder.fc.weight": "spk_enc.fc.weight",
-        "speaker_encoder.fc.bias": "spk_enc.fc.bias",
     }
 
     TALKER_LAYER_PATTERNS = [
@@ -110,19 +103,6 @@ class Qwen3MainGgufExporter:
     CODE_PREDICTOR_CODEBOOK_PATTERNS = [
         (r"talker\.code_predictor\.model\.codec_embedding\.(\d+)\.weight", "code_pred.codec_embd.{}.weight"),
         (r"talker\.code_predictor\.lm_head\.(\d+)\.weight", "code_pred.lm_head.{}.weight"),
-    ]
-
-    SPEAKER_ENCODER_PATTERNS = [
-        (r"speaker_encoder\.blocks\.(\d+)\.res2net_block\.blocks\.(\d+)\.conv\.weight", "spk_enc.blk.{}.res2net.{}.weight"),
-        (r"speaker_encoder\.blocks\.(\d+)\.res2net_block\.blocks\.(\d+)\.conv\.bias", "spk_enc.blk.{}.res2net.{}.bias"),
-        (r"speaker_encoder\.blocks\.(\d+)\.se_block\.conv1\.weight", "spk_enc.blk.{}.se.conv1.weight"),
-        (r"speaker_encoder\.blocks\.(\d+)\.se_block\.conv1\.bias", "spk_enc.blk.{}.se.conv1.bias"),
-        (r"speaker_encoder\.blocks\.(\d+)\.se_block\.conv2\.weight", "spk_enc.blk.{}.se.conv2.weight"),
-        (r"speaker_encoder\.blocks\.(\d+)\.se_block\.conv2\.bias", "spk_enc.blk.{}.se.conv2.bias"),
-        (r"speaker_encoder\.blocks\.(\d+)\.tdnn1\.conv\.weight", "spk_enc.blk.{}.tdnn1.weight"),
-        (r"speaker_encoder\.blocks\.(\d+)\.tdnn1\.conv\.bias", "spk_enc.blk.{}.tdnn1.bias"),
-        (r"speaker_encoder\.blocks\.(\d+)\.tdnn2\.conv\.weight", "spk_enc.blk.{}.tdnn2.weight"),
-        (r"speaker_encoder\.blocks\.(\d+)\.tdnn2\.conv\.bias", "spk_enc.blk.{}.tdnn2.bias"),
     ]
 
     def __init__(self, input_dir: Path, output_path: Path, output_type: str):
@@ -180,11 +160,6 @@ class Qwen3MainGgufExporter:
             match = re.match(pattern, hf_name)
             if match:
                 return template.format(match.group(1))
-        for pattern, template in self.SPEAKER_ENCODER_PATTERNS:
-            match = re.match(pattern, hf_name)
-            if match:
-                groups = match.groups()
-                return template.format(*groups)
         return None
 
     def _get_tensors(self) -> Iterator[tuple[str, torch.Tensor]]:
@@ -375,9 +350,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", required=True, help="Directory to write exported artifacts into.")
     parser.add_argument(
         "--main-type",
-        default="f16",
-        choices=sorted(MAIN_TYPE_TO_QUANT),
-        help="Quantization/data type for the main GGUF export.",
+        action="append",
+        default=None,
+        help=(
+            "Quantization/data type for the main GGUF export. "
+            "Repeat the flag or pass a comma-separated list to export multiple GGUF variants."
+        ),
     )
     parser.add_argument("--main-out", default=None, help="Override the main GGUF output path.")
     parser.add_argument("--vocoder-out", default=None, help="Override the vocoder ONNX output path.")
@@ -404,6 +382,44 @@ def parse_args() -> argparse.Namespace:
 def configure_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+
+
+def validate_main_type(main_type: str) -> None:
+    if main_type in UNSUPPORTED_K_MAIN_TYPES:
+        supported = ", ".join(SUPPORTED_MAIN_TYPES)
+        unsupported = ", ".join(UNSUPPORTED_K_MAIN_TYPES)
+        raise SystemExit(
+            "K-family GGUF export is not supported by this Python exporter yet. "
+            f"Requested --main-type {main_type!r}. Supported values: {supported}. "
+            f"Unsupported values for now: {unsupported}."
+        )
+
+    if main_type not in MAIN_TYPE_TO_QUANT:
+        choices = ", ".join(sorted(MAIN_TYPE_TO_QUANT))
+        raise SystemExit(
+            f"Unknown --main-type {main_type!r}. Valid values: {choices}."
+        )
+
+
+def resolve_main_types(raw_values: list[str] | None) -> list[str]:
+    if not raw_values:
+        return ["f16"]
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        for part in raw.split(","):
+            main_type = part.strip()
+            if not main_type:
+                continue
+            validate_main_type(main_type)
+            if main_type not in seen:
+                resolved.append(main_type)
+                seen.add(main_type)
+
+    if not resolved:
+        raise SystemExit("At least one non-empty --main-type must be provided.")
+    return resolved
 
 
 def resolve_model_dir(model_name_or_path: str, local_files_only: bool) -> Path:
@@ -435,7 +451,9 @@ def add_onnx_metadata(
     decode_upsample_rate: int,
     output_sample_rate: int,
 ) -> None:
-    model = onnx.load(str(onnx_path))
+    # Load external tensor data eagerly so we can re-save the model as a single
+    # self-contained ONNX file after attaching metadata.
+    model = onnx.load(str(onnx_path), load_external_data=True)
     metadata = {
         "source_model": source_model,
         "speech_tokenizer_dir": str(speech_tokenizer_dir),
@@ -449,7 +467,47 @@ def add_onnx_metadata(
         prop = model.metadata_props.add()
         prop.key = key
         prop.value = value
-    onnx.save(model, str(onnx_path))
+    # Keep the vocoder artifact self-contained so one shared ONNX can be uploaded
+    # alongside multiple GGUF variants without a duplicate .onnx.data payload.
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+
+def cleanup_stale_onnx_external_data(onnx_path: Path) -> None:
+    data_path = Path(f"{onnx_path}.data")
+    if not data_path.exists():
+        return
+
+    model = onnx.load(str(onnx_path), load_external_data=False)
+    has_external_initializers = any(
+        tensor.data_location == onnx.TensorProto.EXTERNAL
+        for tensor in model.graph.initializer
+    )
+    if has_external_initializers:
+        logger.info("Keeping external ONNX tensor data: %s", data_path)
+        return
+
+    data_path.unlink()
+    logger.info("Removed stale ONNX external data file: %s", data_path)
+
+
+def normalize_onnx_to_single_file(onnx_path: Path) -> None:
+    data_path = Path(f"{onnx_path}.data")
+    if not data_path.exists():
+        return
+
+    model = onnx.load(str(onnx_path), load_external_data=False)
+    has_external_initializers = any(
+        tensor.data_location == onnx.TensorProto.EXTERNAL
+        for tensor in model.graph.initializer
+    )
+    if not has_external_initializers:
+        cleanup_stale_onnx_external_data(onnx_path)
+        return
+
+    logger.info("Repacking ONNX external tensor data into %s", onnx_path)
+    model = onnx.load(str(onnx_path), load_external_data=True)
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+    cleanup_stale_onnx_external_data(onnx_path)
 
 
 def export_vocoder_onnx(
@@ -503,6 +561,7 @@ def export_vocoder_onnx(
         decode_upsample_rate=decode_upsample_rate,
         output_sample_rate=output_sample_rate,
     )
+    cleanup_stale_onnx_external_data(output_path)
     logger.info(
         "Exported vocoder ONNX: path=%s num_quantizers=%s decode_upsample_rate=%s",
         output_path,
@@ -515,30 +574,43 @@ def export_vocoder_onnx(
 def main() -> None:
     args = parse_args()
     configure_logging(args.verbose)
+    main_types = resolve_main_types(args.main_type)
 
     model_dir = resolve_model_dir(args.model, local_files_only=args.local_files_only)
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    main_out = Path(args.main_out).expanduser().resolve() if args.main_out else default_main_output(out_dir, args.main_type)
+    if args.main_out and len(main_types) != 1:
+        raise SystemExit("--main-out can only be used when exporting exactly one --main-type.")
+
     vocoder_out = Path(args.vocoder_out).expanduser().resolve() if args.vocoder_out else default_vocoder_output(out_dir)
 
     logger.info("Resolved model dir: %s", model_dir)
-    logger.info("Main GGUF output: %s", main_out)
+    logger.info("Main GGUF types: %s", ", ".join(main_types))
     logger.info("Vocoder ONNX output: %s", vocoder_out)
 
-    if main_out.exists():
-        logger.info("Reusing existing main GGUF: %s", main_out)
-        gguf_out = main_out
-    else:
-        gguf_out = Qwen3MainGgufExporter(
-            input_dir=model_dir,
-            output_path=main_out,
-            output_type=args.main_type,
-        ).export()
+    gguf_outputs: list[Path] = []
+    for main_type in main_types:
+        main_out = (
+            Path(args.main_out).expanduser().resolve()
+            if args.main_out
+            else default_main_output(out_dir, main_type)
+        )
+        logger.info("Main GGUF output for %s: %s", main_type, main_out)
+        if main_out.exists():
+            logger.info("Reusing existing main GGUF: %s", main_out)
+            gguf_out = main_out
+        else:
+            gguf_out = Qwen3MainGgufExporter(
+                input_dir=model_dir,
+                output_path=main_out,
+                output_type=main_type,
+            ).export()
+        gguf_outputs.append(gguf_out)
 
     if vocoder_out.exists():
         logger.info("Reusing existing vocoder ONNX: %s", vocoder_out)
+        normalize_onnx_to_single_file(vocoder_out)
         onnx_out = vocoder_out
     else:
         onnx_out = export_vocoder_onnx(
@@ -550,8 +622,8 @@ def main() -> None:
         )
 
     print(
-        f"exported artifacts: main_gguf={gguf_out} "
-        f"vocoder_onnx={onnx_out} main_type={args.main_type}"
+        f"exported artifacts: main_ggufs={','.join(str(path) for path in gguf_outputs)} "
+        f"vocoder_onnx={onnx_out} main_types={','.join(main_types)}"
     )
 
 

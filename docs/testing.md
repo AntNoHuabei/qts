@@ -16,7 +16,6 @@ Set `QWEN3_TTS_MODEL_DIR` to a directory containing:
 
 - `qwen3-tts-0.6b-f16.gguf`
 - `qwen3-tts-vocoder.onnx`
-- `qwen3-tts-vocoder.onnx.data`
 
 Then:
 

@@ -8,12 +8,12 @@ This repository does **not** ship weights. Download or export the model artifact
 models/
   qwen3-tts-0.6b-f16.gguf
   qwen3-tts-vocoder.onnx
-  qwen3-tts-vocoder.onnx.data
 ```
 
 Names may differ if you pass explicit [`ModelPaths`](../crates/qwen3-tts/src/model/paths.rs).
 
-The Rust runtime requires the ONNX vocoder artifact `qwen3-tts-vocoder.onnx` alongside the main GGUF checkpoint.
+The Rust runtime requires the self-contained ONNX vocoder artifact
+`qwen3-tts-vocoder.onnx` alongside the main GGUF checkpoint.
 
 ## Where to get artifacts
 
@@ -26,6 +26,25 @@ uv run export-model-artifacts \
   --out-dir models/qwen3-tts-f16-onnx \
   --main-type f16
 ```
+
+To export multiple GGUF variants into the same directory while reusing a single
+unquantized vocoder ONNX, repeat `--main-type` or pass a comma-separated list:
+
+```bash
+uv run export-model-artifacts \
+  --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --out-dir models/qwen3-tts-bundle \
+  --main-type f16 \
+  --main-type q8_0
+```
+
+Currently supported `--main-type` values are `f32`, `f16`, and `q8_0`.
+The exporter does not emit `speaker_encoder` weights because the native runtime
+builds its own reference-audio encoder at runtime instead of loading those
+tensors from GGUF.
+
+`q4_k`, `q5_k`, and `q6_k` are intentionally rejected for now instead of
+silently falling back to `f16`.
 
 Legacy/community GGUF conversions (verify checksums before trusting):
 

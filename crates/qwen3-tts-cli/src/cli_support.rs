@@ -237,7 +237,7 @@ pub(crate) fn default_model_dir() -> Result<PathBuf> {
         .parent()
         .and_then(Path::parent)
         .context("qwen3-tts-cli manifest has no workspace parent")?;
-    Ok(workspace_root.join("models/volko76-q4k-q8"))
+    Ok(workspace_root.join("models/qwen3-tts-bundle"))
 }
 
 pub(crate) fn value_arg(args: &[String], idx: &mut usize, flag: &str) -> Result<String> {
