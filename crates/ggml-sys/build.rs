@@ -212,23 +212,21 @@ fn validate_features(target: &str) {
 }
 
 fn emit_vulkan_loader_links(target: &str) {
-    if target.contains("apple") {
-        for dir in vulkan_search_dirs(target) {
-            if dir.exists() {
-                println!("cargo:rustc-link-search=native={}", dir.display());
-            }
+    for dir in vulkan_search_dirs(target) {
+        if dir.exists() {
+            println!("cargo:rustc-link-search=native={}", dir.display());
         }
-        println!("cargo:rustc-link-lib=dylib=vulkan");
-    } else if target.contains("windows") {
-        for dir in vulkan_search_dirs(target) {
-            if dir.exists() {
-                println!("cargo:rustc-link-search=native={}", dir.display());
-            }
-        }
-        println!("cargo:rustc-link-lib=vulkan-1");
-    } else {
-        println!("cargo:rustc-link-lib=vulkan");
     }
+
+    let lib = if target.contains("apple") {
+        "dylib=vulkan"
+    } else if target.contains("windows") {
+        "vulkan-1"
+    } else {
+        "vulkan"
+    };
+
+    println!("cargo:rustc-link-lib={lib}");
 }
 
 fn vulkan_search_dirs(target: &str) -> Vec<PathBuf> {

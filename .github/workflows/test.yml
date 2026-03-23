@@ -22,11 +22,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - name: Free Runner Space
-        uses: justinthelaw/maximize-github-runner-space@v0.8.0
-        with:
-          skip-components: rust,cached-python
-          swapfile-size: 2G
       - uses: actions/checkout@v6
         with:
           submodules: recursive
@@ -62,10 +57,9 @@ jobs:
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
           vulkan_version: latest
-          
-      - name: fmt
+      - name: Cargo Fmt
         run: cargo fmt --all -- --check
-      - name: clippy
+      - name: Cargo Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Sync Python environment
         run: uv sync --locked
@@ -76,5 +70,5 @@ jobs:
             --main-type f16 \
             --artifacts-dir models/qwen3-tts-ci \
             --out-dir models/qwen3-tts-ci
-      - name: test
+      - name: Cargo Test
         run: cargo test --workspace
