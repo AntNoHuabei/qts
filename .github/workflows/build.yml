@@ -83,7 +83,7 @@ jobs:
           echo "package_stem=${CLI_BIN_NAME}-${os_tag}-${arch_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Build accelerated release CLI
-        run: cargo build --release -p qts_tts_cli --no-default-features --features ${{ matrix.feature_set }}
+        run: cargo build --release -p qts_cli --no-default-features --features ${{ matrix.feature_set }}
 
       - name: Smoke test CLI help
         shell: bash
