@@ -64,6 +64,7 @@ jobs:
       - name: Sync Python environment
         run: uv sync --locked
       - name: Generate smoke-test model artifacts
+        shell: bash
         run: |
           cargo xtask hf-release \
             --model "$SOURCE_MODEL_ID" \
