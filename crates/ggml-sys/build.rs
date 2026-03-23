@@ -160,6 +160,7 @@ fn main() {
     }
 
     if target.contains("linux") {
+        println!("cargo:rustc-link-lib=gomp");
         println!("cargo:rustc-link-lib=pthread");
         println!("cargo:rustc-link-lib=m");
         println!("cargo:rustc-link-lib=dl");
