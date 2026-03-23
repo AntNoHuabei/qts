@@ -2,10 +2,10 @@
 
 ## ggml (Git submodule)
 
-- **Path**: `vendor/ggml` → [ggml-org/ggml](https://github.com/ggml-org/ggml).
+- **Path**: `crates/qts_ggml_sys/vendor/ggml` → [ggml-org/ggml](https://github.com/ggml-org/ggml).
 - **Pinned release**: **v0.9.8** (gitlink `2fb6431f67dd505584a9fefe94fd2866b944c85f`).
 - **Clone**: `git submodule update --init --recursive` (or clone with `git clone --recurse-submodules …`).
-- **Bump**: `cd vendor/ggml && git fetch origin && git checkout <tag> && cd ../.. && git add vendor/ggml && git commit`.
+- **Bump**: `cd crates/qts_ggml_sys/vendor/ggml && git fetch origin && git checkout <tag> && cd ../../../.. && git add crates/qts_ggml_sys/vendor/ggml && git commit`.
 - **Reported version** (upstream `CMakeLists.txt` at this pin): **0.9.8**.
 
 ## `ggml-sys` Cargo features → CMake

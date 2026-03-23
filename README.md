@@ -13,18 +13,18 @@ Rust workspace for on-device **Qwen3 TTS** using [ggml-org/ggml](https://github.
 
 | Crate | Role |
 |-------|------|
-| `qts_ggml_sys` | CMake + bindgen FFI to `vendor/ggml` ([ggml](https://github.com/ggml-org/ggml) Git submodule) |
+| `qts_ggml_sys` | CMake + bindgen FFI to `crates/qts_ggml_sys/vendor/ggml` ([ggml](https://github.com/ggml-org/ggml) Git submodule) |
 | `qts_ggml` | Thin wrappers + `sys` re-export |
 | `qts` | Pure Rust `rlib` for GGUF loading, speaker encoding, and synthesis |
 | `qts_cli` | Command-line interface for synthesis, profiling, and interactive TUI playback |
 
 ## Prerequisites
 
-- **CMake** on the PATH (for `qts_ggml_sys` building the `vendor/ggml` submodule).
+- **CMake** on the PATH (for `qts_ggml_sys` building its vendored `ggml` submodule).
 
 ## Build
 
-Fetch ggml first (submodule):
+Fetch ggml first (submodule under `crates/qts_ggml_sys/vendor/ggml`):
 
 ```bash
 git submodule update --init --recursive

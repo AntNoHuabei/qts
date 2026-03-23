@@ -4,7 +4,7 @@
 .hf_cache/
 
 # Local CMake outputs (ggml-sys / ggml submodule build tree)
-vendor/ggml/build/
+crates/qts_ggml_sys/vendor/ggml/build/
 *.swp
 .idea
 .vscode

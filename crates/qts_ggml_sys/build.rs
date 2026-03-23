@@ -8,7 +8,7 @@ fn main() {
 
     let ggml_root = env::var("GGML_SRC")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| manifest_dir.join("../../vendor/ggml"));
+        .unwrap_or_else(|_| manifest_dir.join("vendor/ggml"));
     let ggml_root = normalize_source_path(ggml_root);
     let include = ggml_root.join("include");
 
