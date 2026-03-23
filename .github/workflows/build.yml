@@ -1,0 +1,134 @@
+name: Build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  CLI_BIN_NAME: qwen3-tts-cli
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            feature_set: vulkan,blas
+            accel_label: vulkan
+          - os: macos-latest
+            feature_set: metal,coreml,blas
+            accel_label: metal-coreml
+          - os: windows-latest
+            feature_set: vulkan,blas
+            accel_label: vulkan
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libjack-jackd2-dev \
+            libjack-jackd2-0 \
+            libpipewire-0.3-dev \
+            pkg-config \
+            libvulkan-dev \
+            shaderc
+
+      - name: Install macOS build prerequisites
+        if: runner.os == 'macOS'
+        run: brew install shaderc
+
+      - name: Install Windows Vulkan SDK
+        if: runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: latest
+
+      - name: Derive package metadata
+        id: package_meta
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Linux) os_tag=linux ;;
+            macOS) os_tag=macos ;;
+            Windows) os_tag=windows ;;
+            *) os_tag="$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')" ;;
+          esac
+          case "${{ runner.arch }}" in
+            X64) arch_tag=x86_64 ;;
+            ARM64) arch_tag=arm64 ;;
+            *) arch_tag="$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')" ;;
+          esac
+          echo "package_stem=${CLI_BIN_NAME}-${os_tag}-${arch_tag}-${{ matrix.accel_label }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build accelerated release CLI
+        run: cargo build --release -p qwen3-tts-cli --no-default-features --features ${{ matrix.feature_set }}
+
+      - name: Smoke test CLI help
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ./target/release/${CLI_BIN_NAME}.exe --help > /dev/null
+          else
+            ./target/release/${CLI_BIN_NAME} --help > /dev/null
+          fi
+
+      - name: Assemble release archive
+        shell: bash
+        run: |
+          package_dir="target/${{ steps.package_meta.outputs.package_stem }}"
+          mkdir -p "$package_dir"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "./target/release/${CLI_BIN_NAME}.exe" "$package_dir/"
+          else
+            cp "./target/release/${CLI_BIN_NAME}" "$package_dir/"
+          fi
+          cp LICENSE NOTICE README.md "$package_dir/"
+          tar -C target -czf "target/${{ steps.package_meta.outputs.package_stem }}.tar.gz" "${{ steps.package_meta.outputs.package_stem }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package_meta.outputs.package_stem }}
+          path: target/${{ steps.package_meta.outputs.package_stem }}.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish archives to GitHub Releases
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/**/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
