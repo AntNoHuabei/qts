@@ -147,7 +147,7 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=MetalKit");
         println!("cargo:rustc-link-lib=framework=Foundation");
     }
-    if feature_enabled("blas") && target.contains("apple") {
+    if target.contains("apple") {
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }
 
@@ -184,8 +184,6 @@ fn normalize_source_path(path: PathBuf) -> PathBuf {
 
     #[cfg(windows)]
     {
-        use std::path::Path;
-
         if let Some(stripped) = path
             .to_str()
             .and_then(|raw| raw.strip_prefix(r"\\?\"))
