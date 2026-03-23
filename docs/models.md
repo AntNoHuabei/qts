@@ -38,13 +38,10 @@ uv run export-model-artifacts \
   --main-type q8_0
 ```
 
-Currently supported `--main-type` values are `f32`, `f16`, and `q8_0`.
+Currently supported `--main-type` values are `f16` and `q8_0`.
 The exporter does not emit `speaker_encoder` weights because the native runtime
 builds its own reference-audio encoder at runtime instead of loading those
 tensors from GGUF.
-
-`q4_k`, `q5_k`, and `q6_k` are intentionally rejected for now instead of
-silently falling back to `f16`.
 
 Legacy/community GGUF conversions (verify checksums before trusting):
 

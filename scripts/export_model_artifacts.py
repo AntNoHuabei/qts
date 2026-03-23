@@ -36,26 +36,16 @@ MODEL_ALLOW_PATTERNS = [
 ]
 
 MAIN_TYPE_TO_QUANT = {
-    "f32": gguf.GGMLQuantizationType.F32,
     "f16": gguf.GGMLQuantizationType.F16,
     "q8_0": gguf.GGMLQuantizationType.Q8_0,
-    "q6_k": gguf.GGMLQuantizationType.Q6_K,
-    "q5_k": gguf.GGMLQuantizationType.Q5_K,
-    "q4_k": gguf.GGMLQuantizationType.Q4_K,
 }
 
 MAIN_TYPE_TO_FILE_TYPE = {
-    "f32": gguf.LlamaFileType.ALL_F32,
     "f16": gguf.LlamaFileType.MOSTLY_F16,
     "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
-    "q6_k": gguf.LlamaFileType.MOSTLY_Q6_K,
-    "q5_k": gguf.LlamaFileType.MOSTLY_Q5_K_M,
-    "q4_k": gguf.LlamaFileType.MOSTLY_Q4_K_M,
 }
 
-SUPPORTED_MAIN_TYPES = ("f32", "f16", "q8_0")
-UNSUPPORTED_K_MAIN_TYPES = ("q4_k", "q5_k", "q6_k")
-
+SUPPORTED_MAIN_TYPES = ("f16", "q8_0")
 
 class Qwen3MainGgufExporter:
     """Export the talker, code predictor, and tokenizer metadata to GGUF."""
@@ -191,10 +181,8 @@ class Qwen3MainGgufExporter:
         data = tensor.float().numpy() if tensor.dtype == torch.bfloat16 else tensor.numpy()
         if data.ndim <= 1:
             return data.astype(np.float32), gguf.GGMLQuantizationType.F32
-        if self.output_type in ("f32", "f16"):
-            quant = MAIN_TYPE_TO_QUANT[self.output_type]
-            dtype = np.float32 if self.output_type == "f32" else np.float16
-            return data.astype(dtype), quant
+        if self.output_type == "f16":
+            return data.astype(np.float16), gguf.GGMLQuantizationType.F16
         if not self._should_quantize(tensor_name):
             return data.astype(np.float16), gguf.GGMLQuantizationType.F16
         quant = MAIN_TYPE_TO_QUANT[self.output_type]
@@ -385,17 +373,8 @@ def configure_logging(verbose: bool) -> None:
 
 
 def validate_main_type(main_type: str) -> None:
-    if main_type in UNSUPPORTED_K_MAIN_TYPES:
-        supported = ", ".join(SUPPORTED_MAIN_TYPES)
-        unsupported = ", ".join(UNSUPPORTED_K_MAIN_TYPES)
-        raise SystemExit(
-            "K-family GGUF export is not supported by this Python exporter yet. "
-            f"Requested --main-type {main_type!r}. Supported values: {supported}. "
-            f"Unsupported values for now: {unsupported}."
-        )
-
-    if main_type not in MAIN_TYPE_TO_QUANT:
-        choices = ", ".join(sorted(MAIN_TYPE_TO_QUANT))
+    if main_type not in SUPPORTED_MAIN_TYPES:
+        choices = ", ".join(SUPPORTED_MAIN_TYPES)
         raise SystemExit(
             f"Unknown --main-type {main_type!r}. Valid values: {choices}."
         )

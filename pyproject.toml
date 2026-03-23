@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "qwen3-tts-native-scripts"
+name = "qts-scripts"
 version = "0.1.0"
-description = "Python helper scripts for qwen3-tts-native."
+description = "Python helper scripts for qts."
 requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
