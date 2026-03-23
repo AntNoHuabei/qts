@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Export a stage-2 protobuf voice clone prompt using upstream qwen-tts."""
+"""Export a protobuf voice clone prompt using upstream qwen-tts.
+
+This script uses the checked-in `scripts.voice_clone_prompt_pb2` module, which is
+generated from `crates/qts/proto/voice_clone_prompt.proto`.
+"""
 
 from __future__ import annotations
 

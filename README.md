@@ -55,6 +55,7 @@ cargo build -p qts_cli --features vulkan
 
 GPU / accelerator backends are Cargo features on `qts_ggml_sys` (see [VERSIONS.md](VERSIONS.md)).
 `qts` keeps its protobuf schema under `crates/qts/proto/` so `cargo package` / `cargo publish` can verify the crate from a self-contained tarball.
+The checked-in Python binding at `scripts/voice_clone_prompt_pb2.py` is generated from that same canonical schema; regenerate it with `uv run generate-voice-clone-prompt-pb2` after schema changes.
 
 Common backend builds:
 
