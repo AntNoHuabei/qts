@@ -96,6 +96,15 @@ pub struct PrefillConditioning<'a> {
     pub language_id: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct IclPrefillConditioning<'a> {
+    pub text_tokens: &'a [i32],
+    pub ref_text_tokens: &'a [i32],
+    pub speaker_embd: Option<&'a [f32]>,
+    pub ref_code_frames: &'a [Vec<i32>],
+    pub language_id: i32,
+}
+
 #[derive(Debug, Clone)]
 pub struct PrefillForwardOutputs {
     pub hidden_states: Vec<f32>,
@@ -507,6 +516,177 @@ impl TtsTransformer {
         let trailing_eos_offset = (trailing_len - 1) * hidden_size;
         trailing_text_hidden[trailing_eos_offset..trailing_eos_offset + hidden_size]
             .copy_from_slice(&tts_eos_embed);
+
+        Ok(PreparedPrefillInputs {
+            prefill_embd,
+            trailing_text_hidden,
+            tts_pad_embed,
+        })
+    }
+
+    pub fn build_icl_prefill_inputs(
+        &self,
+        conditioning: IclPrefillConditioning<'_>,
+        thread_count: usize,
+    ) -> Result<PreparedPrefillInputs, Qwen3TtsError> {
+        let text_tokens = conditioning.text_tokens;
+        let ref_text_tokens = conditioning.ref_text_tokens;
+        let ref_code_frames = conditioning.ref_code_frames;
+        let speaker_embd = conditioning.speaker_embd;
+        let language_id = conditioning.language_id;
+        if text_tokens.len() < 9 {
+            return Err(Qwen3TtsError::InvalidInput(
+                "ICL target text prompt must contain at least one text token".into(),
+            ));
+        }
+        if ref_text_tokens.len() < 6 {
+            return Err(Qwen3TtsError::InvalidInput(
+                "ICL reference text prompt must contain at least one text token".into(),
+            ));
+        }
+
+        let hidden_size = self.config.hidden_size as usize;
+        if let Some(speaker_embd) = speaker_embd {
+            if speaker_embd.len() != hidden_size {
+                return Err(Qwen3TtsError::InvalidInput(format!(
+                    "speaker embedding must have {hidden_size} elements"
+                )));
+            }
+        }
+        for frame in ref_code_frames {
+            self.validate_codebook_frame(frame)?;
+        }
+
+        let special_tokens = [
+            self.config.tts_bos_token_id,
+            self.config.tts_eos_token_id,
+            self.config.tts_pad_token_id,
+        ];
+        let special_proj = self.project_text_tokens(&special_tokens, thread_count)?;
+        let tts_bos_embed = special_proj[0..hidden_size].to_vec();
+        let tts_eos_embed = special_proj[hidden_size..hidden_size * 2].to_vec();
+        let tts_pad_embed = special_proj[hidden_size * 2..hidden_size * 3].to_vec();
+
+        let role_embed = self.project_text_tokens(&text_tokens[..3], thread_count)?;
+        let target_text_tokens = &text_tokens[3..text_tokens.len() - 5];
+        let ref_text_tokens = &ref_text_tokens[3..ref_text_tokens.len() - 2];
+        let mut icl_text_tokens =
+            Vec::with_capacity(ref_text_tokens.len() + target_text_tokens.len());
+        icl_text_tokens.extend_from_slice(ref_text_tokens);
+        icl_text_tokens.extend_from_slice(target_text_tokens);
+        let mut text_embed = self.project_text_tokens(&icl_text_tokens, thread_count)?;
+        text_embed.extend_from_slice(&tts_eos_embed);
+
+        let codec_prefill_tokens = if language_id < 0 {
+            vec![
+                self.config.codec_nothink_id,
+                self.config.codec_think_bos_id,
+                self.config.codec_think_eos_id,
+            ]
+        } else {
+            vec![
+                self.config.codec_think_id,
+                self.config.codec_think_bos_id,
+                language_id,
+                self.config.codec_think_eos_id,
+            ]
+        };
+        let codec_tail_tokens = [self.config.codec_pad_id, self.config.codec_bos_id];
+        let mut all_codec_tokens =
+            Vec::with_capacity(codec_prefill_tokens.len() + codec_tail_tokens.len());
+        all_codec_tokens.extend_from_slice(&codec_prefill_tokens);
+        all_codec_tokens.extend_from_slice(&codec_tail_tokens);
+        let all_codec_embed = self.lookup_codec_embedding_rows(&all_codec_tokens, thread_count)?;
+        let codec_prefill_embed_len = codec_prefill_tokens.len() * hidden_size;
+        let codec_prefill_embed = &all_codec_embed[..codec_prefill_embed_len];
+        let codec_tail_embed = &all_codec_embed[codec_prefill_embed_len..];
+
+        let codec_input_len = codec_prefill_tokens.len() + usize::from(speaker_embd.is_some()) + 2;
+        let mut codec_input_embedding = vec![0.0f32; codec_input_len * hidden_size];
+        codec_input_embedding[..codec_prefill_embed.len()].copy_from_slice(codec_prefill_embed);
+        let mut dst_token = codec_prefill_tokens.len();
+
+        if let Some(speaker_embd) = speaker_embd {
+            let dst =
+                &mut codec_input_embedding[dst_token * hidden_size..(dst_token + 1) * hidden_size];
+            dst.copy_from_slice(speaker_embd);
+            dst_token += 1;
+        }
+
+        codec_input_embedding[dst_token * hidden_size..(dst_token + 2) * hidden_size]
+            .copy_from_slice(codec_tail_embed);
+
+        let codec_plus_overlay_len = codec_input_len - 1;
+        let mut codec_plus_overlay = vec![0.0f32; codec_plus_overlay_len * hidden_size];
+        for token_idx in 0..codec_plus_overlay_len {
+            let overlay = if token_idx == codec_plus_overlay_len - 1 {
+                &tts_bos_embed
+            } else {
+                &tts_pad_embed
+            };
+            let codec_row =
+                &codec_input_embedding[token_idx * hidden_size..(token_idx + 1) * hidden_size];
+            let out_row =
+                &mut codec_plus_overlay[token_idx * hidden_size..(token_idx + 1) * hidden_size];
+            for h in 0..hidden_size {
+                out_row[h] = overlay[h] + codec_row[h];
+            }
+        }
+
+        let codec_bos_embed = &codec_input_embedding
+            [(codec_input_len - 1) * hidden_size..codec_input_len * hidden_size];
+        let codec_len = ref_code_frames.len() + 1;
+        let mut codec_embed = vec![0.0f32; codec_len * hidden_size];
+        codec_embed[..hidden_size].copy_from_slice(codec_bos_embed);
+        for (frame_idx, frame) in ref_code_frames.iter().enumerate() {
+            let row = self.sum_codec_frame_embeddings(frame, thread_count)?;
+            let dst = (frame_idx + 1) * hidden_size..(frame_idx + 2) * hidden_size;
+            codec_embed[dst].copy_from_slice(&row);
+        }
+
+        let text_len = text_embed.len() / hidden_size;
+        let mut icl_input_embed = vec![0.0f32; codec_len * hidden_size];
+        if text_len > codec_len {
+            for row_idx in 0..codec_len {
+                let text_row = &text_embed[row_idx * hidden_size..(row_idx + 1) * hidden_size];
+                let codec_row = &codec_embed[row_idx * hidden_size..(row_idx + 1) * hidden_size];
+                let out_row =
+                    &mut icl_input_embed[row_idx * hidden_size..(row_idx + 1) * hidden_size];
+                for h in 0..hidden_size {
+                    out_row[h] = text_row[h] + codec_row[h];
+                }
+            }
+        } else {
+            for row_idx in 0..codec_len {
+                let text_row = if row_idx < text_len {
+                    &text_embed[row_idx * hidden_size..(row_idx + 1) * hidden_size]
+                } else {
+                    &tts_pad_embed
+                };
+                let codec_row = &codec_embed[row_idx * hidden_size..(row_idx + 1) * hidden_size];
+                let out_row =
+                    &mut icl_input_embed[row_idx * hidden_size..(row_idx + 1) * hidden_size];
+                for h in 0..hidden_size {
+                    out_row[h] = text_row[h] + codec_row[h];
+                }
+            }
+        }
+
+        let trailing_text_hidden = if text_len > codec_len {
+            text_embed[codec_len * hidden_size..].to_vec()
+        } else {
+            tts_pad_embed.clone()
+        };
+
+        let prefill_len = 3 + codec_plus_overlay_len + codec_len;
+        let mut prefill_embd = vec![0.0f32; prefill_len * hidden_size];
+        prefill_embd[..role_embed.len()].copy_from_slice(&role_embed);
+        let codec_offset = 3 * hidden_size;
+        prefill_embd[codec_offset..codec_offset + codec_plus_overlay.len()]
+            .copy_from_slice(&codec_plus_overlay);
+        let icl_offset = codec_offset + codec_plus_overlay.len();
+        prefill_embd[icl_offset..icl_offset + icl_input_embed.len()]
+            .copy_from_slice(&icl_input_embed);
 
         Ok(PreparedPrefillInputs {
             prefill_embd,
@@ -1721,6 +1901,55 @@ impl TtsTransformer {
         Ok(data)
     }
 
+    fn sum_codec_frame_embeddings(
+        &self,
+        codebook_tokens: &[i32],
+        thread_count: usize,
+    ) -> Result<Vec<f32>, Qwen3TtsError> {
+        self.validate_codebook_frame(codebook_tokens)?;
+        let hidden_size = self.config.hidden_size as usize;
+
+        if let (Some(codec_table), Some(pred_tables)) = (
+            self.talker.codec_embd_cpu.as_ref(),
+            self.code_pred.codec_embd_cpu.as_ref(),
+        ) {
+            let expected_pred = codebook_tokens.len().saturating_sub(1);
+            if pred_tables.len() == expected_pred {
+                let mut out = vec![0.0f32; hidden_size];
+                let token0 = codebook_tokens[0] as usize;
+                let row0 = token0 * hidden_size..(token0 + 1) * hidden_size;
+                if row0.end <= codec_table.len() {
+                    out.copy_from_slice(&codec_table[row0]);
+                    let mut cpu_ok = true;
+                    for (cb_idx, &token) in codebook_tokens[1..].iter().enumerate() {
+                        let tok = token as usize;
+                        let row = tok * hidden_size..(tok + 1) * hidden_size;
+                        let table = &pred_tables[cb_idx];
+                        if row.end > table.len() {
+                            cpu_ok = false;
+                            break;
+                        }
+                        for i in 0..hidden_size {
+                            out[i] += table[row.start + i];
+                        }
+                    }
+                    if cpu_ok {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+
+        let mut out = self.lookup_codec_embedding_rows(&[codebook_tokens[0]], thread_count)?;
+        for (cb_idx, &token) in codebook_tokens[1..].iter().enumerate() {
+            let row = self.lookup_code_pred_embedding_row(cb_idx, token, thread_count)?;
+            for i in 0..hidden_size {
+                out[i] += row[i];
+            }
+        }
+        Ok(out)
+    }
+
     fn forward_code_pred_sequence_recompute(
         &self,
         hidden_state: &[f32],
@@ -2602,57 +2831,12 @@ impl TtsTransformer {
                 "trailing row shape is invalid".into(),
             ));
         }
-        if codebook_tokens[0] < 0 || codebook_tokens[0] >= self.config.codec_vocab_size {
-            return Err(Qwen3TtsError::InvalidInput(format!(
-                "codec token {} out of range 0..{}",
-                codebook_tokens[0],
-                self.config.codec_vocab_size - 1
-            )));
+        let mut cpu_sum = self.sum_codec_frame_embeddings(codebook_tokens, thread_count)?;
+        for i in 0..hidden_size {
+            cpu_sum[i] += trailing_row[i];
         }
-        for (cb_idx, &token) in codebook_tokens[1..].iter().enumerate() {
-            if token < 0 || token >= self.config.code_pred_vocab_size {
-                return Err(Qwen3TtsError::InvalidInput(format!(
-                    "code predictor token {token} out of range 0..{} for codebook {}",
-                    self.config.code_pred_vocab_size - 1,
-                    cb_idx + 1
-                )));
-            }
-        }
-
-        if let (Some(codec_table), Some(pred_tables)) = (
-            self.talker.codec_embd_cpu.as_ref(),
-            self.code_pred.codec_embd_cpu.as_ref(),
-        ) {
-            let expected_pred = codebook_tokens.len().saturating_sub(1);
-            if pred_tables.len() == expected_pred {
-                let t0 = codebook_tokens[0] as usize;
-                let hs = hidden_size;
-                let row0 = t0 * hs..(t0 + 1) * hs;
-                if row0.end <= codec_table.len() {
-                    let mut out = vec![0.0f32; hs];
-                    out.copy_from_slice(&codec_table[row0]);
-                    let mut cpu_ok = true;
-                    for (cb_idx, &tok) in codebook_tokens[1..].iter().enumerate() {
-                        let ti = tok as usize;
-                        let slice = ti * hs..(ti + 1) * hs;
-                        let table = &pred_tables[cb_idx];
-                        if slice.end > table.len() {
-                            cpu_ok = false;
-                            break;
-                        }
-                        let row = &table[slice];
-                        for i in 0..hs {
-                            out[i] += row[i];
-                        }
-                    }
-                    if cpu_ok {
-                        for i in 0..hs {
-                            out[i] += trailing_row[i];
-                        }
-                        return Ok(out);
-                    }
-                }
-            }
+        if self.talker.codec_embd_cpu.is_some() && self.code_pred.codec_embd_cpu.is_some() {
+            return Ok(cpu_sum);
         }
 
         let graph_nodes = 128;

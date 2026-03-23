@@ -1,8 +1,7 @@
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use qwen3_tts::{Qwen3TtsEngine, SynthesizeRequest};
 
 #[derive(Debug, Clone, Default)]
@@ -74,8 +73,6 @@ pub(crate) struct CommonSynthesisArgs {
     pub(crate) model_dir: PathBuf,
     pub(crate) text: Option<String>,
     pub(crate) out_path: Option<PathBuf>,
-    pub(crate) reference_wav: Option<PathBuf>,
-    pub(crate) speaker_bin: Option<PathBuf>,
     pub(crate) voice_clone_prompt: Option<PathBuf>,
     pub(crate) thread_count: usize,
     pub(crate) max_audio_frames: Option<usize>,
@@ -95,8 +92,6 @@ impl CommonSynthesisArgs {
             model_dir: default_model_dir()?,
             text: None,
             out_path: None,
-            reference_wav: None,
-            speaker_bin: None,
             voice_clone_prompt: None,
             thread_count: 4,
             max_audio_frames: None,
@@ -126,14 +121,6 @@ impl CommonSynthesisArgs {
             }
             "--out" => {
                 self.out_path = Some(PathBuf::from(value_arg(args, idx, "--out")?));
-                Ok(true)
-            }
-            "--reference-wav" => {
-                self.reference_wav = Some(PathBuf::from(value_arg(args, idx, "--reference-wav")?));
-                Ok(true)
-            }
-            "--speaker-bin" => {
-                self.speaker_bin = Some(PathBuf::from(value_arg(args, idx, "--speaker-bin")?));
                 Ok(true)
             }
             "--voice-clone-prompt" => {
@@ -182,14 +169,6 @@ impl CommonSynthesisArgs {
     }
 
     pub(crate) fn validate_conditioning(&self) -> Result<()> {
-        let prompt_inputs = usize::from(self.reference_wav.is_some())
-            + usize::from(self.speaker_bin.is_some())
-            + usize::from(self.voice_clone_prompt.is_some());
-        if prompt_inputs > 1 {
-            bail!(
-                "--reference-wav, --speaker-bin, and --voice-clone-prompt are mutually exclusive"
-            );
-        }
         Ok(())
     }
 
@@ -205,12 +184,6 @@ impl CommonSynthesisArgs {
         self.validate_conditioning()?;
         Ok(SynthesizeRequest {
             text,
-            reference_wav_bytes: match self.reference_wav.as_ref() {
-                Some(path) => Some(
-                    fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
-                ),
-                None => None,
-            },
             temperature: self.temperature,
             top_p: self.top_p,
             top_k: self.top_k,

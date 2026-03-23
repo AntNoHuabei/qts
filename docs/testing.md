@@ -1,21 +1,10 @@
 # Testing
 
-## Layer A — always-on (`cargo test --workspace`)
-
 - `ggml-sys`: minimal GGML graph smoke test.
 - `ggml`: wrapper smoke test.
 - `qwen3-tts`: request defaults, `ModelPaths` helpers.
 
 No network, no large files.
-
-## Layer B — local / optional CI (`#[ignore]`)
-
-The direct Rust path validates the main GGUF file, loads tokenizer metadata, and exercises the public synthesis entrypoint with the preferred ONNX vocoder layout.
-
-Set `QWEN3_TTS_MODEL_DIR` to a directory containing:
-
-- `qwen3-tts-0.6b-f16.gguf`
-- `qwen3-tts-vocoder.onnx`
 
 Then:
 
@@ -24,10 +13,8 @@ export QWEN3_TTS_MODEL_DIR=/path/to/models
 cargo test -p qwen3-tts -- --ignored
 ```
 
-The ignored `qwen3-tts` tests now also cover WAV-only reference-audio conditioning:
-
-- `integration_reference_wav_changes_conditioning` generates a small synthetic WAV, verifies that it produces a non-zero speaker embedding, and checks that conditioned synthesis still succeeds.
-- No extra speaker-encoder model asset is required for this path.
+- `integration_voice_clone_prompt_xvector_mode` loads `testdata/sample1.xvector.voice-clone-prompt.pb`.
+- `integration_voice_clone_prompt_icl_mode` loads `testdata/sample1.icl.voice-clone-prompt.pb`.
 
 Backend-specific compile checks:
 
@@ -80,24 +67,26 @@ Optional: `--out target/profile-run1.wav` writes WAV from the first run only. Th
 
 ## CLI smoke checks
 
-With a valid model directory, smoke-test loading a `speaker.bin` produced by the Python exporter (upstream-aligned embedding):
+Voice-clone prompt import can be smoke-tested with protobuf prompts exported by the upstream helper.
+
+Xvector-only mode:
 
 ```bash
 uv sync
-uv run export-speaker-bin \
+uv run export-voice-clone-prompt \
   --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
   --ref-audio testdata/hello.wav \
-  --ref-text "hello" \
-  --out target/hello.speaker.bin
+  --x-vector-only-mode \
+  --out target/hello.xvector.voice-clone-prompt.pb
 
 cargo run -p qwen3-tts-cli -- synthesize \
   --model-dir "$QWEN3_TTS_MODEL_DIR" \
   --text "hello" \
-  --speaker-bin target/hello.speaker.bin \
-  --out target/hello.wav
+  --voice-clone-prompt target/hello.xvector.voice-clone-prompt.pb \
+  --out target/hello.from-xvector-prompt.wav
 ```
 
-Stage-2 prompt import can be smoke-tested with a protobuf prompt exported by the upstream helper:
+ICL mode:
 
 ```bash
 uv sync
@@ -112,13 +101,8 @@ cargo run -p qwen3-tts-cli -- synthesize \
   --text "hello" \
   --voice-clone-prompt target/hello.voice-clone-prompt.pb \
   --out target/hello.from-prompt.wav
-
-cargo run -p qwen3-tts-cli -- speaker-bin \
-  --model-dir "$QWEN3_TTS_MODEL_DIR" \
-  --voice-clone-prompt target/hello.voice-clone-prompt.pb \
-  --out target/hello.from-prompt.speaker.bin
 ```
 
 ## `testdata/`
 
-See [testdata/README.md](../testdata/README.md). Large or generated files under `testdata/` are listed in `.gitignore`; only `testdata/README.md` is intended to be versioned.
+See [testdata/README.md](../testdata/README.md). Most large or generated files under `testdata/` are ignored; only the small checked-in prompt fixtures and `testdata/README.md` are intended to be versioned.

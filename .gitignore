@@ -1,6 +1,7 @@
 /target
 **/target
 .DS_Store
+.hf_cache/
 
 # Local CMake outputs (ggml-sys / ggml submodule build tree)
 vendor/ggml/build/
@@ -17,6 +18,9 @@ models/
 # Test audio, golden vectors, synthetic GGUF — layout described in testdata/README.md
 testdata/**
 !/testdata/README.md
+!/testdata/sample1.wav
+!/testdata/sample1.txt
+!/testdata/sample1.*.pb
 
 # GGUF drops outside models/ (e.g. workspace root)
 *.gguf

@@ -15,8 +15,9 @@ pub use pipeline::backend::BackendKind;
 pub use pipeline::speaker_encoder::{SpeakerEncoder, SpeakerEncoderConfig};
 pub use pipeline::tokenizer::{TextTokenizer, TokenizerConfig};
 pub use pipeline::tts_transformer::{
-    CodecRollout, CodecRolloutSubTimings, PrefillConditioning, PrefillForwardOutputs,
-    PreparedPrefillInputs, SelectedCodecFrame, TtsTransformer, TtsTransformerConfig, VocoderChunk,
+    CodecRollout, CodecRolloutSubTimings, IclPrefillConditioning, PrefillConditioning,
+    PrefillForwardOutputs, PreparedPrefillInputs, SelectedCodecFrame, TtsTransformer,
+    TtsTransformerConfig, VocoderChunk,
 };
 pub use pipeline::vocoder::{
     Vocoder, VocoderConfig, VocoderExecutionProvider, VocoderGraphTemplate,
@@ -32,7 +33,6 @@ use std::time::Instant;
 #[derive(Debug, Clone)]
 pub struct SynthesizeRequest {
     pub text: String,
-    pub reference_wav_bytes: Option<Vec<u8>>,
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: i32,
@@ -54,7 +54,6 @@ impl Default for SynthesizeRequest {
     fn default() -> Self {
         Self {
             text: String::new(),
-            reference_wav_bytes: None,
             temperature: 0.9,
             top_p: 1.0,
             top_k: 50,
@@ -190,32 +189,6 @@ impl Qwen3TtsEngine {
         self.transformer.config().hidden_size as usize
     }
 
-    pub fn decode_speaker_embedding_bin(
-        &self,
-        bin_bytes: &[u8],
-    ) -> Result<Vec<f32>, Qwen3TtsError> {
-        if !bin_bytes.len().is_multiple_of(std::mem::size_of::<f32>()) {
-            return Err(Qwen3TtsError::InvalidInput(
-                "speaker.bin must be a raw little-endian f32 array".into(),
-            ));
-        }
-
-        let embedding = bin_bytes
-            .chunks_exact(std::mem::size_of::<f32>())
-            .map(|chunk| {
-                let bytes: [u8; 4] = chunk.try_into().expect("speaker f32 chunk");
-                f32::from_le_bytes(bytes)
-            })
-            .collect::<Vec<_>>();
-        if embedding.len() != self.speaker_embedding_size() {
-            return Err(Qwen3TtsError::InvalidInput(format!(
-                "speaker.bin must contain {} f32 values",
-                self.speaker_embedding_size()
-            )));
-        }
-        Ok(embedding)
-    }
-
     pub fn decode_voice_clone_prompt(
         &self,
         pb_bytes: &[u8],
@@ -231,15 +204,6 @@ impl Qwen3TtsEngine {
             }
         }
         Ok(prompt)
-    }
-
-    pub fn synthesize_with_speaker_embedding(
-        &self,
-        req: &SynthesizeRequest,
-        speaker_embedding: &[f32],
-    ) -> Result<SynthesizeResult, Qwen3TtsError> {
-        self.validate_speaker_embedding(speaker_embedding)?;
-        self.synthesize_impl(req, Some(speaker_embedding), None, None)
     }
 
     pub fn synthesize_with_voice_clone_prompt(
@@ -266,19 +230,6 @@ impl Qwen3TtsEngine {
         self.synthesize_streaming_impl(req, None, None, sink, None)
     }
 
-    pub fn synthesize_with_speaker_embedding_streaming<S>(
-        &self,
-        req: &SynthesizeRequest,
-        speaker_embedding: &[f32],
-        sink: &mut S,
-    ) -> Result<StreamingSynthesizeResult, Qwen3TtsError>
-    where
-        S: StreamingSynthesis + Send,
-    {
-        self.validate_speaker_embedding(speaker_embedding)?;
-        self.synthesize_streaming_impl(req, Some(speaker_embedding), None, sink, None)
-    }
-
     pub fn synthesize_with_voice_clone_prompt_streaming<S>(
         &self,
         req: &SynthesizeRequest,
@@ -299,19 +250,6 @@ impl Qwen3TtsEngine {
     ) -> Result<(SynthesizeResult, SynthesisStageTimings), Qwen3TtsError> {
         let mut timings = SynthesisStageTimings::default();
         let result = self.synthesize_impl(req, None, None, Some(&mut timings))?;
-        Ok((result, timings))
-    }
-
-    /// Same as [`Self::synthesize_with_speaker_embedding`], plus stage timings.
-    pub fn synthesize_with_speaker_embedding_profile(
-        &self,
-        req: &SynthesizeRequest,
-        speaker_embedding: &[f32],
-    ) -> Result<(SynthesizeResult, SynthesisStageTimings), Qwen3TtsError> {
-        self.validate_speaker_embedding(speaker_embedding)?;
-        let mut timings = SynthesisStageTimings::default();
-        let result =
-            self.synthesize_impl(req, Some(speaker_embedding), None, Some(&mut timings))?;
         Ok((result, timings))
     }
 
@@ -371,70 +309,80 @@ impl Qwen3TtsEngine {
         speaker_embedding_override: Option<&'a [f32]>,
         voice_clone_prompt: Option<&'a VoiceClonePromptV2>,
     ) -> Result<PreparedSynthesis<'a>, Qwen3TtsError> {
-        let mut speaker_encode = std::time::Duration::ZERO;
+        let speaker_encode = std::time::Duration::ZERO;
         let speaker_embedding = if let Some(speaker_embedding) = speaker_embedding_override {
             SpeakerEmbeddingStorage::Borrowed(speaker_embedding)
         } else if let Some(speaker_embedding) =
             voice_clone_prompt.map(VoiceClonePromptV2::speaker_embedding)
         {
             SpeakerEmbeddingStorage::Borrowed(speaker_embedding)
-        } else if let Some(wav_bytes) = req.reference_wav_bytes.as_deref() {
-            let t0 = Instant::now();
-            let encoded = self.encode_reference_speaker(wav_bytes)?;
-            speaker_encode = t0.elapsed();
-            SpeakerEmbeddingStorage::Owned(encoded)
         } else {
             SpeakerEmbeddingStorage::Owned(vec![0.0f32; self.speaker_embedding_size()])
         };
 
         let t_tok = Instant::now();
-        let (tokens, prompt_frames, ref_codebook_0, prefix_frame_count) =
-            if let Some(prompt) = voice_clone_prompt {
-                let prompt_frames =
-                    prompt
-                        .ref_code_shape()
-                        .map_or_else(Vec::new, |(frames, codebooks)| {
-                            let values = prompt.ref_code_values().unwrap_or(&[]);
-                            (0..frames)
-                                .map(|frame_idx| {
-                                    let start = frame_idx * codebooks;
-                                    let end = start + codebooks;
-                                    values[start..end].to_vec()
-                                })
-                                .collect::<Vec<_>>()
-                        });
+        let prompt_frames = if let Some(prompt) = voice_clone_prompt {
+            prompt
+                .ref_code_shape()
+                .map_or_else(Vec::new, |(frames, codebooks)| {
+                    let values = prompt.ref_code_values().unwrap_or(&[]);
+                    (0..frames)
+                        .map(|frame_idx| {
+                            let start = frame_idx * codebooks;
+                            let end = start + codebooks;
+                            values[start..end].to_vec()
+                        })
+                        .collect::<Vec<_>>()
+                })
+        } else {
+            Vec::new()
+        };
+        let prefix_frame_count = prompt_frames.len();
+        let tokenize = t_tok.elapsed();
+
+        let t_prefill = Instant::now();
+        let prepared_inputs = if let Some(prompt) = voice_clone_prompt {
+            if prompt.icl_mode {
+                let text_tokens = self.tokenizer.encode_for_tts(&req.text);
+                let ref_text_tokens = self.tokenizer.encode_ref_for_tts(&prompt.ref_text);
+                self.transformer.build_icl_prefill_inputs(
+                    IclPrefillConditioning {
+                        text_tokens: &text_tokens,
+                        ref_text_tokens: &ref_text_tokens,
+                        speaker_embd: Some(speaker_embedding.as_slice()),
+                        ref_code_frames: &prompt_frames,
+                        language_id: req.language_id,
+                    },
+                    req.thread_count,
+                )?
+            } else {
                 let ref_codebook_0 = prompt_frames
                     .iter()
                     .filter_map(|frame| frame.first().copied())
                     .collect::<Vec<_>>();
-                let tokens = if prompt.icl_mode {
-                    self.tokenizer
-                        .encode_for_voice_clone(&prompt.ref_text, &req.text)
-                } else {
-                    self.tokenizer.encode_for_tts(&req.text)
-                };
-                let prefix_frame_count = prompt_frames.len();
-                (tokens, prompt_frames, ref_codebook_0, prefix_frame_count)
-            } else {
-                (
-                    self.tokenizer.encode_for_tts(&req.text),
-                    Vec::new(),
-                    Vec::new(),
-                    0usize,
-                )
-            };
-        let tokenize = t_tok.elapsed();
-
-        let t_prefill = Instant::now();
-        let prepared_inputs = self.transformer.build_prefill_inputs(
-            PrefillConditioning {
-                text_tokens: &tokens,
-                speaker_embd: Some(speaker_embedding.as_slice()),
-                ref_codebook_0: &ref_codebook_0,
-                language_id: req.language_id,
-            },
-            req.thread_count,
-        )?;
+                let text_tokens = self.tokenizer.encode_for_tts(&req.text);
+                self.transformer.build_prefill_inputs(
+                    PrefillConditioning {
+                        text_tokens: &text_tokens,
+                        speaker_embd: Some(speaker_embedding.as_slice()),
+                        ref_codebook_0: &ref_codebook_0,
+                        language_id: req.language_id,
+                    },
+                    req.thread_count,
+                )?
+            }
+        } else {
+            let text_tokens = self.tokenizer.encode_for_tts(&req.text);
+            self.transformer.build_prefill_inputs(
+                PrefillConditioning {
+                    text_tokens: &text_tokens,
+                    speaker_embd: Some(speaker_embedding.as_slice()),
+                    ref_codebook_0: &[],
+                    language_id: req.language_id,
+                },
+                req.thread_count,
+            )?
+        };
         let prefill_build = t_prefill.elapsed();
 
         Ok(PreparedSynthesis {

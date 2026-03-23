@@ -159,7 +159,18 @@ impl VoiceClonePromptV2 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{TensorF32, TensorI32, VoiceClonePromptV2, VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION};
+
+    fn load_fixture(name: &str) -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|err| {
+            panic!("failed to read fixture {}: {err}", path.display());
+        })
+    }
 
     #[test]
     fn parses_prompt_protobuf() {
@@ -225,5 +236,32 @@ mod tests {
         };
         let err = prompt.validate().unwrap_err();
         assert!(err.to_string().contains("ref_text is required in icl_mode"));
+    }
+
+    #[test]
+    fn parses_checked_in_xvector_fixture() {
+        let pb = load_fixture("sample1.xvector.voice-clone-prompt.pb");
+        let prompt = VoiceClonePromptV2::from_protobuf_bytes(&pb).unwrap();
+        assert!(prompt.x_vector_only_mode);
+        assert!(!prompt.icl_mode);
+        assert_eq!(prompt.ref_text, "");
+        assert_eq!(prompt.speaker_embedding_dim(), Some(1024));
+        assert_eq!(prompt.ref_code_shape(), None);
+        assert!(prompt.ref_code_values().is_none());
+    }
+
+    #[test]
+    fn parses_checked_in_icl_fixture() {
+        let pb = load_fixture("sample1.icl.voice-clone-prompt.pb");
+        let prompt = VoiceClonePromptV2::from_protobuf_bytes(&pb).unwrap();
+        assert!(!prompt.x_vector_only_mode);
+        assert!(prompt.icl_mode);
+        assert_eq!(prompt.speaker_embedding_dim(), Some(1024));
+        assert_eq!(prompt.ref_code_shape(), Some((105, 16)));
+        assert!(!prompt.ref_text.is_empty());
+        assert_eq!(
+            prompt.ref_code_values().map(|values| values.len()),
+            Some(105 * 16)
+        );
     }
 }

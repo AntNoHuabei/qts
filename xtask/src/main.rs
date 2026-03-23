@@ -676,7 +676,7 @@ fn value_arg(
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  cargo xtask bench [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [-- <criterion args>]\n  cargo xtask profile [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] [... same flags as synthesize ...]\n  cargo xtask hf-release --model MODEL [--main-type TYPE] [--artifacts-dir PATH] [--out-dir PATH] [--hf-repo-dir PATH] [--readme-template PATH] [--source-commit SHA] [--local-files-only] [--verbose] [--skip-export]\n\nTry: cargo xtask profile --help\n     cargo xtask hf-release --help"
+        "usage:\n  cargo xtask bench [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [-- <criterion args>]\n  cargo xtask profile [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--runs N] [--out OUT.wav] [--voice-clone-prompt] [... same flags as synthesize ...]\n  cargo xtask hf-release --model MODEL [--main-type TYPE] [--artifacts-dir PATH] [--out-dir PATH] [--hf-repo-dir PATH] [--readme-template PATH] [--source-commit SHA] [--local-files-only] [--verbose] [--skip-export]\n\nTry: cargo xtask profile --help\n     cargo xtask hf-release --help"
     );
 }
 

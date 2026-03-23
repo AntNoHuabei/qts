@@ -16,7 +16,7 @@ Rust workspace for on-device **Qwen3 TTS** using [ggml-org/ggml](https://github.
 | `ggml-sys` | CMake + bindgen FFI to `vendor/ggml` ([ggml](https://github.com/ggml-org/ggml) Git submodule) |
 | `ggml` | Thin wrappers + `sys` re-export |
 | `qwen3-tts` | Pure Rust `rlib` for GGUF loading, speaker encoding, and synthesis |
-| `qwen3-tts-cli` | Command-line interface for synthesis, profiling, and optional `speaker.bin` extraction from voice-clone prompts |
+| `qwen3-tts-cli` | Command-line interface for synthesis, profiling, and interactive TUI playback |
 
 ## Prerequisites
 
@@ -43,7 +43,6 @@ Python helper scripts are managed with `uv` from the workspace root. Public entr
 uv sync
 uv run export-model-artifacts --help
 uv run export-voice-clone-prompt --help
-uv run export-speaker-bin --help
 ```
 
 CLI builds the same engine as the library and supports the same backend features:
@@ -105,19 +104,46 @@ Official Hugging Face publication is handled by GitHub Actions:
 
 When `cargo xtask hf-release` receives `--hf-repo-dir` and you do not override `--artifacts-dir` or `--out-dir`, it now exports and packages directly in that cloned Hugging Face repository root to avoid extra copies. The local flow remains useful for previewing the exact files that the tagged release workflow will publish.
 
-## Reference Audio
+## Voice Clone Prompts
 
-`SynthesizeRequest.reference_wav_bytes` now drives a built-in speaker-conditioning path for tone transfer.
+For better alignment with upstream `QwenLM/Qwen3-TTS`, the native path consumes protobuf voice-clone prompts rather than direct reference-audio conditioning at synthesis time.
 
-- Input format is WAV only in this first pass.
-- No extra speaker-model file is required; the library derives a deterministic speaker embedding from reference audio at runtime.
-- If `reference_wav_bytes` is absent, synthesis keeps the previous zero-speaker fallback.
+### Protobuf prompt export and native consumption
 
-For better alignment with upstream `QwenLM/Qwen3-TTS`, the native path also supports a stage-2 protobuf voice-clone prompt that carries the full upstream prompt semantics.
+The voice-clone runtime now supports two protobuf prompt modes:
 
-### Stage 2: Protobuf prompt export and native consumption
+- **xvector-only mode**: use the reference speaker identity only.
+- **ICL mode**: use the reference speaker identity plus the upstream in-context reference text and codec prompt.
 
-Use the repository's `uv`-managed Python environment to export a single protobuf prompt from `create_voice_clone_prompt(...)`:
+Use the repository's `uv`-managed Python environment to export either form from `create_voice_clone_prompt(...)`.
+
+### Xvector-only mode
+
+This is the closest replacement for the old `speaker.bin` workflow, but the runtime now consumes the protobuf prompt directly instead of a raw embedding file.
+
+```bash
+uv sync
+
+uv run export-voice-clone-prompt \
+  --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --ref-audio testdata/hello.wav \
+  --x-vector-only-mode \
+  --out target/hello.xvector.voice-clone-prompt.pb
+```
+
+Then synthesize with the prompt:
+
+```bash
+cargo run -p qwen3-tts-cli -- synthesize \
+  --model-dir models/qwen3-tts-bundle \
+  --text "hello" \
+  --voice-clone-prompt target/hello.xvector.voice-clone-prompt.pb \
+  --out target/hello-from-xvector-prompt.wav
+```
+
+### ICL mode
+
+ICL mode mirrors upstream `create_voice_clone_prompt(...)` behavior: the prompt includes `ref_spk_embedding`, `ref_code`, and `ref_text`, and the native runtime uses those fields together.
 
 ```bash
 uv sync
@@ -129,29 +155,7 @@ uv run export-voice-clone-prompt \
   --out target/hello.voice-clone-prompt.pb
 ```
 
-Compatibility wrapper paths still work too:
-
-```bash
-uv run python scripts/export_voice_clone_prompt.py --help
-uv run python scripts/export_speaker_bin.py --help
-```
-
-If you only need the upstream speaker embedding as a raw `speaker.bin`, export it directly:
-
-```bash
-uv run export-speaker-bin \
-  --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-  --ref-audio testdata/hello.wav \
-  --ref-text "hello" \
-  --out target/hello.python.speaker.bin
-```
-
-Then consume that prompt from `qwen3-tts-cli`. In stage 2, the native engine reads the protobuf and uses:
-
-- `ref_spk_embedding`
-- `ref_code`
-- `ref_text`
-- `icl_mode` / `x_vector_only_mode`
+Then consume that prompt from `qwen3-tts-cli`:
 
 ```bash
 cargo run -p qwen3-tts-cli -- synthesize \
@@ -159,21 +163,19 @@ cargo run -p qwen3-tts-cli -- synthesize \
   --text "hello" \
   --voice-clone-prompt target/hello.voice-clone-prompt.pb \
   --out target/hello-from-prompt.wav
-
-cargo run -p qwen3-tts-cli -- speaker-bin \
-  --model-dir models/qwen3-tts-bundle \
-  --voice-clone-prompt target/hello.voice-clone-prompt.pb \
-  --out target/hello.from-prompt.speaker.bin
 ```
 
-You can reuse a `speaker.bin` from `export-speaker-bin` (above) or from `speaker-bin` on a prompt:
+The native engine reads the protobuf and uses:
+
+- `ref_spk_embedding`
+- `ref_code`
+- `ref_text`
+- `icl_mode` / `x_vector_only_mode`
+
+Compatibility wrapper path still works too:
 
 ```bash
-cargo run -p qwen3-tts-cli -- synthesize \
-  --model-dir models/qwen3-tts-bundle \
-  --text "hello" \
-  --speaker-bin target/hello.python.speaker.bin \
-  --out target/hello-from-speaker-bin.wav
+uv run python scripts/export_voice_clone_prompt.py --help
 ```
 
 ## Interactive TUI
@@ -183,7 +185,7 @@ For interactive latency demos, the CLI also has a `tui` mode that loads the mode
 ```bash
 cargo run -p qwen3-tts-cli -- tui \
   --model-dir models/qwen3-tts-bundle \
-  --speaker-bin target/hello.python.speaker.bin \
+  --voice-clone-prompt target/hello.xvector.voice-clone-prompt.pb \
   --language en \
   --chunk-size 4
 ```
@@ -198,7 +200,7 @@ Notes:
 - `--backend-fallback` and `--vocoder-ep-fallback` accept comma-separated fallback chains used when the corresponding selector is `auto`.
 - `--language en|zh|ja` is the friendly startup flag; `--language-id` still works if you want to pass a raw codec language id.
 - `--chunk-size` controls how many codec frames are vocoded per playback chunk. Smaller values reduce startup latency, while larger values reduce scheduling overhead.
-- `--reference-wav`, `--speaker-bin`, and `--voice-clone-prompt` work the same way as in `synthesize`, but are loaded once up front and then reused for each prompt.
+- `--voice-clone-prompt` is loaded once up front and then reused for each prompt.
 
 On Apple platforms, the ONNX vocoder can use CoreML:
 

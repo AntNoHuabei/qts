@@ -225,8 +225,6 @@ pub(crate) fn run(args: Vec<String>) -> Result<()> {
 #[derive(Debug, Clone)]
 struct TuiConfig {
     model_dir: PathBuf,
-    reference_wav: Option<PathBuf>,
-    speaker_bin: Option<PathBuf>,
     voice_clone_prompt: Option<PathBuf>,
     thread_count: usize,
     max_audio_frames: usize,
@@ -244,8 +242,6 @@ impl TuiConfig {
     fn parse(args: Vec<String>) -> Result<Self> {
         let mut config = Self {
             model_dir: default_model_dir()?,
-            reference_wav: None,
-            speaker_bin: None,
             voice_clone_prompt: None,
             thread_count: 4,
             max_audio_frames: 256,
@@ -267,17 +263,6 @@ impl TuiConfig {
             match args[idx].as_str() {
                 "--model-dir" => {
                     config.model_dir = PathBuf::from(value_arg(&args, &mut idx, "--model-dir")?);
-                }
-                "--reference-wav" => {
-                    config.reference_wav = Some(PathBuf::from(value_arg(
-                        &args,
-                        &mut idx,
-                        "--reference-wav",
-                    )?));
-                }
-                "--speaker-bin" => {
-                    config.speaker_bin =
-                        Some(PathBuf::from(value_arg(&args, &mut idx, "--speaker-bin")?));
                 }
                 "--voice-clone-prompt" => {
                     config.voice_clone_prompt = Some(PathBuf::from(value_arg(
@@ -329,15 +314,6 @@ impl TuiConfig {
             }
         }
 
-        let prompt_inputs = usize::from(config.reference_wav.is_some())
-            + usize::from(config.speaker_bin.is_some())
-            + usize::from(config.voice_clone_prompt.is_some());
-        if prompt_inputs > 1 {
-            bail!(
-                "--reference-wav, --speaker-bin, and --voice-clone-prompt are mutually exclusive"
-            );
-        }
-
         Ok(config)
     }
 
@@ -361,7 +337,6 @@ impl TuiConfig {
     fn make_request(&self, text: &str) -> SynthesizeRequest {
         SynthesizeRequest {
             text: text.to_string(),
-            reference_wav_bytes: None,
             temperature: self.temperature,
             top_p: self.top_p,
             top_k: self.top_k,
@@ -377,7 +352,6 @@ impl TuiConfig {
 
 enum Conditioning {
     None,
-    SpeakerEmbedding(Vec<f32>),
     VoiceClonePrompt(VoiceClonePromptV2),
 }
 
@@ -385,9 +359,6 @@ impl Conditioning {
     fn describe(&self) -> String {
         match self {
             Self::None => "Conditioning: none".to_string(),
-            Self::SpeakerEmbedding(embedding) => {
-                format!("Conditioning: speaker embedding ({} dims)", embedding.len())
-            }
             Self::VoiceClonePrompt(prompt) => format!(
                 "Conditioning: voice-clone prompt{}",
                 if prompt.icl_mode { " with ICL" } else { "" }
@@ -401,16 +372,6 @@ fn load_conditioning(engine: &Qwen3TtsEngine, config: &TuiConfig) -> Result<Cond
         let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
         let prompt = engine.decode_voice_clone_prompt(&bytes)?;
         return Ok(Conditioning::VoiceClonePrompt(prompt));
-    }
-    if let Some(path) = &config.speaker_bin {
-        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        let embedding = engine.decode_speaker_embedding_bin(&bytes)?;
-        return Ok(Conditioning::SpeakerEmbedding(embedding));
-    }
-    if let Some(path) = &config.reference_wav {
-        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        let embedding = engine.encode_reference_speaker(&bytes)?;
-        return Ok(Conditioning::SpeakerEmbedding(embedding));
     }
     Ok(Conditioning::None)
 }
@@ -825,8 +786,6 @@ fn synthesize_and_play(
 
     let result: StreamingSynthesizeResult = match conditioning {
         Conditioning::None => engine.synthesize_streaming(&request, &mut stream_sink)?,
-        Conditioning::SpeakerEmbedding(embedding) => engine
-            .synthesize_with_speaker_embedding_streaming(&request, embedding, &mut stream_sink)?,
         Conditioning::VoiceClonePrompt(prompt) => engine
             .synthesize_with_voice_clone_prompt_streaming(&request, prompt, &mut stream_sink)?,
     };
@@ -867,8 +826,6 @@ fn warmup_engine(
 
     let result: StreamingSynthesizeResult = match conditioning {
         Conditioning::None => engine.synthesize_streaming(&request, &mut stream_sink)?,
-        Conditioning::SpeakerEmbedding(embedding) => engine
-            .synthesize_with_speaker_embedding_streaming(&request, embedding, &mut stream_sink)?,
         Conditioning::VoiceClonePrompt(prompt) => engine
             .synthesize_with_voice_clone_prompt_streaming(&request, prompt, &mut stream_sink)?,
     };
@@ -889,7 +846,7 @@ fn warmup_engine(
 fn print_tui_usage() {
     eprintln!(
         "qwen3-tts-cli tui — interactive terminal mode with direct cpal playback\n\n\
-         usage:\n  tui [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language en|zh|ja | --language-id N] [--vocoder-threads N] [--chunk-size N] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|coreml] [--vocoder-ep-fallback LIST]\n\n\
+         usage:\n  tui [--model-dir DIR] [--voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language en|zh|ja | --language-id N] [--vocoder-threads N] [--chunk-size N] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|coreml] [--vocoder-ep-fallback LIST]\n\n\
          CLI flags override environment variables.\n\
          Default transformer auto chain: Apple = metal,vulkan,cpu ; others = vulkan,cpu.\n\
          Default vocoder auto chain: Apple = coreml,cpu ; others = cpu.\n\n\
