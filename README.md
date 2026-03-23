@@ -1,6 +1,6 @@
 # qts
 
-Rust workspace for on-device **Qwen3 TTS** using [ggml-org/ggml](https://github.com/ggml-org/ggml) for the main transformer and **ONNX Runtime** for the exported vocoder. The project references [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp) for architecture and tensor naming, but does **not** link against it.
+Rust workspace for on-device **Qwen3 TTS** using [ggml-org/ggml](https://github.com/ggml-org/ggml) for the main transformer and **ONNX Runtime** for the exported vocoder.
 
 ## Repository Layout
 
@@ -261,3 +261,8 @@ This repository is licensed under **Apache License 2.0**. See [`LICENSE`](LICENS
 ## Godot / gdext
 
 The `qwen3-tts` crate is a normal Rust library (`rlib`). A future Godot project can depend on it directly from a `gdext` crate without a separate `cdylib` ABI layer.
+
+## Acknowledgments
+
+- [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp) for architecture and tensor naming.
+- [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) for the model architecture and tensor naming.
