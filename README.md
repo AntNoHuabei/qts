@@ -268,5 +268,5 @@ The `qts` crate is a normal Rust library (`rlib`). A future Godot project can de
 
 ## Acknowledgments
 
-- [predict-woo/qts.cpp](https://github.com/predict-woo/qts.cpp) for architecture and tensor naming.
-- [QwenLM/qts](https://github.com/QwenLM/qts) for the model architecture and tensor naming.
+- [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp) for architecture and tensor naming.
+- [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) for the model architecture and tensor naming.
