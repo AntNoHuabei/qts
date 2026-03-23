@@ -216,16 +216,15 @@ impl Drop for GgufFile {
     }
 }
 
-/// Validate that paths exist and each file parses as GGUF (metadata only, no tensor alloc).
+/// Validate that required model artifacts exist and the main checkpoint parses as GGUF.
 pub fn load_and_validate(paths: &ModelPaths) -> Result<(), Qwen3TtsError> {
     if !paths.main_gguf.is_file() {
         return Err(Qwen3TtsError::ModelFile(paths.main_gguf.clone()));
     }
-    if !paths.vocoder_gguf.is_file() {
-        return Err(Qwen3TtsError::ModelFile(paths.vocoder_gguf.clone()));
+    if !paths.vocoder_onnx.is_file() {
+        return Err(Qwen3TtsError::ModelFile(paths.vocoder_onnx.clone()));
     }
     validate_gguf_file(&paths.main_gguf)?;
-    validate_gguf_file(&paths.vocoder_gguf)?;
     Ok(())
 }
 

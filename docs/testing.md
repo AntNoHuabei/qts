@@ -10,12 +10,13 @@ No network, no large files.
 
 ## Layer B — local / optional CI (`#[ignore]`)
 
-The direct Rust path currently validates GGUF files, loads tokenizer metadata, and exercises the public synthesis entrypoint up to the not-yet-ported transformer/vocoder stages.
+The direct Rust path validates the main GGUF file, loads tokenizer metadata, and exercises the public synthesis entrypoint with the preferred ONNX vocoder layout.
 
 Set `QWEN3_TTS_MODEL_DIR` to a directory containing:
 
 - `qwen3-tts-0.6b-f16.gguf`
-- `qwen3-tts-tokenizer-f16.gguf`
+- `qwen3-tts-vocoder.onnx`
+- `qwen3-tts-vocoder.onnx.data`
 
 Then:
 
@@ -63,6 +64,10 @@ cargo xtask bench vulkan
 The Vulkan path requires a working Vulkan SDK / loader and `glslc` on the machine performing the build.
 
 Runtime backend is controlled by **`QWEN3_TTS_BACKEND`** (`auto`, `cpu`, `metal`, `vulkan`). `cargo xtask profile vulkan` sets `QWEN3_TTS_BACKEND=vulkan` so macOS can use MoltenVK when the binary is built with `--features vulkan`.
+
+The ONNX vocoder execution provider is controlled separately by **`QWEN3_TTS_VOCODER_EP`** (`auto`, `cpu`, `coreml`). On Apple platforms, `auto` prefers CoreML when available.
+
+The CLI also accepts `--backend`, `--backend-fallback`, `--vocoder-ep`, and `--vocoder-ep-fallback`, which override the environment variables for that invocation.
 
 ### Synthesis stage profile (wall clock)
 

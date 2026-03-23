@@ -8,6 +8,74 @@ use qwen3_tts::{Qwen3TtsEngine, SynthesisStageTimings, SynthesizeRequest};
 
 mod tui;
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RuntimeBackendOverrides {
+    ggml_backend: Option<String>,
+    ggml_backend_fallback: Option<String>,
+    vocoder_ep: Option<String>,
+    vocoder_ep_fallback: Option<String>,
+}
+
+impl RuntimeBackendOverrides {
+    pub(crate) fn parse_flag(
+        &mut self,
+        args: &[String],
+        idx: &mut usize,
+    ) -> Result<bool> {
+        match args[*idx].as_str() {
+            "--backend" => {
+                self.ggml_backend = Some(value_arg(args, idx, "--backend")?);
+                Ok(true)
+            }
+            "--backend-fallback" => {
+                self.ggml_backend_fallback = Some(value_arg(args, idx, "--backend-fallback")?);
+                Ok(true)
+            }
+            "--vocoder-ep" => {
+                self.vocoder_ep = Some(value_arg(args, idx, "--vocoder-ep")?);
+                Ok(true)
+            }
+            "--vocoder-ep-fallback" => {
+                self.vocoder_ep_fallback = Some(value_arg(args, idx, "--vocoder-ep-fallback")?);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(crate) fn apply_env_overrides(&self) {
+        if let Some(value) = &self.ggml_backend {
+            unsafe { env::set_var("QWEN3_TTS_BACKEND", value) };
+        }
+        if let Some(value) = &self.ggml_backend_fallback {
+            unsafe { env::set_var("QWEN3_TTS_BACKEND_FALLBACK", value) };
+        }
+        if let Some(value) = &self.vocoder_ep {
+            unsafe { env::set_var("QWEN3_TTS_VOCODER_EP", value) };
+        }
+        if let Some(value) = &self.vocoder_ep_fallback {
+            unsafe { env::set_var("QWEN3_TTS_VOCODER_EP_FALLBACK", value) };
+        }
+    }
+
+    pub(crate) fn describe(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(value) = &self.ggml_backend {
+            parts.push(format!("backend={value}"));
+        }
+        if let Some(value) = &self.ggml_backend_fallback {
+            parts.push(format!("backend_fallback={value}"));
+        }
+        if let Some(value) = &self.vocoder_ep {
+            parts.push(format!("vocoder_ep={value}"));
+        }
+        if let Some(value) = &self.vocoder_ep_fallback {
+            parts.push(format!("vocoder_ep_fallback={value}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" "))
+    }
+}
+
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
@@ -26,9 +94,13 @@ fn run_speaker_bin(args: Vec<String>) -> Result<()> {
     let mut model_dir = default_model_dir()?;
     let mut prompt_path = None;
     let mut out_path = None;
+    let mut runtime_backends = RuntimeBackendOverrides::default();
 
     let mut idx = 0;
     while idx < args.len() {
+        if runtime_backends.parse_flag(&args, &mut idx)? {
+            continue;
+        }
         match args[idx].as_str() {
             "--model-dir" => {
                 model_dir = PathBuf::from(value_arg(&args, &mut idx, "--model-dir")?);
@@ -49,7 +121,7 @@ fn run_speaker_bin(args: Vec<String>) -> Result<()> {
 
     let out_path = out_path.context("--out is required")?;
     let prompt_path = prompt_path.context("--voice-clone-prompt is required")?;
-    let engine = load_engine(&model_dir)?;
+    let engine = load_engine(&model_dir, &runtime_backends)?;
     let prompt_bytes = fs::read(&prompt_path)
         .with_context(|| format!("failed to read {}", prompt_path.display()))?;
     let prompt = engine.decode_voice_clone_prompt(&prompt_bytes)?;
@@ -86,9 +158,13 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
     let mut language_id = 2050i32;
     let mut vocoder_thread_count = 4usize;
     let mut vocoder_chunk_size = 0usize;
+    let mut runtime_backends = RuntimeBackendOverrides::default();
 
     let mut idx = 0;
     while idx < args.len() {
+        if runtime_backends.parse_flag(&args, &mut idx)? {
+            continue;
+        }
         match args[idx].as_str() {
             "--model-dir" => {
                 model_dir = PathBuf::from(value_arg(&args, &mut idx, "--model-dir")?);
@@ -156,7 +232,7 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
 
     let text = text.context("--text is required")?;
     let out_path = out_path.context("--out is required")?;
-    let engine = load_engine(&model_dir)?;
+    let engine = load_engine(&model_dir, &runtime_backends)?;
     let max_audio_frames = match max_audio_frames {
         Some(value) => value,
         None => 256,
@@ -213,8 +289,10 @@ fn run_profile(args: Vec<String>) -> Result<()> {
     {
         eprintln!(
             "qwen3-tts-cli profile — print per-stage synthesis timings (wall clock)\n\n\
-             usage:\n  profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--reference-wav PATH | --speaker-bin PATH | --voice-clone-prompt PATH]\n\n\
-             GGML backend: set env QWEN3_TTS_BACKEND to auto|cpu|metal|vulkan (default auto). On macOS, auto prefers Metal then CPU; use vulkan for MoltenVK when built with --features vulkan.\n\n\
+             usage:\n  profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--reference-wav PATH | --speaker-bin PATH | --voice-clone-prompt PATH] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|coreml] [--vocoder-ep-fallback LIST]\n\n\
+             CLI flags override environment variables.\n\
+             Default transformer auto chain: Apple = metal,vulkan,cpu ; others = vulkan,cpu.\n\
+             Default vocoder auto chain: Apple = coreml,cpu ; others = cpu.\n\n\
              If --frames is omitted, the CLI derives a text-length-based max frame budget.\n\
              --runs N averages stage times over N full synthesize passes (default 1).\n\
              --out writes WAV from the first pass only when --runs > 1."
@@ -238,9 +316,13 @@ fn run_profile(args: Vec<String>) -> Result<()> {
     let mut runs = 1usize;
     let mut vocoder_thread_count = 4usize;
     let mut vocoder_chunk_size = 0usize;
+    let mut runtime_backends = RuntimeBackendOverrides::default();
 
     let mut idx = 0;
     while idx < args.len() {
+        if runtime_backends.parse_flag(&args, &mut idx)? {
+            continue;
+        }
         match args[idx].as_str() {
             "--model-dir" => {
                 model_dir = PathBuf::from(value_arg(&args, &mut idx, "--model-dir")?);
@@ -314,7 +396,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
     }
 
     let text = text.context("--text is required")?;
-    let engine = load_engine(&model_dir)?;
+    let engine = load_engine(&model_dir, &runtime_backends)?;
     let max_audio_frames = match max_audio_frames {
         Some(value) => value,
         None => 256,
@@ -397,7 +479,8 @@ fn run_profile(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn load_engine(model_dir: &Path) -> Result<Qwen3TtsEngine> {
+fn load_engine(model_dir: &Path, runtime_backends: &RuntimeBackendOverrides) -> Result<Qwen3TtsEngine> {
+    runtime_backends.apply_env_overrides();
     Qwen3TtsEngine::from_model_dir(model_dir)
         .with_context(|| format!("failed to load model dir {}", model_dir.display()))
 }
@@ -456,6 +539,6 @@ where
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  cargo run -p qwen3-tts-cli -- synthesize --text TEXT --out OUT.wav [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N]\n  cargo run -p qwen3-tts-cli -- profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] (same tuning flags as synthesize)\n  cargo run -p qwen3-tts-cli -- speaker-bin --voice-clone-prompt prompt.pb --out speaker.bin [--model-dir DIR]\n  cargo run -p qwen3-tts-cli -- tui [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N]\n\nIf --frames is omitted, synthesize/profile derive a text-length-based max frame budget.\n\nOr from the repo root (see .cargo/config.toml): cargo xtask bench … / cargo xtask profile …"
+        "usage:\n  cargo run -p qwen3-tts-cli -- synthesize --text TEXT --out OUT.wav [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|coreml] [--vocoder-ep-fallback LIST]\n  cargo run -p qwen3-tts-cli -- profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] (same tuning flags as synthesize plus backend flags)\n  cargo run -p qwen3-tts-cli -- speaker-bin --voice-clone-prompt prompt.pb --out speaker.bin [--model-dir DIR] [--backend ...] [--vocoder-ep ...]\n  cargo run -p qwen3-tts-cli -- tui [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|coreml] [--vocoder-ep-fallback LIST]\n\nCLI flags override environment variables.\nDefault transformer auto chain: Apple = metal,vulkan,cpu ; others = vulkan,cpu.\nDefault vocoder auto chain: Apple = coreml,cpu ; others = cpu.\n\nEnv fallback remains available: QWEN3_TTS_BACKEND / QWEN3_TTS_BACKEND_FALLBACK / QWEN3_TTS_VOCODER_EP / QWEN3_TTS_VOCODER_EP_FALLBACK\n\nIf --frames is omitted, synthesize/profile derive a text-length-based max frame budget.\n\nOr from the repo root (see .cargo/config.toml): cargo xtask bench … / cargo xtask profile …"
     );
 }

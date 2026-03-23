@@ -1,6 +1,6 @@
 # Qwen TTS Native
 
-Rust workspace for on-device **Qwen3 TTS** using [ggml-org/ggml](https://github.com/ggml-org/ggml) and **GGUF** weights. The project references [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp) for architecture and tensor naming, but does **not** link against it.
+Rust workspace for on-device **Qwen3 TTS** using [ggml-org/ggml](https://github.com/ggml-org/ggml) for the main transformer and **ONNX Runtime** for the exported vocoder. The project references [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp) for architecture and tensor naming, but does **not** link against it.
 
 ## Crates
 
@@ -34,6 +34,7 @@ Python helper scripts under `scripts/` are managed with `uv` from the workspace 
 
 ```bash
 uv sync
+uv run export-model-artifacts --help
 uv run export-voice-clone-prompt --help
 uv run export-speaker-bin --help
 ```
@@ -153,15 +154,39 @@ For interactive latency demos, the CLI also has a `tui` mode that loads the mode
 cargo run -p qwen3-tts-cli -- tui \
   --model-dir models/volko76-q4k-q8 \
   --speaker-bin target/hello.python.speaker.bin \
+  --language en \
   --chunk-size 4
 ```
 
 Notes:
 
 - Press `Enter` to synthesize the current line.
+- Press `F2` to cycle the synthesis language between English, Chinese, and Japanese.
 - Press `Esc`, `Ctrl-C`, or type `:q` to quit.
+- The TUI header shows both the transformer backend (`ggml`) and the active vocoder EP (`ORT/CPU` or `ORT/CoreML`).
+- `--backend` and `--vocoder-ep` let you choose the transformer backend and vocoder EP directly from the command line.
+- `--backend-fallback` and `--vocoder-ep-fallback` accept comma-separated fallback chains used when the corresponding selector is `auto`.
+- `--language en|zh|ja` is the friendly startup flag; `--language-id` still works if you want to pass a raw codec language id.
 - `--chunk-size` controls how many codec frames are vocoded per playback chunk. Smaller values reduce startup latency, while larger values reduce scheduling overhead.
 - `--reference-wav`, `--speaker-bin`, and `--voice-clone-prompt` work the same way as in `synthesize`, but are loaded once up front and then reused for each prompt.
+
+On Apple platforms, the ONNX vocoder can use CoreML:
+
+```bash
+cargo run -p qwen3-tts-cli -- tui \
+  --model-dir models/qwen3-tts-f16-onnx \
+  --backend auto \
+  --backend-fallback metal,vulkan,cpu \
+  --vocoder-ep coreml \
+  --chunk-size 4
+```
+
+Defaults:
+
+- Apple transformer `auto`: `metal,vulkan,cpu`
+- Other transformer `auto`: `vulkan,cpu`
+- Apple vocoder `auto`: `coreml,cpu`
+- Other vocoder `auto`: `cpu`
 
 ## Tests
 
@@ -193,11 +218,11 @@ QWEN3_TTS_BACKEND=vulkan cargo run -p qwen3-tts-cli --features vulkan -- profile
 
 This runs `qwen3-tts-cli profile`, which prints per-stage milliseconds and percentage of total wall time. Use `--out run1.wav` to keep audio from the first run while profiling.
 
-**Backend selection:** `auto` (default) prefers **Metal → CPU** on Apple, and **Vulkan → CPU** on other platforms. On macOS, **Vulkan is not auto-selected**; use `QWEN3_TTS_BACKEND=vulkan` (or `cargo xtask profile vulkan`) when you want MoltenVK.
+**Transformer backend selection:** use `--backend` / `--backend-fallback` on the CLI, or `QWEN3_TTS_BACKEND` / `QWEN3_TTS_BACKEND_FALLBACK` if you prefer environment variables. The default `auto` chain is `metal,vulkan,cpu` on Apple and `vulkan,cpu` elsewhere.
 
 GGML picks GPU devices by **registry** name plus index: use **`QWEN3_TTS_GPU_DEVICE`** (default `0`) to choose among multiple Vulkan or Metal adapters (`Vulkan0` / `MTL0`, …).
 
-With **`QWEN3_TTS_BACKEND=vulkan`**, the vocoder inserts **`ggml_cast` to F32** around `CONV_TRANSPOSE_1D` when weights are quantized, because GGML’s Vulkan kernel for that op currently requires F32 tensors (see `ggml_vk_conv_transpose_1d` in upstream ggml).
+**Vocoder EP selection:** use `--vocoder-ep` / `--vocoder-ep-fallback` on the CLI, or `QWEN3_TTS_VOCODER_EP` / `QWEN3_TTS_VOCODER_EP_FALLBACK` from the environment. The default `auto` chain is `coreml,cpu` on Apple and `cpu` elsewhere.
 
 ## Godot / gdext
 

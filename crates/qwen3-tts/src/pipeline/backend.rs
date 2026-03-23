@@ -43,13 +43,25 @@ fn gpu_device_index() -> Result<usize, Qwen3TtsError> {
 /// were linked into the binary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendChoice {
-    /// Prefer Metal on Apple (if `metal` feature), else Vulkan on non-Apple (if `vulkan` feature), else CPU.
     Auto,
+    Explicit(BackendPreference),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendPreference {
     Cpu,
-    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     Metal,
-    #[cfg(feature = "vulkan")]
     Vulkan,
+}
+
+impl BackendPreference {
+    fn as_env_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::Vulkan => "vulkan",
+        }
+    }
 }
 
 fn parse_qwen3_tts_backend() -> Result<BackendChoice, Qwen3TtsError> {
@@ -59,36 +71,61 @@ fn parse_qwen3_tts_backend() -> Result<BackendChoice, Qwen3TtsError> {
     };
     match var.trim().to_ascii_lowercase().as_str() {
         "auto" => Ok(BackendChoice::Auto),
-        "cpu" => Ok(BackendChoice::Cpu),
-        "metal" => {
-            #[cfg(all(feature = "metal", target_vendor = "apple"))]
-            {
-                Ok(BackendChoice::Metal)
-            }
-            #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
-            {
-                Err(Qwen3TtsError::InvalidInput(
-                    "QWEN3_TTS_BACKEND=metal is only valid on Apple targets with the `metal` feature"
-                        .into(),
-                ))
-            }
-        }
-        "vulkan" => {
-            #[cfg(feature = "vulkan")]
-            {
-                Ok(BackendChoice::Vulkan)
-            }
-            #[cfg(not(feature = "vulkan"))]
-            {
-                Err(Qwen3TtsError::InvalidInput(
-                    "QWEN3_TTS_BACKEND=vulkan requires building with --features vulkan".into(),
-                ))
-            }
-        }
+        "cpu" => Ok(BackendChoice::Explicit(BackendPreference::Cpu)),
+        "metal" => Ok(BackendChoice::Explicit(BackendPreference::Metal)),
+        "vulkan" => Ok(BackendChoice::Explicit(BackendPreference::Vulkan)),
         other => Err(Qwen3TtsError::InvalidInput(format!(
             "QWEN3_TTS_BACKEND: unknown value '{other}' (expected auto, cpu, metal, vulkan)"
         ))),
     }
+}
+
+fn default_auto_backend_order() -> Vec<BackendPreference> {
+    #[cfg(target_vendor = "apple")]
+    {
+        vec![
+            BackendPreference::Metal,
+            BackendPreference::Vulkan,
+            BackendPreference::Cpu,
+        ]
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        vec![BackendPreference::Vulkan, BackendPreference::Cpu]
+    }
+}
+
+fn parse_auto_backend_order() -> Result<Vec<BackendPreference>, Qwen3TtsError> {
+    let var = match std::env::var("QWEN3_TTS_BACKEND_FALLBACK") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return Ok(default_auto_backend_order()),
+    };
+    let mut order = Vec::new();
+    for token in var.split(',') {
+        let value = token.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            continue;
+        }
+        let pref = match value.as_str() {
+            "cpu" => BackendPreference::Cpu,
+            "metal" => BackendPreference::Metal,
+            "vulkan" => BackendPreference::Vulkan,
+            other => {
+                return Err(Qwen3TtsError::InvalidInput(format!(
+                    "QWEN3_TTS_BACKEND_FALLBACK: unknown backend '{other}' (expected cpu, metal, vulkan)"
+                )));
+            }
+        };
+        if !order.contains(&pref) {
+            order.push(pref);
+        }
+    }
+    if order.is_empty() {
+        return Err(Qwen3TtsError::InvalidInput(
+            "QWEN3_TTS_BACKEND_FALLBACK must contain at least one backend".into(),
+        ));
+    }
+    Ok(order)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,8 +163,6 @@ struct BackendSetInner {
     primary_kind: BackendKind,
     cpu_fallback: Option<OwnedBackend>,
     primary_galloc: Mutex<OwnedGallocr>,
-    /// Vulkan's `ggml_vk_conv_transpose_1d` requires F32 weights/activations; GGUF kernels are often quantized.
-    vulkan_conv_transpose_cast_quant: bool,
 }
 
 impl BackendSet {
@@ -138,77 +173,119 @@ impl BackendSet {
         }
 
         match parse_qwen3_tts_backend()? {
-            BackendChoice::Auto => Self::auto_select_backend(),
-            BackendChoice::Cpu => {
+            BackendChoice::Auto => Self::auto_select_backend(&parse_auto_backend_order()?),
+            BackendChoice::Explicit(choice) => Self::require_backend(choice),
+        }
+    }
+
+    fn auto_select_backend(order: &[BackendPreference]) -> Result<Self, Qwen3TtsError> {
+        if backend_debug_enabled() {
+            let chain = order
+                .iter()
+                .map(|choice| choice.as_env_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            eprintln!("[backend-debug] auto fallback chain: {chain}");
+        }
+        for choice in order {
+            if let Some(backends) = Self::try_backend(*choice)? {
+                return Ok(backends);
+            }
+        }
+        Err(Qwen3TtsError::InvalidInput(
+            "QWEN3_TTS_BACKEND_FALLBACK did not contain a usable backend".into(),
+        ))
+    }
+
+    fn require_backend(choice: BackendPreference) -> Result<Self, Qwen3TtsError> {
+        match choice {
+            BackendPreference::Cpu => {
                 let primary = OwnedBackend::cpu()?;
                 if backend_debug_enabled() {
                     eprintln!("[backend-debug] selected {}", BackendKind::Cpu.as_str());
                 }
-                Self::with_primary(primary, BackendKind::Cpu, None, false)
+                Self::with_primary(primary, BackendKind::Cpu, None)
             }
-            #[cfg(all(feature = "metal", target_vendor = "apple"))]
-            BackendChoice::Metal => {
-                Self::require_reg_backend(ggml_reg_mtl(), BackendKind::Metal, false)
+            BackendPreference::Metal => {
+                #[cfg(all(feature = "metal", target_vendor = "apple"))]
+                {
+                    Self::require_reg_backend(ggml_reg_mtl(), BackendKind::Metal)
+                }
+                #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
+                {
+                    Err(Qwen3TtsError::InvalidInput(
+                        "QWEN3_TTS_BACKEND=metal is only valid on Apple targets with the `metal` feature"
+                            .into(),
+                    ))
+                }
             }
-            #[cfg(feature = "vulkan")]
-            BackendChoice::Vulkan => {
-                Self::require_reg_backend(ggml_reg_vulkan(), BackendKind::Vulkan, true)
+            BackendPreference::Vulkan => {
+                #[cfg(feature = "vulkan")]
+                {
+                    Self::require_reg_backend(ggml_reg_vulkan(), BackendKind::Vulkan)
+                }
+                #[cfg(not(feature = "vulkan"))]
+                {
+                    Err(Qwen3TtsError::InvalidInput(
+                        "QWEN3_TTS_BACKEND=vulkan requires building with --features vulkan".into(),
+                    ))
+                }
             }
         }
     }
 
-    pub(crate) fn cpu_only() -> Result<Self, Qwen3TtsError> {
-        unsafe {
-            sys::ggml_backend_load_all();
-            sys::ggml_cpu_init();
+    fn try_backend(choice: BackendPreference) -> Result<Option<Self>, Qwen3TtsError> {
+        match choice {
+            BackendPreference::Cpu => {
+                let primary = OwnedBackend::cpu()?;
+                if backend_debug_enabled() {
+                    eprintln!("[backend-debug] selected {}", BackendKind::Cpu.as_str());
+                }
+                Ok(Some(Self::with_primary(primary, BackendKind::Cpu, None)?))
+            }
+            BackendPreference::Metal => {
+                #[cfg(all(feature = "metal", target_vendor = "apple"))]
+                {
+                    Self::try_optional_reg(ggml_reg_mtl(), BackendKind::Metal)
+                }
+                #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
+                {
+                    if backend_debug_enabled() {
+                        eprintln!("[backend-debug] skipping metal (not supported by this build/target)");
+                    }
+                    Ok(None)
+                }
+            }
+            BackendPreference::Vulkan => {
+                #[cfg(feature = "vulkan")]
+                {
+                    Self::try_optional_reg(ggml_reg_vulkan(), BackendKind::Vulkan)
+                }
+                #[cfg(not(feature = "vulkan"))]
+                {
+                    if backend_debug_enabled() {
+                        eprintln!("[backend-debug] skipping vulkan (not enabled in this build)");
+                    }
+                    Ok(None)
+                }
+            }
         }
-        let primary = OwnedBackend::cpu()?;
-        Self::with_primary(primary, BackendKind::Cpu, None, false)
-    }
-
-    /// Automatic preference: Apple → Metal (if enabled) → CPU. Non-Apple → Vulkan (if enabled) → CPU.
-    /// On macOS, Vulkan is **not** tried here; use `QWEN3_TTS_BACKEND=vulkan` to force it.
-    fn auto_select_backend() -> Result<Self, Qwen3TtsError> {
-        #[cfg(all(feature = "metal", target_vendor = "apple"))]
-        if let Some(backends) =
-            Self::try_optional_reg(ggml_reg_mtl(), BackendKind::Metal, false)?
-        {
-            return Ok(backends);
-        }
-
-        #[cfg(all(feature = "vulkan", not(target_vendor = "apple")))]
-        if let Some(backends) = Self::try_optional_reg(ggml_reg_vulkan(), BackendKind::Vulkan, true)?
-        {
-            return Ok(backends);
-        }
-
-        let primary = OwnedBackend::cpu()?;
-        if backend_debug_enabled() {
-            eprintln!("[backend-debug] selected {}", BackendKind::Cpu.as_str());
-        }
-        Self::with_primary(primary, BackendKind::Cpu, None, false)
     }
 
     #[cfg(any(
         all(feature = "metal", target_vendor = "apple"),
-        all(feature = "vulkan", not(target_vendor = "apple"))
+        feature = "vulkan"
     ))]
     fn try_optional_reg(
         reg: &CStr,
         kind: BackendKind,
-        vulkan_conv_transpose_cast_quant: bool,
     ) -> Result<Option<Self>, Qwen3TtsError> {
         let label = kind.as_str();
         if let Some(primary) = OwnedBackend::init_from_reg(reg, label, false)? {
             if backend_debug_enabled() {
                 eprintln!("[backend-debug] selected {label}");
             }
-            return Ok(Some(Self::with_primary(
-                primary,
-                kind,
-                Some(OwnedBackend::cpu()?),
-                vulkan_conv_transpose_cast_quant,
-            )?));
+            return Ok(Some(Self::with_primary(primary, kind, Some(OwnedBackend::cpu()?))?));
         }
 
         if backend_debug_enabled() {
@@ -224,7 +301,6 @@ impl BackendSet {
     fn require_reg_backend(
         reg: &CStr,
         kind: BackendKind,
-        vulkan_conv_transpose_cast_quant: bool,
     ) -> Result<Self, Qwen3TtsError> {
         let label = kind.as_str();
         let primary = OwnedBackend::init_from_reg(reg, label, true)?.ok_or_else(|| {
@@ -235,19 +311,13 @@ impl BackendSet {
         if backend_debug_enabled() {
             eprintln!("[backend-debug] selected {label} (QWEN3_TTS_BACKEND)");
         }
-        Self::with_primary(
-            primary,
-            kind,
-            Some(OwnedBackend::cpu()?),
-            vulkan_conv_transpose_cast_quant,
-        )
+        Self::with_primary(primary, kind, Some(OwnedBackend::cpu()?))
     }
 
     fn with_primary(
         primary: OwnedBackend,
         primary_kind: BackendKind,
         cpu_fallback: Option<OwnedBackend>,
-        vulkan_conv_transpose_cast_quant: bool,
     ) -> Result<Self, Qwen3TtsError> {
         let primary_galloc = Mutex::new(OwnedGallocr::new(primary.as_ptr())?);
         Ok(Self(Arc::new(BackendSetInner {
@@ -255,13 +325,7 @@ impl BackendSet {
             primary_kind,
             cpu_fallback,
             primary_galloc,
-            vulkan_conv_transpose_cast_quant,
         })))
-    }
-
-    /// When true, vocoder graphs should `ggml_cast` quantized conv-transpose weights/inputs to F32 before the op (Vulkan limitation).
-    pub(crate) fn vulkan_conv_transpose_cast_quant_weights(&self) -> bool {
-        self.0.vulkan_conv_transpose_cast_quant
     }
 
     pub(crate) fn primary_ptr(&self) -> sys::ggml_backend_t {
@@ -528,19 +592,6 @@ pub(crate) fn execute_graph(
             "failed to allocate backend graph for {error_message}"
         )));
     }
-    run_graph_impl(backends, graph, uploads, downloads, error_message)
-}
-
-/// Re-run a previously allocated graph with new input data (skip `ggml_gallocr_alloc_graph`).
-pub(crate) fn rerun_graph(
-    backends: &BackendSet,
-    graph: NonNull<sys::ggml_cgraph>,
-    uploads: &[TensorUpload<'_>],
-    downloads: &mut [TensorDownload<'_>],
-    thread_count: usize,
-    error_message: &str,
-) -> Result<(), Qwen3TtsError> {
-    backends.configure_threads(thread_count);
     run_graph_impl(backends, graph, uploads, downloads, error_message)
 }
 

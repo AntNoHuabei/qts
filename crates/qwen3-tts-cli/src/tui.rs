@@ -25,9 +25,66 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 
-use crate::{default_model_dir, load_engine, parse_value_arg, value_arg};
+use crate::{default_model_dir, load_engine, parse_value_arg, value_arg, RuntimeBackendOverrides};
 
 const MAX_LOG_LINES: usize = 12;
+const WARMUP_TEXT: &str = "TTS warmup.";
+const WARMUP_MAX_AUDIO_FRAMES: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LanguageOption {
+    label: &'static str,
+    short: &'static str,
+    id: i32,
+}
+
+const LANGUAGE_OPTIONS: [LanguageOption; 3] = [
+    LanguageOption {
+        label: "English",
+        short: "en",
+        id: 2050,
+    },
+    LanguageOption {
+        label: "Chinese",
+        short: "zh",
+        id: 2055,
+    },
+    LanguageOption {
+        label: "Japanese",
+        short: "ja",
+        id: 2058,
+    },
+];
+
+fn language_option_from_name(name: &str) -> Option<LanguageOption> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "en" | "eng" | "english" => Some(LANGUAGE_OPTIONS[0]),
+        "zh" | "cn" | "zh-cn" | "chinese" => Some(LANGUAGE_OPTIONS[1]),
+        "ja" | "jp" | "japanese" => Some(LANGUAGE_OPTIONS[2]),
+        _ => None,
+    }
+}
+
+fn language_option_from_id(id: i32) -> Option<LanguageOption> {
+    LANGUAGE_OPTIONS.iter().copied().find(|option| option.id == id)
+}
+
+fn format_language(language_id: i32) -> String {
+    match language_option_from_id(language_id) {
+        Some(option) => format!("lang={}({})", option.short, option.id),
+        None => format!("lang=id:{language_id}"),
+    }
+}
+
+fn next_language_id(language_id: i32) -> i32 {
+    match LANGUAGE_OPTIONS
+        .iter()
+        .position(|option| option.id == language_id)
+    {
+        Some(idx) => LANGUAGE_OPTIONS[(idx + 1) % LANGUAGE_OPTIONS.len()].id,
+        None => LANGUAGE_OPTIONS[0].id,
+    }
+}
 
 pub(crate) fn run(args: Vec<String>) -> Result<()> {
     if args.iter().any(|arg| matches!(arg.as_str(), "--help" | "-h")) {
@@ -35,18 +92,38 @@ pub(crate) fn run(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let config = TuiConfig::parse(args)?;
+    let mut config = TuiConfig::parse(args)?;
     let _stderr_guard = StderrSilencer::new()?;
-    let engine = load_engine(&config.model_dir)?;
+    let engine = load_engine(&config.model_dir, &config.runtime_backends)?;
     let conditioning = load_conditioning(&engine, &config)?;
     let playback = PlaybackStream::new()?;
     let mut terminal = TerminalSession::new()?;
     let mut app = App::new(
-        format!("Backend: {}", engine.primary_backend_kind().as_str()),
+        format!(
+            "Transformer: {} | Vocoder: {}",
+            engine.primary_backend_kind().as_str(),
+            engine.vocoder_backend_label()
+        ),
         config.describe(),
         conditioning.describe(),
         playback.describe(),
     );
+    app.status = "Warming up synthesis pipeline...".to_string();
+    terminal.draw(&app)?;
+
+    match warmup_engine(&engine, &conditioning, &config, &playback) {
+        Ok(summary) => {
+            app.push_log(format!(
+                "Warmup complete. first_finalized_audio={:.1}ms synth={:.1}ms",
+                summary.first_chunk_latency_ms, summary.synthesis_ms
+            ));
+            app.status = "Ready.".to_string();
+        }
+        Err(err) => {
+            app.push_log(format!("warmup failed: {err:#}"));
+            app.status = "Ready (warmup failed).".to_string();
+        }
+    }
 
     app.push_log("Model loaded. Enter a sentence and press Enter to synthesize.");
     if config.vocoder_chunk_size == 0 {
@@ -107,6 +184,14 @@ pub(crate) fn run(args: Vec<String>) -> Result<()> {
                     }
                 }
             }
+            KeyCode::F(2) => {
+                config.language_id = next_language_id(config.language_id);
+                app.config_line = config.describe();
+                app.push_log(format!(
+                    "Language changed to {}.",
+                    format_language(config.language_id)
+                ));
+            }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.input.push(ch);
             }
@@ -132,6 +217,7 @@ struct TuiConfig {
     language_id: i32,
     vocoder_thread_count: usize,
     vocoder_chunk_size: usize,
+    runtime_backends: RuntimeBackendOverrides,
 }
 
 impl TuiConfig {
@@ -150,10 +236,14 @@ impl TuiConfig {
             language_id: 2050,
             vocoder_thread_count: 4,
             vocoder_chunk_size: 4,
+            runtime_backends: RuntimeBackendOverrides::default(),
         };
 
         let mut idx = 0;
         while idx < args.len() {
+            if config.runtime_backends.parse_flag(&args, &mut idx)? {
+                continue;
+            }
             match args[idx].as_str() {
                 "--model-dir" => {
                     config.model_dir = PathBuf::from(value_arg(&args, &mut idx, "--model-dir")?);
@@ -195,6 +285,14 @@ impl TuiConfig {
                 "--language-id" => {
                     config.language_id = parse_value_arg(&args, &mut idx, "--language-id")?;
                 }
+                "--language" => {
+                    let value = value_arg(&args, &mut idx, "--language")?;
+                    config.language_id = language_option_from_name(&value).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unsupported value for --language: {value} (expected en, zh, or ja)"
+                        )
+                    })?.id;
+                }
                 "--vocoder-threads" => {
                     config.vocoder_thread_count =
                         parse_value_arg(&args, &mut idx, "--vocoder-threads")?;
@@ -217,15 +315,20 @@ impl TuiConfig {
     }
 
     fn describe(&self) -> String {
-        format!(
-            "threads={} frames={} chunk_size={} temp={:.2} top_k={} top_p={:.2}",
+        let mut parts = vec![format!(
+            "threads={} frames={} chunk_size={} temp={:.2} top_k={} top_p={:.2} {}",
             self.thread_count,
             self.max_audio_frames,
             self.vocoder_chunk_size,
             self.temperature,
             self.top_k,
-            self.top_p
-        )
+            self.top_p,
+            format_language(self.language_id)
+        )];
+        if let Some(runtime) = self.runtime_backends.describe() {
+            parts.push(runtime);
+        }
+        parts.join(" ")
     }
 
     fn make_request(&self, text: &str) -> SynthesizeRequest {
@@ -350,7 +453,7 @@ impl TerminalSession {
                 .split(area);
 
             let header = Paragraph::new(vec![
-                Line::from("Enter to synthesize. Esc or Ctrl-C quits. :q also exits."),
+                Line::from("Enter to synthesize. F2 cycles language. Esc/Ctrl-C quits. :q also exits."),
                 Line::from(app.backend_line.as_str()),
                 Line::from(app.config_line.as_str()),
                 Line::from(app.conditioning_line.as_str()),
@@ -491,6 +594,26 @@ impl StreamingPlaybackSink {
         state.samples.extend(tail);
         cvar.notify_all();
         Ok(())
+    }
+}
+
+struct MutedPlaybackSink {
+    resampler: LinearResampler,
+}
+
+impl MutedPlaybackSink {
+    fn new(input_rate_hz: u32, output_rate_hz: u32) -> Self {
+        Self {
+            resampler: LinearResampler::new(input_rate_hz, output_rate_hz),
+        }
+    }
+
+    fn push_chunk(&mut self, pcm_f32: &[f32]) {
+        let _ = self.resampler.push_chunk(pcm_f32);
+    }
+
+    fn finish(&mut self) {
+        let _ = self.resampler.finish();
     }
 }
 
@@ -687,11 +810,59 @@ fn synthesize_and_play(
     })
 }
 
+fn warmup_engine(
+    engine: &Qwen3TtsEngine,
+    conditioning: &Conditioning,
+    config: &TuiConfig,
+    playback: &PlaybackStream,
+) -> Result<PlaybackSummary> {
+    let mut request = config.make_request(WARMUP_TEXT);
+    request.max_audio_frames = request
+        .max_audio_frames
+        .min(WARMUP_MAX_AUDIO_FRAMES)
+        .max(1);
+
+    let start = Instant::now();
+    let mut first_chunk_latency: Option<Duration> = None;
+    let mut sink = MutedPlaybackSink::new(SAMPLE_RATE_HZ, playback.sample_rate_hz);
+    let mut stream_sink = |pcm_f32: &[f32]| -> Result<(), Qwen3TtsError> {
+        if !pcm_f32.is_empty() && first_chunk_latency.is_none() {
+            first_chunk_latency = Some(start.elapsed());
+        }
+        sink.push_chunk(pcm_f32);
+        Ok(())
+    };
+
+    let result: StreamingSynthesizeResult = match conditioning {
+        Conditioning::None => engine.synthesize_streaming(&request, &mut stream_sink)?,
+        Conditioning::SpeakerEmbedding(embedding) => engine
+            .synthesize_with_speaker_embedding_streaming(&request, embedding, &mut stream_sink)?,
+        Conditioning::VoiceClonePrompt(prompt) => engine
+            .synthesize_with_voice_clone_prompt_streaming(&request, prompt, &mut stream_sink)?,
+    };
+    sink.finish();
+    let synthesis_elapsed = start.elapsed();
+
+    Ok(PlaybackSummary {
+        first_chunk_latency_ms: first_chunk_latency
+            .unwrap_or(synthesis_elapsed)
+            .as_secs_f64()
+            * 1_000.0,
+        synthesis_ms: synthesis_elapsed.as_secs_f64() * 1_000.0,
+        audio_seconds: result.generated_samples as f64 / result.sample_rate_hz as f64,
+        generated_frames: result.generated_frames,
+    })
+}
+
 fn print_tui_usage() {
     eprintln!(
         "qwen3-tts-cli tui — interactive terminal mode with direct cpal playback\n\n\
-         usage:\n  tui [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N]\n\n\
+         usage:\n  tui [--model-dir DIR] [--reference-wav REF.wav | --speaker-bin speaker.bin | --voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language en|zh|ja | --language-id N] [--vocoder-threads N] [--chunk-size N] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|coreml] [--vocoder-ep-fallback LIST]\n\n\
+         CLI flags override environment variables.\n\
+         Default transformer auto chain: Apple = metal,vulkan,cpu ; others = vulkan,cpu.\n\
+         Default vocoder auto chain: Apple = coreml,cpu ; others = cpu.\n\n\
          The model is loaded once and reused for every input line.\n\
+         Press F2 in the TUI to cycle between English, Chinese, and Japanese.\n\
          --chunk-size controls how many codec frames are vocoded per streamed chunk (default 4).\n\
          Set --chunk-size 0 to disable chunked playback and decode after full synthesis."
     );

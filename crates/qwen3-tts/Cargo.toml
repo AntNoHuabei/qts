@@ -8,13 +8,14 @@ repository.workspace = true
 description = "Qwen3 TTS inference (GGUF + GGML); Rust API for host apps and gdext."
 
 [features]
-default = ["metal", "blas", "vulkan"]
+default = ["metal", "blas", "vulkan", "coreml"]
 # Optional Hugging Face cache download helpers (URLs in docs/models.md).
 hf = ["dep:hf-hub"]
 metal = ["ggml/metal"]
 vulkan = ["ggml/vulkan"]
 blas = ["ggml/blas"]
 native = ["ggml/native"]
+coreml = ["ort/coreml"]
 
 [dependencies]
 ggml.workspace = true
@@ -24,6 +25,7 @@ rand.workspace = true
 hound = "3.5.1"
 rustfft = "6.4.1"
 prost = "0.13"
+ort = "2.0.0-rc.9"
 
 [dev-dependencies]
 criterion = "0.5.1"

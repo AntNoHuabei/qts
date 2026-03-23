@@ -17,6 +17,9 @@ pub enum Qwen3TtsError {
     #[error("file is not a valid GGUF container: {0}")]
     InvalidGguf(PathBuf),
 
+    #[error("file is not a valid ONNX model: {0}")]
+    InvalidOnnx(PathBuf),
+
     #[error("tokenizer error: {0}")]
     Tokenizer(String),
 
@@ -37,6 +40,9 @@ pub enum Qwen3TtsError {
 
     #[error("stage not implemented yet: {0}")]
     NotImplemented(&'static str),
+
+    #[error("onnx runtime error: {0}")]
+    Ort(String),
 
     #[cfg(feature = "hf")]
     #[error("Hugging Face hub error: {0}")]

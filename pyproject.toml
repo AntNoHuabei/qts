@@ -8,11 +8,17 @@ version = "0.1.0"
 description = "Python helper scripts for qwen3-tts-native."
 requires-python = ">=3.12"
 dependencies = [
+    "gguf>=0.18.0",
     "grpcio-tools",
+    "huggingface-hub>=0.36.2",
+    "onnx>=1.20.1",
+    "onnxscript>=0.6.2",
     "protobuf",
     "qwen-tts",
+    "safetensors>=0.7.0",
+    "tqdm>=4.67.3",
 ]
-scripts = { export-voice-clone-prompt = "qwen3_tts_native_scripts.export_voice_clone_prompt:main", export-speaker-bin = "qwen3_tts_native_scripts.export_speaker_bin:main" }
+scripts = { export-voice-clone-prompt = "qwen3_tts_native_scripts.export_voice_clone_prompt:main", export-speaker-bin = "qwen3_tts_native_scripts.export_speaker_bin:main", export-model-artifacts = "qwen3_tts_native_scripts.export_model_artifacts:main" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["qwen3_tts_native_scripts"]

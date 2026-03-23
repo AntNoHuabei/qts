@@ -20,7 +20,7 @@ pub use pipeline::tts_transformer::{
     CodecRollout, CodecRolloutSubTimings, PrefillConditioning, PrefillForwardOutputs,
     PreparedPrefillInputs, SelectedCodecFrame, TtsTransformer, TtsTransformerConfig, VocoderChunk,
 };
-pub use pipeline::vocoder::{Vocoder, VocoderConfig, VocoderGraphTemplate};
+pub use pipeline::vocoder::{Vocoder, VocoderConfig, VocoderExecutionProvider, VocoderGraphTemplate};
 pub use pipeline::backend::BackendKind;
 pub use synthesis_profile::SynthesisStageTimings;
 pub use voice_clone_prompt::{
@@ -120,10 +120,9 @@ impl Qwen3TtsEngine {
     pub fn load(paths: ModelPaths) -> Result<Self, Qwen3TtsError> {
         load_and_validate(&paths)?;
         let main = GgufFile::open(&paths.main_gguf)?;
-        let vocoder_gguf = GgufFile::open(&paths.vocoder_gguf)?;
         let tokenizer = TextTokenizer::load_from_gguf(&main)?;
         let transformer = TtsTransformer::load_from_gguf(&main)?;
-        let vocoder = Vocoder::load_from_gguf(&vocoder_gguf)?;
+        let vocoder = Vocoder::load_from_onnx(&paths.vocoder_onnx)?;
         let speaker_encoder = SpeakerEncoder::new(transformer.config().hidden_size as usize)?;
 
         Ok(Self {
@@ -156,6 +155,16 @@ impl Qwen3TtsEngine {
     #[must_use]
     pub fn vocoder(&self) -> &Vocoder {
         &self.vocoder
+    }
+
+    #[must_use]
+    pub fn vocoder_execution_provider(&self) -> VocoderExecutionProvider {
+        self.vocoder.execution_provider()
+    }
+
+    #[must_use]
+    pub fn vocoder_backend_label(&self) -> &'static str {
+        self.vocoder.execution_provider_label()
     }
 
     #[must_use]
