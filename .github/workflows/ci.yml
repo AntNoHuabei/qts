@@ -28,6 +28,30 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libjack-jackd2-dev \
+            libjack-jackd2-0 \
+            libpipewire-0.3-dev \
+            pkg-config \
+            libvulkan-dev \
+            glslc libshaderc-dev \
+            libopenblas-dev
+
+      - name: Install macOS build prerequisites
+        if: runner.os == 'macOS'
+        run: brew install shaderc molten-vk vulkan-tools
+
+      - name: Install Windows Vulkan SDK
+        if: runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: latest
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
