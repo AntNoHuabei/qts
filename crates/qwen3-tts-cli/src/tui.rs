@@ -25,7 +25,9 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 
-use crate::{default_model_dir, load_engine, parse_value_arg, value_arg, RuntimeBackendOverrides};
+use crate::cli_support::{
+    default_model_dir, load_engine, parse_value_arg, value_arg, RuntimeBackendOverrides,
+};
 
 const MAX_LOG_LINES: usize = 12;
 const WARMUP_TEXT: &str = "TTS warmup.";

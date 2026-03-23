@@ -44,7 +44,4 @@ pub enum Qwen3TtsError {
     #[error("onnx runtime error: {0}")]
     Ort(String),
 
-    #[cfg(feature = "hf")]
-    #[error("Hugging Face hub error: {0}")]
-    Hf(#[from] hf_hub::api::sync::ApiError),
 }

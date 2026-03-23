@@ -4,77 +4,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
-use qwen3_tts::{Qwen3TtsEngine, SynthesisStageTimings, SynthesizeRequest};
+use qwen3_tts::{Qwen3TtsEngine, SynthesisStageTimings, VoiceClonePromptV2};
 
+mod cli_support;
 mod tui;
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct RuntimeBackendOverrides {
-    ggml_backend: Option<String>,
-    ggml_backend_fallback: Option<String>,
-    vocoder_ep: Option<String>,
-    vocoder_ep_fallback: Option<String>,
-}
-
-impl RuntimeBackendOverrides {
-    pub(crate) fn parse_flag(
-        &mut self,
-        args: &[String],
-        idx: &mut usize,
-    ) -> Result<bool> {
-        match args[*idx].as_str() {
-            "--backend" => {
-                self.ggml_backend = Some(value_arg(args, idx, "--backend")?);
-                Ok(true)
-            }
-            "--backend-fallback" => {
-                self.ggml_backend_fallback = Some(value_arg(args, idx, "--backend-fallback")?);
-                Ok(true)
-            }
-            "--vocoder-ep" => {
-                self.vocoder_ep = Some(value_arg(args, idx, "--vocoder-ep")?);
-                Ok(true)
-            }
-            "--vocoder-ep-fallback" => {
-                self.vocoder_ep_fallback = Some(value_arg(args, idx, "--vocoder-ep-fallback")?);
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    pub(crate) fn apply_env_overrides(&self) {
-        if let Some(value) = &self.ggml_backend {
-            unsafe { env::set_var("QWEN3_TTS_BACKEND", value) };
-        }
-        if let Some(value) = &self.ggml_backend_fallback {
-            unsafe { env::set_var("QWEN3_TTS_BACKEND_FALLBACK", value) };
-        }
-        if let Some(value) = &self.vocoder_ep {
-            unsafe { env::set_var("QWEN3_TTS_VOCODER_EP", value) };
-        }
-        if let Some(value) = &self.vocoder_ep_fallback {
-            unsafe { env::set_var("QWEN3_TTS_VOCODER_EP_FALLBACK", value) };
-        }
-    }
-
-    pub(crate) fn describe(&self) -> Option<String> {
-        let mut parts = Vec::new();
-        if let Some(value) = &self.ggml_backend {
-            parts.push(format!("backend={value}"));
-        }
-        if let Some(value) = &self.ggml_backend_fallback {
-            parts.push(format!("backend_fallback={value}"));
-        }
-        if let Some(value) = &self.vocoder_ep {
-            parts.push(format!("vocoder_ep={value}"));
-        }
-        if let Some(value) = &self.vocoder_ep_fallback {
-            parts.push(format!("vocoder_ep_fallback={value}"));
-        }
-        (!parts.is_empty()).then(|| parts.join(" "))
-    }
-}
+use crate::cli_support::{
+    default_model_dir, load_engine, parse_value_arg, value_arg, CommonSynthesisArgs,
+    RuntimeBackendOverrides,
+};
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
@@ -143,130 +81,27 @@ fn run_speaker_bin(args: Vec<String>) -> Result<()> {
 }
 
 fn run_synthesize(args: Vec<String>) -> Result<()> {
-    let mut model_dir = default_model_dir()?;
-    let mut text = None;
-    let mut out_path = None;
-    let mut reference_wav = None;
-    let mut speaker_bin = None;
-    let mut voice_clone_prompt = None;
-    let mut thread_count = 4usize;
-    let mut max_audio_frames = None;
-    let mut temperature = 0.9f32;
-    let mut top_k = 50i32;
-    let mut top_p = 1.0f32;
-    let mut repetition_penalty = 1.05f32;
-    let mut language_id = 2050i32;
-    let mut vocoder_thread_count = 4usize;
-    let mut vocoder_chunk_size = 0usize;
-    let mut runtime_backends = RuntimeBackendOverrides::default();
+    let mut common = CommonSynthesisArgs::new()?;
 
     let mut idx = 0;
     while idx < args.len() {
-        if runtime_backends.parse_flag(&args, &mut idx)? {
+        if common.parse_flag(&args, &mut idx)? {
             continue;
         }
-        match args[idx].as_str() {
-            "--model-dir" => {
-                model_dir = PathBuf::from(value_arg(&args, &mut idx, "--model-dir")?);
-            }
-            "--text" => {
-                text = Some(value_arg(&args, &mut idx, "--text")?);
-            }
-            "--out" => {
-                out_path = Some(PathBuf::from(value_arg(&args, &mut idx, "--out")?));
-            }
-            "--reference-wav" => {
-                reference_wav = Some(PathBuf::from(value_arg(
-                    &args,
-                    &mut idx,
-                    "--reference-wav",
-                )?));
-            }
-            "--speaker-bin" => {
-                speaker_bin = Some(PathBuf::from(value_arg(&args, &mut idx, "--speaker-bin")?));
-            }
-            "--voice-clone-prompt" => {
-                voice_clone_prompt = Some(PathBuf::from(value_arg(
-                    &args,
-                    &mut idx,
-                    "--voice-clone-prompt",
-                )?));
-            }
-            "--threads" => {
-                thread_count = parse_value_arg(&args, &mut idx, "--threads")?;
-            }
-            "--frames" => {
-                max_audio_frames = Some(parse_value_arg(&args, &mut idx, "--frames")?);
-            }
-            "--temperature" => {
-                temperature = parse_value_arg(&args, &mut idx, "--temperature")?;
-            }
-            "--top-k" => {
-                top_k = parse_value_arg(&args, &mut idx, "--top-k")?;
-            }
-            "--top-p" => {
-                top_p = parse_value_arg(&args, &mut idx, "--top-p")?;
-            }
-            "--repetition-penalty" => {
-                repetition_penalty = parse_value_arg(&args, &mut idx, "--repetition-penalty")?;
-            }
-            "--language-id" => {
-                language_id = parse_value_arg(&args, &mut idx, "--language-id")?;
-            }
-            "--vocoder-threads" => {
-                vocoder_thread_count = parse_value_arg(&args, &mut idx, "--vocoder-threads")?;
-            }
-            "--chunk-size" => {
-                vocoder_chunk_size = parse_value_arg(&args, &mut idx, "--chunk-size")?;
-            }
-            other => bail!("unknown synthesize argument: {other}"),
-        }
+        bail!("unknown synthesize argument: {}", args[idx]);
     }
 
-    let prompt_inputs = usize::from(reference_wav.is_some())
-        + usize::from(speaker_bin.is_some())
-        + usize::from(voice_clone_prompt.is_some());
-    if prompt_inputs > 1 {
-        bail!("--reference-wav, --speaker-bin, and --voice-clone-prompt are mutually exclusive");
-    }
+    common.validate_conditioning()?;
+    let text = common.require_text()?;
+    let out_path = common.require_out_path()?;
+    let engine = load_engine(&common.model_dir, &common.runtime_backends)?;
+    let request = common.build_request(text)?;
+    let conditioning = load_synthesis_conditioning(&engine, &common)?;
 
-    let text = text.context("--text is required")?;
-    let out_path = out_path.context("--out is required")?;
-    let engine = load_engine(&model_dir, &runtime_backends)?;
-    let max_audio_frames = match max_audio_frames {
-        Some(value) => value,
-        None => 256,
-    };
-
-    let request = SynthesizeRequest {
-        text,
-        reference_wav_bytes: match reference_wav.as_ref() {
-            Some(path) => {
-                Some(fs::read(path).with_context(|| format!("failed to read {}", path.display()))?)
-            }
-            None => None,
-        },
-        temperature,
-        top_p,
-        top_k,
-        max_audio_frames,
-        thread_count,
-        repetition_penalty,
-        language_id,
-        vocoder_thread_count,
-        vocoder_chunk_size,
-    };
-
-    let result = if let Some(path) = voice_clone_prompt {
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let prompt = engine.decode_voice_clone_prompt(&bytes)?;
-        engine.synthesize_with_voice_clone_prompt(&request, &prompt)?
-    } else if let Some(path) = speaker_bin {
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let embedding = engine.decode_speaker_embedding_bin(&bytes)?;
-        engine.synthesize_with_speaker_embedding(&request, &embedding)?
+    let result = if let LoadedConditioning::VoiceClonePrompt(prompt) = &conditioning {
+        engine.synthesize_with_voice_clone_prompt(&request, prompt)?
+    } else if let LoadedConditioning::SpeakerEmbedding(embedding) = &conditioning {
+        engine.synthesize_with_speaker_embedding(&request, embedding)?
     } else {
         engine.synthesize(&request)?
     };
@@ -300,153 +135,44 @@ fn run_profile(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let mut model_dir = default_model_dir()?;
-    let mut text = None;
-    let mut out_path = None;
-    let mut reference_wav = None;
-    let mut speaker_bin = None;
-    let mut voice_clone_prompt = None;
-    let mut thread_count = 4usize;
-    let mut max_audio_frames = None;
-    let mut temperature = 0.9f32;
-    let mut top_k = 50i32;
-    let mut top_p = 1.0f32;
-    let mut repetition_penalty = 1.05f32;
-    let mut language_id = 2050i32;
+    let mut common = CommonSynthesisArgs::new()?;
     let mut runs = 1usize;
-    let mut vocoder_thread_count = 4usize;
-    let mut vocoder_chunk_size = 0usize;
-    let mut runtime_backends = RuntimeBackendOverrides::default();
 
     let mut idx = 0;
     while idx < args.len() {
-        if runtime_backends.parse_flag(&args, &mut idx)? {
+        if common.parse_flag(&args, &mut idx)? {
             continue;
         }
         match args[idx].as_str() {
-            "--model-dir" => {
-                model_dir = PathBuf::from(value_arg(&args, &mut idx, "--model-dir")?);
-            }
-            "--text" => {
-                text = Some(value_arg(&args, &mut idx, "--text")?);
-            }
-            "--out" => {
-                out_path = Some(PathBuf::from(value_arg(&args, &mut idx, "--out")?));
-            }
-            "--reference-wav" => {
-                reference_wav = Some(PathBuf::from(value_arg(
-                    &args,
-                    &mut idx,
-                    "--reference-wav",
-                )?));
-            }
-            "--speaker-bin" => {
-                speaker_bin = Some(PathBuf::from(value_arg(&args, &mut idx, "--speaker-bin")?));
-            }
-            "--voice-clone-prompt" => {
-                voice_clone_prompt = Some(PathBuf::from(value_arg(
-                    &args,
-                    &mut idx,
-                    "--voice-clone-prompt",
-                )?));
-            }
-            "--threads" => {
-                thread_count = parse_value_arg(&args, &mut idx, "--threads")?;
-            }
-            "--frames" => {
-                max_audio_frames = Some(parse_value_arg(&args, &mut idx, "--frames")?);
-            }
-            "--temperature" => {
-                temperature = parse_value_arg(&args, &mut idx, "--temperature")?;
-            }
-            "--top-k" => {
-                top_k = parse_value_arg(&args, &mut idx, "--top-k")?;
-            }
-            "--top-p" => {
-                top_p = parse_value_arg(&args, &mut idx, "--top-p")?;
-            }
-            "--repetition-penalty" => {
-                repetition_penalty = parse_value_arg(&args, &mut idx, "--repetition-penalty")?;
-            }
-            "--language-id" => {
-                language_id = parse_value_arg(&args, &mut idx, "--language-id")?;
-            }
             "--runs" => {
                 runs = parse_value_arg(&args, &mut idx, "--runs")?;
             }
-            "--vocoder-threads" => {
-                vocoder_thread_count = parse_value_arg(&args, &mut idx, "--vocoder-threads")?;
-            }
-            "--chunk-size" => {
-                vocoder_chunk_size = parse_value_arg(&args, &mut idx, "--chunk-size")?;
-            }
             other => bail!("unknown profile argument: {other}"),
         }
-    }
-
-    let prompt_inputs = usize::from(reference_wav.is_some())
-        + usize::from(speaker_bin.is_some())
-        + usize::from(voice_clone_prompt.is_some());
-    if prompt_inputs > 1 {
-        bail!("--reference-wav, --speaker-bin, and --voice-clone-prompt are mutually exclusive");
     }
 
     if runs == 0 {
         bail!("--runs must be >= 1");
     }
 
-    let text = text.context("--text is required")?;
-    let engine = load_engine(&model_dir, &runtime_backends)?;
-    let max_audio_frames = match max_audio_frames {
-        Some(value) => value,
-        None => 256,
-    };
-
-    let request = SynthesizeRequest {
-        text,
-        reference_wav_bytes: match reference_wav.as_ref() {
-            Some(path) => {
-                Some(fs::read(path).with_context(|| format!("failed to read {}", path.display()))?)
-            }
-            None => None,
-        },
-        temperature,
-        top_p,
-        top_k,
-        max_audio_frames,
-        thread_count,
-        repetition_penalty,
-        language_id,
-        vocoder_thread_count,
-        vocoder_chunk_size,
-    };
-
-    let voice_prompt = if let Some(path) = &voice_clone_prompt {
-        let bytes =
-            fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        Some(engine.decode_voice_clone_prompt(&bytes)?)
-    } else {
-        None
-    };
-
-    let speaker_embedding = if let Some(path) = &speaker_bin {
-        let bytes =
-            fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        Some(engine.decode_speaker_embedding_bin(&bytes)?)
-    } else {
-        None
-    };
+    common.validate_conditioning()?;
+    let text = common.require_text()?;
+    let engine = load_engine(&common.model_dir, &common.runtime_backends)?;
+    let request = common.build_request(text)?;
+    let conditioning = load_synthesis_conditioning(&engine, &common)?;
 
     let mut samples = Vec::with_capacity(runs);
     let mut first_result = None;
 
     for run_idx in 0..runs {
-        let (result, timings) = if let Some(prompt) = voice_prompt.as_ref() {
-            engine.synthesize_with_voice_clone_prompt_profile(&request, prompt)?
-        } else if let Some(embedding) = speaker_embedding.as_ref() {
-            engine.synthesize_with_speaker_embedding_profile(&request, embedding)?
-        } else {
-            engine.synthesize_with_profile(&request)?
+        let (result, timings) = match &conditioning {
+            LoadedConditioning::VoiceClonePrompt(prompt) => {
+                engine.synthesize_with_voice_clone_prompt_profile(&request, prompt)?
+            }
+            LoadedConditioning::SpeakerEmbedding(embedding) => {
+                engine.synthesize_with_speaker_embedding_profile(&request, embedding)?
+            }
+            LoadedConditioning::None => engine.synthesize_with_profile(&request)?,
         };
         if run_idx == 0 {
             first_result = Some(result);
@@ -454,7 +180,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
         samples.push(timings);
     }
 
-    if let Some(path) = out_path {
+    if let Some(path) = common.out_path {
         let result = first_result.context("internal: missing first synthesis result")?;
         write_wav_f32(&path, result.sample_rate_hz, &result.pcm_f32)?;
         eprintln!(
@@ -479,12 +205,28 @@ fn run_profile(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn load_engine(model_dir: &Path, runtime_backends: &RuntimeBackendOverrides) -> Result<Qwen3TtsEngine> {
-    runtime_backends.apply_env_overrides();
-    Qwen3TtsEngine::from_model_dir(model_dir)
-        .with_context(|| format!("failed to load model dir {}", model_dir.display()))
+enum LoadedConditioning {
+    None,
+    SpeakerEmbedding(Vec<f32>),
+    VoiceClonePrompt(VoiceClonePromptV2),
 }
 
+fn load_synthesis_conditioning(
+    engine: &Qwen3TtsEngine,
+    args: &CommonSynthesisArgs,
+) -> Result<LoadedConditioning> {
+    if let Some(path) = &args.voice_clone_prompt {
+        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        let prompt = engine.decode_voice_clone_prompt(&bytes)?;
+        return Ok(LoadedConditioning::VoiceClonePrompt(prompt));
+    }
+    if let Some(path) = &args.speaker_bin {
+        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        let embedding = engine.decode_speaker_embedding_bin(&bytes)?;
+        return Ok(LoadedConditioning::SpeakerEmbedding(embedding));
+    }
+    Ok(LoadedConditioning::None)
+}
 
 fn write_wav_f32(path: &Path, sample_rate_hz: u32, pcm_f32: &[f32]) -> Result<()> {
     let spec = WavSpec {
@@ -505,36 +247,6 @@ fn write_wav_f32(path: &Path, sample_rate_hz: u32, pcm_f32: &[f32]) -> Result<()
         .finalize()
         .with_context(|| format!("failed to finalize {}", path.display()))?;
     Ok(())
-}
-
-fn default_model_dir() -> Result<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .context("qwen3-tts-cli manifest has no workspace parent")?;
-    Ok(workspace_root.join("models/volko76-q4k-q8"))
-}
-
-fn value_arg(args: &[String], idx: &mut usize, flag: &str) -> Result<String> {
-    *idx += 1;
-    let value = args
-        .get(*idx)
-        .with_context(|| format!("missing value for {flag}"))?
-        .clone();
-    *idx += 1;
-    Ok(value)
-}
-
-fn parse_value_arg<T>(args: &[String], idx: &mut usize, flag: &str) -> Result<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    let value = value_arg(args, idx, flag)?;
-    value
-        .parse::<T>()
-        .map_err(|err| anyhow::anyhow!("invalid value for {flag}: {err}"))
 }
 
 fn print_usage() {

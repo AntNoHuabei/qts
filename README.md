@@ -2,6 +2,13 @@
 
 Rust workspace for on-device **Qwen3 TTS** using [ggml-org/ggml](https://github.com/ggml-org/ggml) for the main transformer and **ONNX Runtime** for the exported vocoder. The project references [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp) for architecture and tensor naming, but does **not** link against it.
 
+## Repository Layout
+
+- `crates/`: Rust crates for GGML bindings, the TTS engine, and the CLI/TUI.
+- `scripts/`: canonical Python helper entrypoints for model export and prompt tooling.
+- `docs/`: model, testing, and release-oriented documentation.
+- `testdata/`: small checked-in fixtures only; large local models and scratch audio stay outside the repo root.
+
 ## Crates
 
 | Crate | Role |
@@ -30,19 +37,13 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Python helper scripts under `scripts/` are managed with `uv` from the workspace root:
+Python helper scripts are managed with `uv` from the workspace root. Public entrypoints and shared Python support code now live under `scripts/`:
 
 ```bash
 uv sync
 uv run export-model-artifacts --help
 uv run export-voice-clone-prompt --help
 uv run export-speaker-bin --help
-```
-
-Optional Hugging Face helpers:
-
-```bash
-cargo build -p qwen3-tts --features hf
 ```
 
 CLI builds the same engine as the library and supports the same backend features:
@@ -99,7 +100,7 @@ uv run export-voice-clone-prompt \
   --out target/hello.voice-clone-prompt.pb
 ```
 
-The legacy script path still works too:
+Compatibility wrapper paths still work too:
 
 ```bash
 uv run python scripts/export_voice_clone_prompt.py --help
@@ -223,6 +224,10 @@ This runs `qwen3-tts-cli profile`, which prints per-stage milliseconds and perce
 GGML picks GPU devices by **registry** name plus index: use **`QWEN3_TTS_GPU_DEVICE`** (default `0`) to choose among multiple Vulkan or Metal adapters (`Vulkan0` / `MTL0`, …).
 
 **Vocoder EP selection:** use `--vocoder-ep` / `--vocoder-ep-fallback` on the CLI, or `QWEN3_TTS_VOCODER_EP` / `QWEN3_TTS_VOCODER_EP_FALLBACK` from the environment. The default `auto` chain is `coreml,cpu` on Apple and `cpu` elsewhere.
+
+## License
+
+This repository is licensed under **Apache License 2.0**. See [`LICENSE`](LICENSE) for the full text and [`NOTICE`](NOTICE) for repository-level attribution notes.
 
 ## Godot / gdext
 

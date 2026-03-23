@@ -9,9 +9,6 @@ pub mod pipeline;
 mod synthesis_profile;
 mod voice_clone_prompt;
 
-#[cfg(feature = "hf")]
-pub mod hf;
-
 pub use error::Qwen3TtsError;
 pub use model::{load_and_validate, GgufFile, ModelPaths};
 pub use pipeline::speaker_encoder::{SpeakerEncoder, SpeakerEncoderConfig};

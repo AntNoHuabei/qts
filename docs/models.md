@@ -34,17 +34,3 @@ Legacy/community GGUF conversions (verify checksums before trusting):
 Official base model (PyTorch / safetensors, for reference — convert elsewhere if needed):
 
 - [Qwen/Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base)
-
-## Optional download in Rust
-
-Enable feature `hf` on `qwen3-tts`, then use `qwen3_tts::hf::download_hf_file` with a repo id and file path (see `hf-hub` cache semantics).
-
-Example (pseudo-repo — replace with the GGUF repo/file you actually use):
-
-```rust
-qwen3_tts::hf::download_hf_file(
-    "namespace/Qwen3-TTS-GGUF",
-    "qwen3-tts-0.6b-f16.gguf",
-    std::path::Path::new("models"),
-)?;
-```

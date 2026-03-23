@@ -1,0 +1,10 @@
+qwen-tts-native
+Copyright 2026 yetanotherai
+
+This repository is distributed under the Apache License 2.0.
+
+Repository-level notes:
+
+- The Rust and Python code in this repository is licensed under Apache-2.0 unless a subdirectory or vendored dependency states otherwise.
+- Third-party code, models, and submodules keep their own upstream licenses and notices.
+- The `scripts/` directory is the sole Python entrypoint and shared support surface for this repository.

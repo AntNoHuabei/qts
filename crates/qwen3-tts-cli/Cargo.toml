@@ -9,7 +9,6 @@ description = "Command-line tools for Qwen3 TTS synthesis and WAV output."
 
 [features]
 default = ["metal", "blas", "vulkan", "coreml"]
-hf = ["qwen3-tts/hf"]
 metal = ["qwen3-tts/metal"]
 vulkan = ["qwen3-tts/vulkan"]
 blas = ["qwen3-tts/blas"]

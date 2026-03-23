@@ -20,6 +20,9 @@ testdata/**
 
 # GGUF drops outside models/ (e.g. workspace root)
 *.gguf
+/test.wav
+/reference.py
+/voice_clone_prompt_pb2.py
 
 # Criterion / xtask separate target dirs
 target/bench-cpu/
