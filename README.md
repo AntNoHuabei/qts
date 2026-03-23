@@ -76,6 +76,34 @@ Runtime backend preference is automatic:
 
 Documented GGUF links and directory layout: [docs/models.md](docs/models.md).
 
+### Repository Relationship
+
+`qts` uses two repositories with different responsibilities:
+
+- GitHub [`yet-another-ai/qts`](https://github.com/yet-another-ai/qts) is the source-of-truth repository for code, export scripts, tests, and developer documentation.
+- Hugging Face [`dsh0416/Qwen3-TTS-12Hz-0.6B-Base-QTS`](https://huggingface.co/dsh0416/Qwen3-TTS-12Hz-0.6B-Base-QTS) is the distribution repository for built model artifacts.
+
+In practice:
+
+- Make code, export, and format changes in this GitHub repository first.
+- Export stable artifacts from a known Git commit.
+- Upload only the resulting model files to the Hugging Face repository.
+- Keep the Hugging Face model card aligned with this repository's docs, but do not treat it as a second source repository.
+
+The intended artifact layout is one shared `qwen3-tts-vocoder.onnx` plus one or more GGUF variants such as `qwen3-tts-0.6b-f16.gguf` and `qwen3-tts-0.6b-q8_0.gguf` in the same Hugging Face repository root. That layout matches the default `ModelPaths::from_model_dir(...)` resolution used by the Rust runtime.
+
+A copy-ready Hugging Face model card template lives at [`docs/huggingface-model-card.md`](docs/huggingface-model-card.md).
+To prepare a release directory with `README.md`, `SHA256SUMS`, and Hugging Face Xet
+tracking for `*.gguf` / `*.onnx`, run `cargo xtask hf-release --model Qwen/Qwen3-TTS-12Hz-0.6B-Base`. If you already have the Hugging Face repository cloned locally, add `--hf-repo-dir /path/to/cloned-hf-repo` to sync the managed release files into that existing git checkout.
+
+Official Hugging Face publication is handled by GitHub Actions:
+
+- `.github/workflows/hf-release.yml` publishes tagged `v*` releases to `dsh0416/Qwen3-TTS-12Hz-0.6B-Base-QTS`
+- `.github/workflows/model-integration.yml` provides a manual release-preview run that exports and uploads the staged bundle without pushing
+- repository secret `HF_TOKEN` must be configured with write access to the Hugging Face model repository
+
+The local `cargo xtask hf-release ...` flow remains useful for previewing the exact files that the tagged release workflow will publish.
+
 ## Reference Audio
 
 `SynthesizeRequest.reference_wav_bytes` now drives a built-in speaker-conditioning path for tone transfer.
