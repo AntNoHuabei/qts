@@ -70,6 +70,11 @@ jobs:
           rm -rf "$HF_REPO_DIR"
           git clone "https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/${HF_REPO_ID}" "$HF_REPO_DIR"
 
+      - name: Remove existing model files to avoid disk issues
+        working-directory: ${{ env.HF_REPO_DIR }}
+        run: |
+          rm -f qwen3-tts-0.6b-f16.gguf qwen3-tts-0.6b-q8_0.gguf qwen3-tts-vocoder.onnx
+
       - name: Build and sync release files
         run: |
           cargo xtask hf-release \
