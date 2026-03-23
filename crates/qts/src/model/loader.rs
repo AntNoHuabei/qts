@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
-use ggml::sys;
+use qts_ggml::sys;
 
 use super::paths::ModelPaths;
 use crate::Qwen3TtsError;

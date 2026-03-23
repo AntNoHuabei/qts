@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use qwen3_tts::{Qwen3TtsEngine, SynthesizeRequest};
+use qts::{Qwen3TtsEngine, SynthesizeRequest};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);

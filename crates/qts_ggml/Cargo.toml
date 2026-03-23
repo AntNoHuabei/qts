@@ -1,0 +1,17 @@
+[package]
+name = "qts_ggml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin safe wrappers over qts_ggml_sys for qts."
+
+[features]
+default = ["metal", "vulkan"]
+metal = ["qts_ggml_sys/metal"]
+vulkan = ["qts_ggml_sys/vulkan"]
+blas = ["qts_ggml_sys/blas"]
+native = ["qts_ggml_sys/native"]
+
+[dependencies]
+qts_ggml_sys.workspace = true

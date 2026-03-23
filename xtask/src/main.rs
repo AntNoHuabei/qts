@@ -1,7 +1,9 @@
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use sha2::{Digest, Sha256};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
@@ -511,19 +513,25 @@ fn quantization_name(path: &Path) -> Option<String> {
 }
 
 fn sha256_hex(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("shasum")
-        .args(["-a", "256"])
-        .arg(path)
-        .output()?;
-    if !output.status.success() {
-        return Err(format!("failed to compute sha256 for {}", path.display()).into());
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
     }
-    let stdout = String::from_utf8(output.stdout)?;
-    let digest = stdout
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| format!("unexpected shasum output for {}", path.display()))?;
-    Ok(digest.to_owned())
+
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}")?;
+    }
+    Ok(hex)
 }
 
 fn render_sha256sums(checksums: &[(String, String)]) -> String {

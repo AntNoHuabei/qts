@@ -1,21 +1,22 @@
 [package]
-name = "qwen3-tts"
+name = "qts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Qwen3 TTS inference (GGUF + GGML); Rust API for host apps and gdext."
+publish = true
 
 [features]
 default = ["metal", "vulkan", "coreml"]
-metal = ["ggml/metal"]
-vulkan = ["ggml/vulkan"]
-blas = ["ggml/blas"]
-native = ["ggml/native"]
+metal = ["qts_ggml/metal"]
+vulkan = ["qts_ggml/vulkan"]
+blas = ["qts_ggml/blas"]
+native = ["qts_ggml/native"]
 coreml = ["ort/coreml"]
 
 [dependencies]
-ggml.workspace = true
+qts_ggml.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 hound.workspace = true

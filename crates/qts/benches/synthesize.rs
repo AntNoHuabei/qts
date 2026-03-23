@@ -3,7 +3,7 @@ use std::hint::black_box;
 use std::path::PathBuf;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use qwen3_tts::{Qwen3TtsEngine, SynthesizeRequest};
+use qts::{Qwen3TtsEngine, SynthesizeRequest};
 
 struct BenchConfig {
     backend_label: String,

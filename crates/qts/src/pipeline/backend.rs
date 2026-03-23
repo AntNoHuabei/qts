@@ -4,7 +4,7 @@ use std::ffi::CStr;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ggml::sys;
+use qts_ggml::sys;
 
 use crate::Qwen3TtsError;
 
@@ -61,7 +61,7 @@ impl BackendPreference {
     }
 }
 
-fn parse_qwen3_tts_backend() -> Result<BackendChoice, Qwen3TtsError> {
+fn parse_qts_backend() -> Result<BackendChoice, Qwen3TtsError> {
     let var = match std::env::var("QWEN3_TTS_BACKEND") {
         Ok(s) if !s.trim().is_empty() => s,
         _ => return Ok(BackendChoice::Auto),
@@ -169,7 +169,7 @@ impl BackendSet {
             sys::ggml_cpu_init();
         }
 
-        match parse_qwen3_tts_backend()? {
+        match parse_qts_backend()? {
             BackendChoice::Auto => Self::auto_select_backend(&parse_auto_backend_order()?),
             BackendChoice::Explicit(choice) => Self::require_backend(choice),
         }

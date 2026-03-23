@@ -2,20 +2,30 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
-use qwen3_tts::{PrefillConditioning, Qwen3TtsEngine, SynthesizeRequest};
+use qts::{PrefillConditioning, Qwen3TtsEngine, SynthesizeRequest};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let model_dir = PathBuf::from(args.next().ok_or("missing model dir")?);
     let text = args.next().ok_or("missing text")?;
     let output = PathBuf::from(args.next().ok_or("missing output path")?);
+    let temperature = args
+        .next()
+        .map(|value| value.parse::<f32>())
+        .transpose()?
+        .unwrap_or(0.9);
+    let top_k = args
+        .next()
+        .map(|value| value.parse::<i32>())
+        .transpose()?
+        .unwrap_or(50);
 
     let engine = Qwen3TtsEngine::from_model_dir(model_dir)?;
     let req = SynthesizeRequest {
         text,
-        max_audio_frames: 1,
-        temperature: 0.0,
-        top_k: 0,
+        max_audio_frames: 16,
+        temperature,
+        top_k,
         ..Default::default()
     };
 
@@ -43,17 +53,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         req.top_p,
     )?;
 
-    let frame = rollout.frames.first().ok_or("no frames generated")?;
     let mut writer = BufWriter::new(File::create(&output)?);
-    for value in &frame.hidden_state {
-        writer.write_all(&value.to_le_bytes())?;
+    for frame in &rollout.frames {
+        for &token in &frame.codebook_tokens {
+            writer.write_all(&(token as i64).to_le_bytes())?;
+        }
     }
     writer.flush()?;
     println!(
-        "cb0={} hidden_len={}",
-        frame.codebook_0_token,
-        frame.hidden_state.len()
+        "wrote {} frames / {} codes to {}",
+        rollout.frames.len(),
+        rollout
+            .frames
+            .iter()
+            .map(|f| f.codebook_tokens.len())
+            .sum::<usize>(),
+        output.display()
     );
-    println!("codes={:?}", frame.codebook_tokens);
     Ok(())
 }

@@ -4,7 +4,7 @@ use std::cmp::max;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
-use ggml::sys;
+use qts_ggml::sys;
 use rand::RngExt;
 
 use super::backend::{

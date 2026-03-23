@@ -833,21 +833,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ggml"
-version = "0.1.0"
-dependencies = [
- "ggml-sys",
-]
-
-[[package]]
-name = "ggml-sys"
-version = "0.1.0"
-dependencies = [
- "bindgen",
- "cmake",
-]
-
-[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1924,32 +1909,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 
 [[package]]
-name = "quote"
-version = "1.0.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
-dependencies = [
- "proc-macro2",
-]
-
-[[package]]
-name = "qwen3-tts"
+name = "qts"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "ggml",
  "hound",
  "ort",
  "prost 0.14.3",
  "prost-build",
  "protoc-bin-vendored",
+ "qts_ggml",
  "rand 0.10.0",
  "rustfft",
  "thiserror 2.0.18",
 ]
 
 [[package]]
-name = "qwen3-tts-cli"
+name = "qts_cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1957,9 +1933,33 @@ dependencies = [
  "crossterm",
  "hound",
  "libc",
- "qwen3-tts",
+ "qts",
  "ratatui",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "qts_ggml"
+version = "0.1.0"
+dependencies = [
+ "qts_ggml_sys",
+]
+
+[[package]]
+name = "qts_ggml_sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cmake",
+]
+
+[[package]]
+name = "quote"
+version = "1.0.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
+dependencies = [
+ "proc-macro2",
 ]
 
 [[package]]
@@ -3314,6 +3314,9 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "zerocopy"

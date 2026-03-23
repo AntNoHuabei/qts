@@ -13,14 +13,14 @@ Rust workspace for on-device **Qwen3 TTS** using [ggml-org/ggml](https://github.
 
 | Crate | Role |
 |-------|------|
-| `ggml-sys` | CMake + bindgen FFI to `vendor/ggml` ([ggml](https://github.com/ggml-org/ggml) Git submodule) |
-| `ggml` | Thin wrappers + `sys` re-export |
-| `qwen3-tts` | Pure Rust `rlib` for GGUF loading, speaker encoding, and synthesis |
-| `qwen3-tts-cli` | Command-line interface for synthesis, profiling, and interactive TUI playback |
+| `qts_ggml_sys` | CMake + bindgen FFI to `vendor/ggml` ([ggml](https://github.com/ggml-org/ggml) Git submodule) |
+| `qts_ggml` | Thin wrappers + `sys` re-export |
+| `qts` | Pure Rust `rlib` for GGUF loading, speaker encoding, and synthesis |
+| `qts_cli` | Command-line interface for synthesis, profiling, and interactive TUI playback |
 
 ## Prerequisites
 
-- **CMake** on the PATH (for `ggml-sys` building the `vendor/ggml` submodule).
+- **CMake** on the PATH (for `qts_ggml_sys` building the `vendor/ggml` submodule).
 
 ## Build
 
@@ -48,21 +48,21 @@ uv run export-voice-clone-prompt --help
 CLI builds the same engine as the library and supports the same backend features:
 
 ```bash
-cargo build -p qwen3-tts-cli
-cargo build -p qwen3-tts-cli --features metal
-cargo build -p qwen3-tts-cli --features vulkan
+cargo build -p qts_cli
+cargo build -p qts_cli --features metal
+cargo build -p qts_cli --features vulkan
 ```
 
-GPU / accelerator backends are Cargo features on `ggml-sys` (see [VERSIONS.md](VERSIONS.md)).
+GPU / accelerator backends are Cargo features on `qts_ggml_sys` (see [VERSIONS.md](VERSIONS.md)).
 
 Common backend builds:
 
 ```bash
 # Apple GPU path
-cargo build -p qwen3-tts --features metal
+cargo build -p qts --features metal
 
 # Cross-platform GPU path (requires Vulkan SDK / loader + glslc)
-cargo build -p qwen3-tts --features vulkan
+cargo build -p qts --features vulkan
 ```
 
 Runtime backend preference is automatic:
@@ -80,7 +80,7 @@ Documented GGUF links and directory layout: [docs/models.md](docs/models.md).
 `qts` uses two repositories with different responsibilities:
 
 - GitHub [`yet-another-ai/qts`](https://github.com/yet-another-ai/qts) is the source-of-truth repository for code, export scripts, tests, and developer documentation.
-- Hugging Face [`dsh0416/Qwen3-TTS-12Hz-0.6B-Base-QTS`](https://huggingface.co/dsh0416/Qwen3-TTS-12Hz-0.6B-Base-QTS) is the distribution repository for built model artifacts.
+- Hugging Face [`dsh0416/qts-12Hz-0.6B-Base-QTS`](https://huggingface.co/dsh0416/qts-12Hz-0.6B-Base-QTS) is the distribution repository for built model artifacts.
 
 In practice:
 
@@ -89,16 +89,16 @@ In practice:
 - Upload only the resulting model files to the Hugging Face repository.
 - Keep the Hugging Face model card aligned with this repository's docs, but do not treat it as a second source repository.
 
-The intended artifact layout is one shared `qwen3-tts-vocoder.onnx` plus one or more GGUF variants such as `qwen3-tts-0.6b-f16.gguf` and `qwen3-tts-0.6b-q8_0.gguf` in the same Hugging Face repository root. That layout matches the default `ModelPaths::from_model_dir(...)` resolution used by the Rust runtime.
+The intended artifact layout is one shared `qts-vocoder.onnx` plus one or more GGUF variants such as `qts-0.6b-f16.gguf` and `qts-0.6b-q8_0.gguf` in the same Hugging Face repository root. That layout matches the default `ModelPaths::from_model_dir(...)` resolution used by the Rust runtime.
 
 A copy-ready Hugging Face model card template lives at [`docs/huggingface-model-card.md`](docs/huggingface-model-card.md).
 To prepare a release directory with `README.md`, `SHA256SUMS`, and Hugging Face Xet
-tracking for `*.gguf` / `*.onnx`, run `cargo xtask hf-release --model Qwen/Qwen3-TTS-12Hz-0.6B-Base`. If you already have the Hugging Face repository cloned locally, add `--hf-repo-dir /path/to/cloned-hf-repo` to sync the managed release files into that existing git checkout.
+tracking for `*.gguf` / `*.onnx`, run `cargo xtask hf-release --model Qwen/qts-12Hz-0.6B-Base`. If you already have the Hugging Face repository cloned locally, add `--hf-repo-dir /path/to/cloned-hf-repo` to sync the managed release files into that existing git checkout.
 
 Official Hugging Face publication is handled by GitHub Actions:
 
-- `.github/workflows/build.yml` builds accelerated `qwen3-tts-cli` archives for Linux, macOS, and Windows on pull requests and `main` (Vulkan on Linux/Windows; `metal+coreml+blas` on macOS via Accelerate), and uploads tagged `v*` builds to GitHub Releases
-- `.github/workflows/hf-release.yml` publishes tagged `v*` releases to `dsh0416/Qwen3-TTS-12Hz-0.6B-Base-QTS`
+- `.github/workflows/build.yml` builds accelerated `qts_cli` archives for Linux, macOS, and Windows on pull requests and `main` (Vulkan on Linux/Windows; `metal+coreml+blas` on macOS via Accelerate), and uploads tagged `v*` builds to GitHub Releases
+- `.github/workflows/hf-release.yml` publishes tagged `v*` releases to `dsh0416/qts-12Hz-0.6B-Base-QTS`
 - `.github/workflows/model-integration.yml` provides a manual release-preview run that exports and uploads the staged bundle without pushing
 - repository secret `HF_TOKEN` must be configured with write access to the Hugging Face model repository
 
@@ -106,7 +106,7 @@ When `cargo xtask hf-release` receives `--hf-repo-dir` and you do not override `
 
 ## Voice Clone Prompts
 
-For better alignment with upstream `QwenLM/Qwen3-TTS`, the native path consumes protobuf voice-clone prompts rather than direct reference-audio conditioning at synthesis time.
+For better alignment with upstream `QwenLM/qts`, the native path consumes protobuf voice-clone prompts rather than direct reference-audio conditioning at synthesis time.
 
 ### Protobuf prompt export and native consumption
 
@@ -125,7 +125,7 @@ This is the closest replacement for the old `speaker.bin` workflow, but the runt
 uv sync
 
 uv run export-voice-clone-prompt \
-  --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --model Qwen/qts-12Hz-0.6B-Base \
   --ref-audio testdata/hello.wav \
   --x-vector-only-mode \
   --out target/hello.xvector.voice-clone-prompt.pb
@@ -134,8 +134,8 @@ uv run export-voice-clone-prompt \
 Then synthesize with the prompt:
 
 ```bash
-cargo run -p qwen3-tts-cli -- synthesize \
-  --model-dir models/qwen3-tts-bundle \
+cargo run -p qts_cli -- synthesize \
+  --model-dir models/qts-bundle \
   --text "hello" \
   --voice-clone-prompt target/hello.xvector.voice-clone-prompt.pb \
   --out target/hello-from-xvector-prompt.wav
@@ -149,17 +149,17 @@ ICL mode mirrors upstream `create_voice_clone_prompt(...)` behavior: the prompt 
 uv sync
 
 uv run export-voice-clone-prompt \
-  --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --model Qwen/qts-12Hz-0.6B-Base \
   --ref-audio testdata/hello.wav \
   --ref-text "hello" \
   --out target/hello.voice-clone-prompt.pb
 ```
 
-Then consume that prompt from `qwen3-tts-cli`:
+Then consume that prompt from `qts_cli`:
 
 ```bash
-cargo run -p qwen3-tts-cli -- synthesize \
-  --model-dir models/qwen3-tts-bundle \
+cargo run -p qts_cli -- synthesize \
+  --model-dir models/qts-bundle \
   --text "hello" \
   --voice-clone-prompt target/hello.voice-clone-prompt.pb \
   --out target/hello-from-prompt.wav
@@ -183,8 +183,8 @@ uv run python scripts/export_voice_clone_prompt.py --help
 For interactive latency demos, the CLI also has a `tui` mode that loads the model once, lets you type successive utterances, and streams audio directly to the default output device through `cpal`.
 
 ```bash
-cargo run -p qwen3-tts-cli -- tui \
-  --model-dir models/qwen3-tts-bundle \
+cargo run -p qts_cli -- tui \
+  --model-dir models/qts-bundle \
   --voice-clone-prompt target/hello.xvector.voice-clone-prompt.pb \
   --language en \
   --chunk-size 4
@@ -195,7 +195,7 @@ Notes:
 - Press `Enter` to synthesize the current line.
 - Press `F2` to cycle the synthesis language between English, Chinese, and Japanese.
 - Press `Esc`, `Ctrl-C`, or type `:q` to quit.
-- The TUI header shows both the transformer backend (`ggml`) and the active vocoder EP (`ORT/CPU` or `ORT/CoreML`).
+- The TUI header shows both the transformer backend (`qts_ggml`) and the active vocoder EP (`ORT/CPU` or `ORT/CoreML`).
 - `--backend` and `--vocoder-ep` let you choose the transformer backend and vocoder EP directly from the command line.
 - `--backend-fallback` and `--vocoder-ep-fallback` accept comma-separated fallback chains used when the corresponding selector is `auto`.
 - `--language en|zh|ja` is the friendly startup flag; `--language-id` still works if you want to pass a raw codec language id.
@@ -205,8 +205,8 @@ Notes:
 On Apple platforms, the ONNX vocoder can use CoreML:
 
 ```bash
-cargo run -p qwen3-tts-cli -- tui \
-  --model-dir models/qwen3-tts-f16-onnx \
+cargo run -p qts_cli -- tui \
+  --model-dir models/qts-f16-onnx \
   --backend auto \
   --backend-fallback metal,vulkan,cpu \
   --vocoder-ep coreml \
@@ -235,20 +235,20 @@ cargo xtask bench vulkan
 Stage timings (tokenizer, prefill build, codec rollout / transformer, vocoder, etc.) for a real synthesis pass:
 
 ```bash
-cargo xtask profile cpu --model-dir models/qwen3-tts-bundle --text "hello" --frames 64 --runs 3
-cargo xtask profile metal --model-dir models/qwen3-tts-bundle --text "hello" --frames 64
-cargo xtask profile vulkan --model-dir models/qwen3-tts-bundle --text "hello" --frames 64
+cargo xtask profile cpu --model-dir models/qts-bundle --text "hello" --frames 64 --runs 3
+cargo xtask profile metal --model-dir models/qts-bundle --text "hello" --frames 64
+cargo xtask profile vulkan --model-dir models/qts-bundle --text "hello" --frames 64
 ```
 
 `cargo xtask profile` sets **`QWEN3_TTS_BACKEND`** for the child to match the first token (`cpu` / `metal` / `vulkan`), so **Cargo features and the actual GGML primary backend stay aligned** (including Vulkan on macOS when you choose the `vulkan` profile).
 
-For `cargo run -p qwen3-tts-cli` directly, set the backend explicitly, for example:
+For `cargo run -p qts_cli` directly, set the backend explicitly, for example:
 
 ```bash
-QWEN3_TTS_BACKEND=vulkan cargo run -p qwen3-tts-cli --features vulkan -- profile --text "hello" --model-dir models/qwen3-tts-bundle --frames 64
+QWEN3_TTS_BACKEND=vulkan cargo run -p qts_cli --features vulkan -- profile --text "hello" --model-dir models/qts-bundle --frames 64
 ```
 
-This runs `qwen3-tts-cli profile`, which prints per-stage milliseconds and percentage of total wall time. Use `--out run1.wav` to keep audio from the first run while profiling.
+This runs `qts_cli profile`, which prints per-stage milliseconds and percentage of total wall time. Use `--out run1.wav` to keep audio from the first run while profiling.
 
 **Transformer backend selection:** use `--backend` / `--backend-fallback` on the CLI, or `QWEN3_TTS_BACKEND` / `QWEN3_TTS_BACKEND_FALLBACK` if you prefer environment variables. The default `auto` chain is `metal,vulkan,cpu` on Apple and `vulkan,cpu` elsewhere.
 
@@ -262,9 +262,9 @@ This repository is licensed under **Apache License 2.0**. See [`LICENSE`](LICENS
 
 ## Godot / gdext
 
-The `qwen3-tts` crate is a normal Rust library (`rlib`). A future Godot project can depend on it directly from a `gdext` crate without a separate `cdylib` ABI layer.
+The `qts` crate is a normal Rust library (`rlib`). A future Godot project can depend on it directly from a `gdext` crate without a separate `cdylib` ABI layer.
 
 ## Acknowledgments
 
-- [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp) for architecture and tensor naming.
-- [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) for the model architecture and tensor naming.
+- [predict-woo/qts.cpp](https://github.com/predict-woo/qts.cpp) for architecture and tensor naming.
+- [QwenLM/qts](https://github.com/QwenLM/qts) for the model architecture and tensor naming.

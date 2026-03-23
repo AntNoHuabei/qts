@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
-use qwen3_tts::{Qwen3TtsEngine, SynthesisStageTimings, VoiceClonePromptV2};
+use qts::{Qwen3TtsEngine, SynthesisStageTimings, VoiceClonePromptV2};
 
 mod cli_support;
 mod tui;

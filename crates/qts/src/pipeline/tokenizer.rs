@@ -280,7 +280,7 @@ mod tests {
     use super::*;
     use std::ffi::CString;
 
-    use ggml::sys;
+    use qts_ggml::sys;
 
     fn write_minimal_tokenizer_gguf(path: &std::path::Path) {
         let key_tokens = CString::new("tokenizer.ggml.tokens").unwrap();

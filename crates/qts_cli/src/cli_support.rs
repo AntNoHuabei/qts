@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use qwen3_tts::{Qwen3TtsEngine, SynthesizeRequest};
+use qts::{Qwen3TtsEngine, SynthesizeRequest};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeBackendOverrides {

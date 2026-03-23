@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use qwen3_tts::{Qwen3TtsEngine, SynthesizeRequest, VoiceClonePromptV2};
+use qts::{Qwen3TtsEngine, SynthesizeRequest, VoiceClonePromptV2};
 
 fn require_model_dir() -> PathBuf {
     std::env::var("QWEN3_TTS_MODEL_DIR")

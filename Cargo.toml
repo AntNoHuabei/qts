@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ggml-sys",
-    "crates/ggml",
-    "crates/qwen3-tts", "xtask", "crates/qwen3-tts-cli",
+    "crates/qts",
+    "crates/qts_cli",
+    "crates/qts_ggml_sys",
+    "crates/qts_ggml",
+    "xtask",
 ]
 
 [workspace.package]
@@ -13,9 +15,9 @@ license = "Apache-2.0"
 repository = "https://github.com/yet-another-ai/qts"
 
 [workspace.dependencies]
-qwen3-tts = { path = "crates/qwen3-tts" }
-ggml-sys = { path = "crates/ggml-sys" }
-ggml = { path = "crates/ggml" }
+qts = { path = "crates/qts" }
+qts_ggml_sys = { path = "crates/qts_ggml_sys" }
+qts_ggml = { path = "crates/qts_ggml" }
 thiserror = "2"
 rand = "0.10"
 anyhow = "1.0.102"

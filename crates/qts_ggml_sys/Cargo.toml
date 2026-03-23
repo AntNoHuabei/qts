@@ -1,5 +1,5 @@
 [package]
-name = "ggml-sys"
+name = "qts_ggml_sys"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

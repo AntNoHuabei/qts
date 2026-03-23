@@ -18,7 +18,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use qwen3_tts::{
+use qts::{
     Qwen3TtsEngine, Qwen3TtsError, StreamingSynthesizeResult, SynthesizeRequest,
     VoiceClonePromptV2, SAMPLE_RATE_HZ,
 };
