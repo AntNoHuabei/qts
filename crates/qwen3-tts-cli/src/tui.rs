@@ -29,11 +29,13 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE};
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::{DuplicateHandle, GetCurrentProcess};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::cli_support::{
     default_model_dir, load_engine, parse_value_arg, value_arg, RuntimeBackendOverrides,
@@ -956,7 +958,7 @@ impl StderrSilencer {
             return Err(anyhow::anyhow!("failed to fetch stderr handle"));
         }
 
-        let mut saved = std::ptr::null_mut();
+        let mut saved: HANDLE = std::ptr::null_mut();
         let duplicated = unsafe {
             DuplicateHandle(
                 current_process,
