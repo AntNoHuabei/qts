@@ -53,8 +53,11 @@ By default this prepares `target/hf-qts-release/` with:
 - generated `.gitattributes` that routes `*.gguf` and `*.onnx` through Hugging Face Xet
 
 If you already have the Hugging Face repository cloned locally, pass
-`--hf-repo-dir /path/to/cloned-hf-repo` to sync those managed release files
-into that existing git checkout after staging them in `target/hf-qts-release/`.
+`--hf-repo-dir /path/to/cloned-hf-repo`. By default, `xtask` will then reuse
+that repository root as both the export destination and the packaged release
+directory, so the managed files are generated in place instead of being copied
+through an extra staging directory. You can still override `--artifacts-dir` or
+`--out-dir` if you explicitly want a separate staging layout.
 
 For official releases, this repository now treats GitHub Actions as the source
 of truth for publication:

@@ -59,7 +59,7 @@ jobs:
 
       - name: Install macOS build prerequisites
         if: runner.os == 'macOS'
-        run: brew install shaderc vulkan-sdk vulkan-tools
+        run: brew install shaderc molten-vk vulkan-tools
 
       - name: Install Windows Vulkan SDK
         if: runner.os == 'Windows'

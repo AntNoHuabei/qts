@@ -15,7 +15,6 @@ env:
   HF_REPO_ID: dsh0416/Qwen3-TTS-12Hz-0.6B-Base-QTS
   HF_USERNAME: dsh0416
   HF_REPO_DIR: hf-model-repo
-  STAGED_RELEASE_DIR: target/hf-qts-release
 
 permissions:
   contents: read
@@ -75,13 +74,18 @@ jobs:
         run: |
           cargo xtask hf-release \
             --model "$SOURCE_MODEL_ID" \
-            --out-dir "$STAGED_RELEASE_DIR" \
             --hf-repo-dir "$HF_REPO_DIR"
 
       - uses: actions/upload-artifact@v4
         with:
           name: hf-release-${{ github.ref_name }}
-          path: ${{ env.STAGED_RELEASE_DIR }}
+          path: |
+            ${{ env.HF_REPO_DIR }}/.gitattributes
+            ${{ env.HF_REPO_DIR }}/README.md
+            ${{ env.HF_REPO_DIR }}/SHA256SUMS
+            ${{ env.HF_REPO_DIR }}/qwen3-tts-vocoder.onnx
+            ${{ env.HF_REPO_DIR }}/qwen3-tts-0.6b-f16.gguf
+            ${{ env.HF_REPO_DIR }}/qwen3-tts-0.6b-q8_0.gguf
           if-no-files-found: error
 
       - name: Stage managed release files

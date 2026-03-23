@@ -103,7 +103,7 @@ Official Hugging Face publication is handled by GitHub Actions:
 - `.github/workflows/model-integration.yml` provides a manual release-preview run that exports and uploads the staged bundle without pushing
 - repository secret `HF_TOKEN` must be configured with write access to the Hugging Face model repository
 
-The local `cargo xtask hf-release ...` flow remains useful for previewing the exact files that the tagged release workflow will publish.
+When `cargo xtask hf-release` receives `--hf-repo-dir` and you do not override `--artifacts-dir` or `--out-dir`, it now exports and packages directly in that cloned Hugging Face repository root to avoid extra copies. The local flow remains useful for previewing the exact files that the tagged release workflow will publish.
 
 ## Reference Audio
 

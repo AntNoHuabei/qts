@@ -160,6 +160,8 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut local_files_only = false;
     let mut verbose = false;
     let mut skip_export = false;
+    let mut artifacts_dir_explicit = false;
+    let mut out_dir_explicit = false;
 
     let mut idx = 0;
     while idx < args.len() {
@@ -169,9 +171,11 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--artifacts-dir" => {
                 artifacts_dir = PathBuf::from(value_arg(&args, &mut idx, "--artifacts-dir")?);
+                artifacts_dir_explicit = true;
             }
             "--out-dir" => {
                 out_dir = PathBuf::from(value_arg(&args, &mut idx, "--out-dir")?);
+                out_dir_explicit = true;
             }
             "--readme-template" => {
                 readme_template = PathBuf::from(value_arg(&args, &mut idx, "--readme-template")?);
@@ -204,6 +208,17 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         return Err("--model is required unless --skip-export is used".into());
     }
 
+    if let Some(hf_repo_dir) = hf_repo_dir.as_ref() {
+        ensure_git_repo_root(hf_repo_dir)?;
+        if !artifacts_dir_explicit && !out_dir_explicit {
+            artifacts_dir = hf_repo_dir.clone();
+            out_dir = hf_repo_dir.clone();
+        }
+        if !skip_export && same_existing_path(&artifacts_dir, hf_repo_dir)? {
+            remove_managed_release_files(hf_repo_dir)?;
+        }
+    }
+
     if !skip_export {
         run_export_model_artifacts(
             &workspace_root,
@@ -226,16 +241,21 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|path| quantization_name(path))
         .collect::<Vec<_>>();
 
-    if out_dir.exists() {
-        fs::remove_dir_all(&out_dir)?;
-    }
-    fs::create_dir_all(&out_dir)?;
+    let package_in_place = same_existing_path(&artifacts_dir, &out_dir)?;
+    if package_in_place {
+        fs::create_dir_all(&out_dir)?;
+    } else {
+        if out_dir.exists() {
+            fs::remove_dir_all(&out_dir)?;
+        }
+        fs::create_dir_all(&out_dir)?;
 
-    for artifact in &artifacts {
-        let file_name = artifact
-            .file_name()
-            .ok_or("artifact path missing file name")?;
-        fs::copy(artifact, out_dir.join(file_name))?;
+        for artifact in &artifacts {
+            let file_name = artifact
+                .file_name()
+                .ok_or("artifact path missing file name")?;
+            fs::copy(artifact, out_dir.join(file_name))?;
+        }
     }
 
     fs::write(out_dir.join(".gitattributes"), hf_xet_gitattributes())?;
@@ -497,6 +517,13 @@ fn render_hf_model_card(
 
 fn hf_xet_gitattributes() -> &'static str {
     "*.gguf filter=xet diff=xet merge=xet -text\n*.onnx filter=xet diff=xet merge=xet -text\n"
+}
+
+fn same_existing_path(left: &Path, right: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    if !left.exists() || !right.exists() {
+        return Ok(left == right);
+    }
+    Ok(fs::canonicalize(left)? == fs::canonicalize(right)?)
 }
 
 fn sync_release_to_hf_repo(
