@@ -58,7 +58,7 @@ jobs:
             libpipewire-0.3-dev \
             pkg-config \
             libvulkan-dev \
-            libshaderc-dev \
+            glslc libshaderc-dev \
             libopenblas-dev
 
       - name: Install macOS build prerequisites

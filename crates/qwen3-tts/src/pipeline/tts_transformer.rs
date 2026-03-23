@@ -437,7 +437,7 @@ impl TtsTransformer {
             + usize::from(speaker_embd.is_some())
             + 2;
         let mut codec_input_embedding = vec![0.0f32; codec_input_len * hidden_size];
-        codec_input_embedding[..codec_prefill_embed.len()].copy_from_slice(&codec_prefill_embed);
+        codec_input_embedding[..codec_prefill_embed.len()].copy_from_slice(codec_prefill_embed);
         let mut dst_token = codec_prefill_tokens.len();
 
         if !codec_prompt_embed.is_empty() {
@@ -455,7 +455,7 @@ impl TtsTransformer {
         }
 
         codec_input_embedding[dst_token * hidden_size..(dst_token + 2) * hidden_size]
-            .copy_from_slice(&codec_tail_embed);
+            .copy_from_slice(codec_tail_embed);
 
         let codec_plus_overlay_len = codec_input_len - 1;
         let mut codec_plus_overlay = vec![0.0f32; codec_plus_overlay_len * hidden_size];
@@ -4115,13 +4115,13 @@ fn select_token(
         }
     }
 
-    Ok(adjusted
+    adjusted
         .iter()
         .copied()
         .enumerate()
         .rfind(|(_, logit)| logit.is_finite())
         .map(|(idx, _)| idx as i32)
-        .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to sample token".into()))?)
+        .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to sample token".into()))
 }
 
 #[cfg(test)]

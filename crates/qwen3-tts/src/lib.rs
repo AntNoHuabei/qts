@@ -194,7 +194,7 @@ impl Qwen3TtsEngine {
         &self,
         bin_bytes: &[u8],
     ) -> Result<Vec<f32>, Qwen3TtsError> {
-        if bin_bytes.len() % std::mem::size_of::<f32>() != 0 {
+        if !bin_bytes.len().is_multiple_of(std::mem::size_of::<f32>()) {
             return Err(Qwen3TtsError::InvalidInput(
                 "speaker.bin must be a raw little-endian f32 array".into(),
             ));

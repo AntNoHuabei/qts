@@ -285,7 +285,7 @@ impl Vocoder {
             .sessions
             .lock()
             .map_err(|_| Qwen3TtsError::InvalidInput("failed to lock ORT session cache".into()))?;
-        if !sessions.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = sessions.entry(key) {
             let (session, actual_ep) = Self::build_session(&self.model_path, key)?;
             if actual_ep != self.execution_provider {
                 return Err(Qwen3TtsError::InvalidInput(format!(
@@ -294,7 +294,7 @@ impl Vocoder {
                     actual_ep.as_str()
                 )));
             }
-            sessions.insert(key, session);
+            e.insert(session);
         }
 
         let session = sessions

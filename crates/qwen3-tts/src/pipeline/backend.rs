@@ -11,13 +11,13 @@ use crate::Qwen3TtsError;
 /// `ggml_backend_reg_by_name` argument for the Metal backend (device names are `MTL0`, … — not `"Metal"`).
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn ggml_reg_mtl() -> &'static CStr {
-    CStr::from_bytes_with_nul(b"MTL\0").expect("MTL reg name")
+    c"MTL"
 }
 
 /// `ggml_backend_reg_by_name` argument for the Vulkan backend (per-device names are `Vulkan0`, …).
 #[cfg(feature = "vulkan")]
 fn ggml_reg_vulkan() -> &'static CStr {
-    CStr::from_bytes_with_nul(b"Vulkan\0").expect("Vulkan reg name")
+    c"Vulkan"
 }
 
 #[cfg(any(all(feature = "metal", target_vendor = "apple"), feature = "vulkan"))]
