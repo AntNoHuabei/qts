@@ -76,18 +76,6 @@ jobs:
             --model "$SOURCE_MODEL_ID" \
             --hf-repo-dir "$HF_REPO_DIR"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: hf-release-${{ github.ref_name }}
-          path: |
-            ${{ env.HF_REPO_DIR }}/.gitattributes
-            ${{ env.HF_REPO_DIR }}/README.md
-            ${{ env.HF_REPO_DIR }}/SHA256SUMS
-            ${{ env.HF_REPO_DIR }}/qwen3-tts-vocoder.onnx
-            ${{ env.HF_REPO_DIR }}/qwen3-tts-0.6b-f16.gguf
-            ${{ env.HF_REPO_DIR }}/qwen3-tts-0.6b-q8_0.gguf
-          if-no-files-found: error
-
       - name: Stage managed release files
         working-directory: ${{ env.HF_REPO_DIR }}
         run: |
