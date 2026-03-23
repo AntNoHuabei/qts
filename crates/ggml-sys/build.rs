@@ -9,9 +9,7 @@ fn main() {
     let ggml_root = env::var("GGML_SRC")
         .map(PathBuf::from)
         .unwrap_or_else(|_| manifest_dir.join("../../vendor/ggml"));
-    let ggml_root = ggml_root
-        .canonicalize()
-        .unwrap_or_else(|e| panic!("ggml source path missing or invalid ({ggml_root:?}): {e}"));
+    let ggml_root = normalize_source_path(ggml_root);
     let include = ggml_root.join("include");
 
     println!("cargo:rerun-if-changed=build.rs");
@@ -176,6 +174,27 @@ fn feature_enabled(name: &str) -> bool {
         name.to_ascii_uppercase().replace('-', "_")
     ))
     .is_ok()
+}
+
+fn normalize_source_path(path: PathBuf) -> PathBuf {
+    let path = path
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("ggml source path missing or invalid ({path:?}): {e}"));
+
+    #[cfg(windows)]
+    {
+        use std::path::Path;
+
+        if let Some(stripped) = path
+            .to_str()
+            .and_then(|raw| raw.strip_prefix(r"\\?\"))
+            .map(PathBuf::from)
+        {
+            return stripped;
+        }
+    }
+
+    path
 }
 
 fn map_feature_cmake(cfg: &mut cmake::Config, feature: &str, cmake_opt: &str) {
