@@ -15,7 +15,7 @@ Rust workspace for on-device **Qwen3 TTS** using [ggml-org/ggml](https://github.
 |-------|------|
 | `qts_ggml_sys` | CMake + bindgen FFI to `crates/qts_ggml_sys/vendor/ggml` ([ggml](https://github.com/ggml-org/ggml) Git submodule) |
 | `qts_ggml` | Thin wrappers + `sys` re-export |
-| `qts` | Pure Rust `rlib` for GGUF loading, speaker encoding, and synthesis |
+| `qts` | Pure Rust `rlib` for GGUF loading, speaker encoding, synthesis, and crate-local protobuf codegen |
 | `qts_cli` | Command-line interface for synthesis, profiling, and interactive TUI playback |
 
 ## Prerequisites
@@ -54,6 +54,7 @@ cargo build -p qts_cli --features vulkan
 ```
 
 GPU / accelerator backends are Cargo features on `qts_ggml_sys` (see [VERSIONS.md](VERSIONS.md)).
+`qts` keeps its protobuf schema under `crates/qts/proto/` so `cargo package` / `cargo publish` can verify the crate from a self-contained tarball.
 
 Common backend builds:
 
