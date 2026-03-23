@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import re
+import sys
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -46,6 +47,19 @@ MAIN_TYPE_TO_FILE_TYPE = {
 }
 
 SUPPORTED_MAIN_TYPES = ("f16", "q8_0")
+
+
+def configure_stdio() -> None:
+    """Use UTF-8 stdio so exporter status logs do not fail on Windows cp1252."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            # Keep export behavior intact even if the host stream is not reconfigurable.
+            pass
 
 class Qwen3MainGgufExporter:
     """Export the talker, code predictor, and tokenizer metadata to GGUF."""
@@ -551,6 +565,7 @@ def export_vocoder_onnx(
 
 
 def main() -> None:
+    configure_stdio()
     args = parse_args()
     configure_logging(args.verbose)
     main_types = resolve_main_types(args.main_type)
