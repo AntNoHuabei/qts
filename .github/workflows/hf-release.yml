@@ -21,6 +21,8 @@ concurrency:
 
 jobs:
   publish:
+    environment:
+      name: publish
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
