@@ -85,6 +85,7 @@ jobs:
         run: |
           cargo xtask hf-release \
             --model "$SOURCE_MODEL_ID" \
+            --main-type f16 \
             --hf-repo-dir "$HF_REPO_DIR"
 
       - name: Stage managed release files
@@ -95,8 +96,7 @@ jobs:
             README.md \
             SHA256SUMS \
             qwen3-tts-vocoder.onnx \
-            qwen3-tts-0.6b-f16.gguf \
-            qwen3-tts-0.6b-q8_0.gguf
+            qwen3-tts-0.6b-f16.gguf
 
       - name: Detect publish changes
         id: detect_changes

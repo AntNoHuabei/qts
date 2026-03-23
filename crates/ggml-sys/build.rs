@@ -213,28 +213,41 @@ fn validate_features(target: &str) {
 
 fn emit_vulkan_loader_links(target: &str) {
     if target.contains("apple") {
-        for dir in vulkan_search_dirs() {
+        for dir in vulkan_search_dirs(target) {
             if dir.exists() {
                 println!("cargo:rustc-link-search=native={}", dir.display());
             }
         }
         println!("cargo:rustc-link-lib=dylib=vulkan");
     } else if target.contains("windows") {
+        for dir in vulkan_search_dirs(target) {
+            if dir.exists() {
+                println!("cargo:rustc-link-search=native={}", dir.display());
+            }
+        }
         println!("cargo:rustc-link-lib=vulkan-1");
     } else {
         println!("cargo:rustc-link-lib=vulkan");
     }
 }
 
-fn vulkan_search_dirs() -> Vec<PathBuf> {
+fn vulkan_search_dirs(target: &str) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Ok(sdk) = env::var("VULKAN_SDK") {
         let sdk = PathBuf::from(sdk);
-        dirs.push(sdk.join("lib"));
-        dirs.push(sdk.join("macOS").join("lib"));
+        if target.contains("windows") {
+            dirs.push(sdk.join("Lib"));
+        } else {
+            dirs.push(sdk.join("lib"));
+            if target.contains("apple") {
+                dirs.push(sdk.join("macOS").join("lib"));
+            }
+        }
     }
-    dirs.push(PathBuf::from("/opt/homebrew/lib"));
-    dirs.push(PathBuf::from("/usr/local/lib"));
+    if target.contains("apple") {
+        dirs.push(PathBuf::from("/opt/homebrew/lib"));
+        dirs.push(PathBuf::from("/usr/local/lib"));
+    }
     dirs
 }
 

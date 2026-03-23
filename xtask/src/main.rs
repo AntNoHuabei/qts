@@ -157,6 +157,7 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut source_commit: Option<String> = None;
     let mut hf_repo_dir: Option<PathBuf> = None;
     let mut model: Option<String> = None;
+    let mut raw_main_types = Vec::new();
     let mut local_files_only = false;
     let mut verbose = false;
     let mut skip_export = false;
@@ -168,6 +169,9 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         match args[idx].as_str() {
             "--model" => {
                 model = Some(value_arg(&args, &mut idx, "--model")?);
+            }
+            "--main-type" => {
+                raw_main_types.push(value_arg(&args, &mut idx, "--main-type")?);
             }
             "--artifacts-dir" => {
                 artifacts_dir = PathBuf::from(value_arg(&args, &mut idx, "--artifacts-dir")?);
@@ -203,6 +207,7 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    let main_types = resolve_release_main_types(&raw_main_types)?;
 
     if !skip_export && model.is_none() {
         return Err("--model is required unless --skip-export is used".into());
@@ -224,6 +229,7 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             &workspace_root,
             model.as_deref().expect("validated model is present"),
             &artifacts_dir,
+            &main_types,
             local_files_only,
             verbose,
         )?;
@@ -369,10 +375,48 @@ fn release_main_types() -> [&'static str; 2] {
     ["f16", "q8_0"]
 }
 
+fn resolve_release_main_types(
+    raw_values: &[String],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if raw_values.is_empty() {
+        return Ok(release_main_types()
+            .into_iter()
+            .map(str::to_owned)
+            .collect());
+    }
+
+    let supported = release_main_types();
+    let mut resolved = Vec::new();
+    for raw in raw_values {
+        for part in raw.split(',') {
+            let main_type = part.trim();
+            if main_type.is_empty() {
+                continue;
+            }
+            if !supported.contains(&main_type) {
+                let choices = supported.join(", ");
+                return Err(
+                    format!("unknown --main-type {main_type:?}. Valid values: {choices}.").into(),
+                );
+            }
+            if !resolved.iter().any(|existing| existing == main_type) {
+                resolved.push(main_type.to_owned());
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        return Err("at least one non-empty --main-type must be provided".into());
+    }
+
+    Ok(resolved)
+}
+
 fn run_export_model_artifacts(
     workspace_root: &Path,
     model: &str,
     artifacts_dir: &Path,
+    main_types: &[String],
     local_files_only: bool,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -386,7 +430,7 @@ fn run_export_model_artifacts(
         "--out-dir",
     ]);
     command.arg(artifacts_dir);
-    for main_type in release_main_types() {
+    for main_type in main_types {
         command.args(["--main-type", main_type]);
     }
     if local_files_only {
@@ -632,7 +676,7 @@ fn value_arg(
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  cargo xtask bench [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [-- <criterion args>]\n  cargo xtask profile [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] [... same flags as synthesize ...]\n  cargo xtask hf-release --model MODEL [--artifacts-dir PATH] [--out-dir PATH] [--hf-repo-dir PATH] [--readme-template PATH] [--source-commit SHA] [--local-files-only] [--verbose] [--skip-export]\n\nTry: cargo xtask profile --help\n     cargo xtask hf-release --help"
+        "usage:\n  cargo xtask bench [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [-- <criterion args>]\n  cargo xtask profile [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--runs N] [--out OUT.wav] [--reference-wav | --speaker-bin | --voice-clone-prompt] [... same flags as synthesize ...]\n  cargo xtask hf-release --model MODEL [--main-type TYPE] [--artifacts-dir PATH] [--out-dir PATH] [--hf-repo-dir PATH] [--readme-template PATH] [--source-commit SHA] [--local-files-only] [--verbose] [--skip-export]\n\nTry: cargo xtask profile --help\n     cargo xtask hf-release --help"
     );
 }
 
@@ -650,9 +694,10 @@ fn print_profile_help() {
 fn print_hf_release_help() {
     eprintln!(
         "cargo xtask hf-release — prepare a Hugging Face release directory\n\n\
-         usage:\n  cargo xtask hf-release --model MODEL [--artifacts-dir PATH] [--out-dir PATH] [--hf-repo-dir PATH] [--readme-template PATH] [--source-commit SHA] [--local-files-only] [--verbose] [--skip-export]\n\n\
+         usage:\n  cargo xtask hf-release --model MODEL [--main-type TYPE] [--artifacts-dir PATH] [--out-dir PATH] [--hf-repo-dir PATH] [--readme-template PATH] [--source-commit SHA] [--local-files-only] [--verbose] [--skip-export]\n\n\
          Defaults:\n  --artifacts-dir models/qwen3-tts-bundle\n  --out-dir target/hf-qts-release\n  --readme-template docs/huggingface-model-card.md\n  --source-commit <git rev-parse HEAD>\n\n\
-         By default this command first runs:\n  uv run export-model-artifacts --model MODEL --out-dir <artifacts-dir> --main-type f16 --main-type q8_0\n\n\
+         By default this command exports both GGUF variants:\n  uv run export-model-artifacts --model MODEL --out-dir <artifacts-dir> --main-type f16 --main-type q8_0\n\n\
+         Repeat --main-type or pass a comma-separated list to export only the variants you need.\n\n\
          Then it copies `qwen3-tts-0.6b-*.gguf` and `qwen3-tts-vocoder.onnx`, writes `README.md`, \
          `SHA256SUMS`, and `.gitattributes`, and marks `.gguf` / `.onnx` for Hugging Face Xet in the prepared release directory.\n\n\
          If --hf-repo-dir is set, those managed release files are also synced into that existing cloned git repository root.\n\n\

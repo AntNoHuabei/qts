@@ -28,16 +28,10 @@ jobs:
         include:
           - os: ubuntu-latest
             feature_set: vulkan
-            accel_label: vulkan
-            blas_vendor: ""
           - os: macos-latest
             feature_set: metal,coreml,blas
-            accel_label: metal-coreml
-            blas_vendor: ""
           - os: windows-latest
             feature_set: vulkan
-            accel_label: vulkan
-            blas_vendor: ""
     steps:
       - uses: actions/checkout@v6
         with:
@@ -56,16 +50,11 @@ jobs:
             libjack-jackd2-dev \
             libjack-jackd2-0 \
             libpipewire-0.3-dev \
-            pkg-config \
-            libvulkan-dev \
-            glslc libshaderc-dev
+            glslc \
+            pkg-config
 
-      - name: Install macOS build prerequisites
-        if: runner.os == 'macOS'
-        run: brew install shaderc molten-vk vulkan-tools
-
-      - name: Install Windows Vulkan SDK
-        if: runner.os == 'Windows'
+      - name: Install Vulkan SDK
+        id: install_vulkan_sdk
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
           vulkan_version: latest
@@ -85,12 +74,9 @@ jobs:
             ARM64) arch_tag=arm64 ;;
             *) arch_tag="$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')" ;;
           esac
-          echo "package_stem=${CLI_BIN_NAME}-${os_tag}-${arch_tag}-${{ matrix.accel_label }}" >> "$GITHUB_OUTPUT"
+          echo "package_stem=${CLI_BIN_NAME}-${os_tag}-${arch_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Build accelerated release CLI
-        env:
-          BLA_VENDOR: ${{ matrix.blas_vendor }}
-          GGML_BLAS_VENDOR: ${{ matrix.blas_vendor }}
         run: cargo build --release -p qwen3-tts-cli --no-default-features --features ${{ matrix.feature_set }}
 
       - name: Smoke test CLI help
