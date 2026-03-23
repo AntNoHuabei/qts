@@ -82,7 +82,7 @@ Documented GGUF links and directory layout: [docs/models.md](docs/models.md).
 `qts` uses two repositories with different responsibilities:
 
 - GitHub [`yet-another-ai/qts`](https://github.com/yet-another-ai/qts) is the source-of-truth repository for code, export scripts, tests, and developer documentation.
-- Hugging Face [`dsh0416/qts-12Hz-0.6B-Base-QTS`](https://huggingface.co/dsh0416/qts-12Hz-0.6B-Base-QTS) is the distribution repository for built model artifacts.
+- Hugging Face [`dsh0416/qts-12Hz-0.6B-Base-QTS`](https://huggingface.co/dsh0416/Qwen3-TTS-12Hz-0.6B-Base-QTS) is the distribution repository for built model artifacts.
 
 In practice:
 
