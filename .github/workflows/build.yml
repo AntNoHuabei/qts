@@ -16,10 +16,6 @@ env:
   CARGO_TERM_COLOR: always
   CLI_BIN_NAME: qwen3-tts-cli
 
-concurrency:
-  group: build-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     name: Build (${{ matrix.os }})

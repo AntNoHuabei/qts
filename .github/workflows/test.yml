@@ -15,10 +15,6 @@ env:
   CARGO_TERM_COLOR: always
   SOURCE_MODEL_ID: Qwen/Qwen3-TTS-12Hz-0.6B-Base
 
-concurrency:
-  group: validate-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   smoke:
     runs-on: ${{ matrix.os }}
