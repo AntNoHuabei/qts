@@ -28,13 +28,16 @@ jobs:
         include:
           - os: ubuntu-latest
             feature_set: vulkan,blas
-            accel_label: vulkan
+            accel_label: vulkan-openblas
+            blas_vendor: OpenBLAS
           - os: macos-latest
             feature_set: metal,coreml,blas
             accel_label: metal-coreml
+            blas_vendor: ""
           - os: windows-latest
             feature_set: vulkan,blas
-            accel_label: vulkan
+            accel_label: vulkan-openblas
+            blas_vendor: OpenBLAS
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,7 +58,8 @@ jobs:
             libpipewire-0.3-dev \
             pkg-config \
             libvulkan-dev \
-            libshaderc-dev
+            libshaderc-dev \
+            libopenblas-dev
 
       - name: Install macOS build prerequisites
         if: runner.os == 'macOS'
@@ -66,6 +70,19 @@ jobs:
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
           vulkan_version: latest
+
+      - name: Install Windows OpenBLAS via vcpkg
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git clone https://github.com/microsoft/vcpkg $vcpkgRoot
+          & (Join-Path $vcpkgRoot 'bootstrap-vcpkg.bat') -disableMetrics
+          & (Join-Path $vcpkgRoot 'vcpkg.exe') install openblas:x64-windows-static-md
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKG_DEFAULT_TRIPLET=x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_TOOLCHAIN_FILE=$vcpkgRoot\scripts\buildsystems\vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_PREFIX_PATH=$vcpkgRoot\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Derive package metadata
         id: package_meta
@@ -85,6 +102,9 @@ jobs:
           echo "package_stem=${CLI_BIN_NAME}-${os_tag}-${arch_tag}-${{ matrix.accel_label }}" >> "$GITHUB_OUTPUT"
 
       - name: Build accelerated release CLI
+        env:
+          BLA_VENDOR: ${{ matrix.blas_vendor }}
+          GGML_BLAS_VENDOR: ${{ matrix.blas_vendor }}
         run: cargo build --release -p qwen3-tts-cli --no-default-features --features ${{ matrix.feature_set }}
 
       - name: Smoke test CLI help

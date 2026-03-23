@@ -67,6 +67,6 @@ cargo build -p ggml-sys
 
 ## Vulkan prerequisites
 
-- Linux: install a Vulkan loader / headers plus `glslc` before building `--features vulkan`.
-- Windows: install the Vulkan SDK so CMake can find both Vulkan and `glslc`.
+- Linux: install a Vulkan loader / headers plus `glslc` before building `--features vulkan`. If you also enable `blas`, this repository's release workflow prefers OpenBLAS and sets `BLA_VENDOR=OpenBLAS`.
+- Windows: the release workflow installs OpenBLAS through vcpkg and passes the vcpkg toolchain plus `BLA_VENDOR=OpenBLAS` to CMake for BLAS-enabled Vulkan builds.
 - Apple: use **`QWEN3_TTS_BACKEND`** to pick the GGML primary backend (`auto` \| `cpu` \| `metal` \| `vulkan`). `cargo xtask profile <cpu|metal|vulkan>` sets this env for the CLI child so profiling matches the intended backend.

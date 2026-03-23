@@ -18,6 +18,8 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=GGML_SRC");
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+    println!("cargo:rerun-if-env-changed=BLA_VENDOR");
+    println!("cargo:rerun-if-env-changed=GGML_BLAS_VENDOR");
     validate_features(&target);
 
     if feature_enabled("vulkan") {
@@ -49,6 +51,13 @@ fn main() {
 
     if feature_enabled("blas") {
         cfg.define("GGML_BLAS", "ON");
+        if let Some(blas_vendor) = env::var("GGML_BLAS_VENDOR")
+            .ok()
+            .or_else(|| env::var("BLA_VENDOR").ok())
+            .filter(|value| !value.trim().is_empty())
+        {
+            cfg.define("BLA_VENDOR", &blas_vendor);
+        }
         if target.contains("apple") {
             cfg.define("GGML_ACCELERATE", "ON");
         }
