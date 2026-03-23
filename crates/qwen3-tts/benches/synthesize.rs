@@ -1,4 +1,5 @@
 use std::env;
+use std::hint::black_box;
 use std::path::PathBuf;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -73,8 +74,8 @@ fn bench_synthesize(c: &mut Criterion) {
         |b| {
             b.iter(|| {
                 let result = engine.synthesize(&req).expect("synthesis benchmark failed");
-                criterion::black_box(result.generated_frames);
-                criterion::black_box(result.pcm_f32.len());
+                black_box(result.generated_frames);
+                black_box(result.pcm_f32.len());
             });
         },
     );

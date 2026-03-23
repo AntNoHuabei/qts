@@ -5,7 +5,7 @@ use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use ggml::sys;
-use rand::Rng;
+use rand::RngExt;
 
 use super::backend::{
     execute_graph, ggml_soft_max_ext_with_diag_mask_cache, graph_metadata_mem_size, slice_as_bytes,
@@ -859,6 +859,7 @@ impl TtsTransformer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn predict_remaining_codebooks_kv_with_cache(
         &self,
         hidden_state: &[f32],
@@ -919,6 +920,7 @@ impl TtsTransformer {
         Ok(codebook_tokens)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_next_codec_frame_recompute(
         &self,
         history_embd: &[f32],
@@ -973,6 +975,7 @@ impl TtsTransformer {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn rollout_codec_frames_recompute(
         &self,
         prefill_embd: &[f32],
@@ -1112,6 +1115,7 @@ impl TtsTransformer {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn rollout_codec_frames_kv(
         &self,
         prefill_embd: &[f32],
@@ -1315,6 +1319,7 @@ impl TtsTransformer {
 
     /// Streaming variant that sends `VocoderChunk`s to `chunk_tx` every
     /// `chunk_size` generated frames so the vocoder can decode in parallel.
+    #[allow(clippy::too_many_arguments)]
     pub fn rollout_codec_frames_kv_streaming(
         &self,
         prefill_embd: &[f32],
@@ -3707,15 +3712,10 @@ impl CodePredWeights {
         let hidden_u = cfg.hidden_size as usize;
         let pred_vocab_u = cfg.code_pred_vocab_size as usize;
         let mut codec_embd_cpu: Option<Vec<Vec<f32>>> = Some(Vec::with_capacity(per_codebook));
-        for cb_idx in 0..per_codebook {
+        for (cb_idx, embedding) in embeddings.iter().enumerate().take(per_codebook) {
             let name = format!("code_pred.codec_embd.{cb_idx}.weight");
-            let row = try_read_embedding_matrix_f32(
-                file,
-                &name,
-                embeddings[cb_idx],
-                hidden_u,
-                pred_vocab_u,
-            );
+            let row =
+                try_read_embedding_matrix_f32(file, &name, *embedding, hidden_u, pred_vocab_u);
             match (&mut codec_embd_cpu, row) {
                 (Some(rows), Some(data)) => rows.push(data),
                 _ => {

@@ -338,27 +338,9 @@ impl Qwen3TtsEngine {
             self.prepare_synthesis(req, speaker_embedding_override, voice_clone_prompt)?;
 
         if req.vocoder_chunk_size > 0 {
-            self.synthesize_pipelined(
-                req,
-                &prepared.prepared_inputs,
-                &prepared.prompt_frames,
-                prepared.prefix_frame_count,
-                timings,
-                prepared.speaker_encode,
-                prepared.tokenize,
-                prepared.prefill_build,
-            )
+            self.synthesize_pipelined(req, &prepared, timings)
         } else {
-            self.synthesize_sequential(
-                req,
-                &prepared.prepared_inputs,
-                &prepared.prompt_frames,
-                prepared.prefix_frame_count,
-                timings,
-                prepared.speaker_encode,
-                prepared.tokenize,
-                prepared.prefill_build,
-            )
+            self.synthesize_sequential(req, &prepared, timings)
         }
     }
 
@@ -377,29 +359,9 @@ impl Qwen3TtsEngine {
             self.prepare_synthesis(req, speaker_embedding_override, voice_clone_prompt)?;
 
         if req.vocoder_chunk_size > 0 {
-            self.synthesize_pipelined_streaming(
-                req,
-                &prepared.prepared_inputs,
-                &prepared.prompt_frames,
-                prepared.prefix_frame_count,
-                sink,
-                timings,
-                prepared.speaker_encode,
-                prepared.tokenize,
-                prepared.prefill_build,
-            )
+            self.synthesize_pipelined_streaming(req, &prepared, sink, timings)
         } else {
-            self.synthesize_sequential_streaming(
-                req,
-                &prepared.prepared_inputs,
-                &prepared.prompt_frames,
-                prepared.prefix_frame_count,
-                sink,
-                timings,
-                prepared.speaker_encode,
-                prepared.tokenize,
-                prepared.prefill_build,
-            )
+            self.synthesize_sequential_streaming(req, &prepared, sink, timings)
         }
     }
 
@@ -489,20 +451,15 @@ impl Qwen3TtsEngine {
     fn synthesize_sequential(
         &self,
         req: &SynthesizeRequest,
-        prepared_inputs: &PreparedPrefillInputs,
-        prompt_frames: &[Vec<i32>],
-        prefix_frame_count: usize,
+        prepared: &PreparedSynthesis<'_>,
         timings: Option<&mut SynthesisStageTimings>,
-        speaker_encode: std::time::Duration,
-        tokenize: std::time::Duration,
-        prefill_build: std::time::Duration,
     ) -> Result<SynthesizeResult, Qwen3TtsError> {
         let t_roll = Instant::now();
         let codec_rollout = self.transformer.rollout_codec_frames_kv(
-            &prepared_inputs.prefill_embd,
-            &prepared_inputs.trailing_text_hidden,
-            &prepared_inputs.tts_pad_embed,
-            prompt_frames,
+            &prepared.prepared_inputs.prefill_embd,
+            &prepared.prepared_inputs.trailing_text_hidden,
+            &prepared.prepared_inputs.tts_pad_embed,
+            &prepared.prompt_frames,
             req.thread_count,
             req.max_audio_frames,
             req.repetition_penalty,
@@ -515,7 +472,7 @@ impl Qwen3TtsEngine {
         let generated_frames = codec_rollout
             .frames
             .len()
-            .saturating_sub(prefix_frame_count);
+            .saturating_sub(prepared.prefix_frame_count);
 
         let t_post = Instant::now();
         let flattened_codes = codec_rollout
@@ -534,10 +491,11 @@ impl Qwen3TtsEngine {
         let vocoder_decode = t_voc.elapsed();
 
         let t_trim = Instant::now();
-        let pcm_f32 = if prefix_frame_count == 0 || codec_rollout.frames.is_empty() {
+        let pcm_f32 = if prepared.prefix_frame_count == 0 || codec_rollout.frames.is_empty() {
             pcm_all
         } else {
-            let cut = prefix_frame_count
+            let cut = prepared
+                .prefix_frame_count
                 .saturating_mul(pcm_all.len())
                 .checked_div(codec_rollout.frames.len())
                 .unwrap_or(0)
@@ -548,15 +506,17 @@ impl Qwen3TtsEngine {
 
         let sample_rate_hz = self.vocoder.config().sample_rate as u32;
         if let Some(t) = timings {
-            t.speaker_encode = speaker_encode;
-            t.tokenize = tokenize;
-            t.prefill_build = prefill_build;
+            t.speaker_encode = prepared.speaker_encode;
+            t.tokenize = prepared.tokenize;
+            t.prefill_build = prepared.prefill_build;
             t.codec_rollout = codec_rollout_dur;
             t.vocoder_decode = vocoder_decode;
             t.post = post;
             t.codec_rollout_detail = codec_rollout.sub_timings;
-            t.first_frame_latency =
-                speaker_encode + tokenize + prefill_build + codec_rollout.first_frame_elapsed;
+            t.first_frame_latency = prepared.speaker_encode
+                + prepared.tokenize
+                + prepared.prefill_build
+                + codec_rollout.first_frame_elapsed;
             t.generated_samples = pcm_f32.len();
             t.sample_rate_hz = sample_rate_hz;
         }
@@ -571,28 +531,14 @@ impl Qwen3TtsEngine {
     fn synthesize_sequential_streaming<S>(
         &self,
         req: &SynthesizeRequest,
-        prepared_inputs: &PreparedPrefillInputs,
-        prompt_frames: &[Vec<i32>],
-        prefix_frame_count: usize,
+        prepared: &PreparedSynthesis<'_>,
         sink: &mut S,
         timings: Option<&mut SynthesisStageTimings>,
-        speaker_encode: std::time::Duration,
-        tokenize: std::time::Duration,
-        prefill_build: std::time::Duration,
     ) -> Result<StreamingSynthesizeResult, Qwen3TtsError>
     where
         S: StreamingSynthesis + Send,
     {
-        let result = self.synthesize_sequential(
-            req,
-            prepared_inputs,
-            prompt_frames,
-            prefix_frame_count,
-            timings,
-            speaker_encode,
-            tokenize,
-            prefill_build,
-        )?;
+        let result = self.synthesize_sequential(req, prepared, timings)?;
         sink.push_pcm_chunk(&result.pcm_f32)?;
         Ok(StreamingSynthesizeResult {
             sample_rate_hz: result.sample_rate_hz,
@@ -616,13 +562,8 @@ impl Qwen3TtsEngine {
     fn synthesize_pipelined(
         &self,
         req: &SynthesizeRequest,
-        prepared_inputs: &PreparedPrefillInputs,
-        prompt_frames: &[Vec<i32>],
-        prefix_frame_count: usize,
+        prepared: &PreparedSynthesis<'_>,
         timings: Option<&mut SynthesisStageTimings>,
-        speaker_encode: std::time::Duration,
-        tokenize: std::time::Duration,
-        prefill_build: std::time::Duration,
     ) -> Result<SynthesizeResult, Qwen3TtsError> {
         use std::sync::mpsc;
 
@@ -636,14 +577,15 @@ impl Qwen3TtsEngine {
 
         let (chunk_tx, chunk_rx) = mpsc::sync_channel::<VocoderChunk>(2);
 
-        let prompt_chunk = if prefix_frame_count > 0 {
-            let codes = prompt_frames
+        let prompt_chunk = if prepared.prefix_frame_count > 0 {
+            let codes = prepared
+                .prompt_frames
                 .iter()
                 .flat_map(|f| f.iter().copied())
                 .collect::<Vec<_>>();
             Some(VocoderChunk {
                 codes,
-                n_frames: prefix_frame_count,
+                n_frames: prepared.prefix_frame_count,
             })
         } else {
             None
@@ -728,10 +670,10 @@ impl Qwen3TtsEngine {
 
             let t_roll = Instant::now();
             let codec_rollout = self.transformer.rollout_codec_frames_kv_streaming(
-                &prepared_inputs.prefill_embd,
-                &prepared_inputs.trailing_text_hidden,
-                &prepared_inputs.tts_pad_embed,
-                prompt_frames,
+                &prepared.prepared_inputs.prefill_embd,
+                &prepared.prepared_inputs.trailing_text_hidden,
+                &prepared.prepared_inputs.tts_pad_embed,
+                &prepared.prompt_frames,
                 thread_count,
                 req.max_audio_frames,
                 req.repetition_penalty,
@@ -748,18 +690,19 @@ impl Qwen3TtsEngine {
             let generated_frames = codec_rollout
                 .frames
                 .len()
-                .saturating_sub(prefix_frame_count);
+                .saturating_sub(prepared.prefix_frame_count);
 
             let (pcm_all, vocoder_decode) = vocoder_handle.join().unwrap()?;
 
             let pipeline_wall_clock = t_pipeline_start.elapsed();
 
             let t_trim = Instant::now();
-            let pcm_f32 = if prefix_frame_count == 0 || pcm_all.is_empty() {
+            let pcm_f32 = if prepared.prefix_frame_count == 0 || pcm_all.is_empty() {
                 pcm_all
             } else {
-                let total_frames = prefix_frame_count + generated_frames;
-                let cut = prefix_frame_count
+                let total_frames = prepared.prefix_frame_count + generated_frames;
+                let cut = prepared
+                    .prefix_frame_count
                     .saturating_mul(pcm_all.len())
                     .checked_div(total_frames)
                     .unwrap_or(0)
@@ -770,17 +713,19 @@ impl Qwen3TtsEngine {
 
             let sample_rate_hz = self.vocoder.config().sample_rate as u32;
             if let Some(t) = timings {
-                t.speaker_encode = speaker_encode;
-                t.tokenize = tokenize;
-                t.prefill_build = prefill_build;
+                t.speaker_encode = prepared.speaker_encode;
+                t.tokenize = prepared.tokenize;
+                t.prefill_build = prepared.prefill_build;
                 t.codec_rollout = codec_rollout_dur;
                 t.vocoder_decode = vocoder_decode;
                 t.post = post;
                 t.codec_rollout_detail = codec_rollout.sub_timings;
                 let sequential_sum = codec_rollout_dur + vocoder_decode;
                 t.pipeline_overlap = sequential_sum.saturating_sub(pipeline_wall_clock);
-                t.first_frame_latency =
-                    speaker_encode + tokenize + prefill_build + codec_rollout.first_frame_elapsed;
+                t.first_frame_latency = prepared.speaker_encode
+                    + prepared.tokenize
+                    + prepared.prefill_build
+                    + codec_rollout.first_frame_elapsed;
                 t.generated_samples = pcm_f32.len();
                 t.sample_rate_hz = sample_rate_hz;
             }
@@ -796,14 +741,9 @@ impl Qwen3TtsEngine {
     fn synthesize_pipelined_streaming<S>(
         &self,
         req: &SynthesizeRequest,
-        prepared_inputs: &PreparedPrefillInputs,
-        prompt_frames: &[Vec<i32>],
-        prefix_frame_count: usize,
+        prepared: &PreparedSynthesis<'_>,
         sink: &mut S,
         timings: Option<&mut SynthesisStageTimings>,
-        speaker_encode: std::time::Duration,
-        tokenize: std::time::Duration,
-        prefill_build: std::time::Duration,
     ) -> Result<StreamingSynthesizeResult, Qwen3TtsError>
     where
         S: StreamingSynthesis + Send,
@@ -918,10 +858,10 @@ impl Qwen3TtsEngine {
 
             let t_roll = Instant::now();
             let codec_rollout = self.transformer.rollout_codec_frames_kv_streaming(
-                &prepared_inputs.prefill_embd,
-                &prepared_inputs.trailing_text_hidden,
-                &prepared_inputs.tts_pad_embed,
-                prompt_frames,
+                &prepared.prepared_inputs.prefill_embd,
+                &prepared.prepared_inputs.trailing_text_hidden,
+                &prepared.prepared_inputs.tts_pad_embed,
+                &prepared.prompt_frames,
                 thread_count,
                 req.max_audio_frames,
                 req.repetition_penalty,
@@ -938,7 +878,7 @@ impl Qwen3TtsEngine {
             let generated_frames = codec_rollout
                 .frames
                 .len()
-                .saturating_sub(prefix_frame_count);
+                .saturating_sub(prepared.prefix_frame_count);
 
             let (generated_samples, vocoder_decode) = vocoder_handle.join().unwrap()?;
 
@@ -946,17 +886,19 @@ impl Qwen3TtsEngine {
             let post = std::time::Duration::ZERO;
             let sample_rate_hz = self.vocoder.config().sample_rate as u32;
             if let Some(t) = timings {
-                t.speaker_encode = speaker_encode;
-                t.tokenize = tokenize;
-                t.prefill_build = prefill_build;
+                t.speaker_encode = prepared.speaker_encode;
+                t.tokenize = prepared.tokenize;
+                t.prefill_build = prepared.prefill_build;
                 t.codec_rollout = codec_rollout_dur;
                 t.vocoder_decode = vocoder_decode;
                 t.post = post;
                 t.codec_rollout_detail = codec_rollout.sub_timings;
                 let sequential_sum = codec_rollout_dur + vocoder_decode;
                 t.pipeline_overlap = sequential_sum.saturating_sub(pipeline_wall_clock);
-                t.first_frame_latency =
-                    speaker_encode + tokenize + prefill_build + codec_rollout.first_frame_elapsed;
+                t.first_frame_latency = prepared.speaker_encode
+                    + prepared.tokenize
+                    + prepared.prefill_build
+                    + codec_rollout.first_frame_elapsed;
                 t.generated_samples = generated_samples;
                 t.sample_rate_hz = sample_rate_hz;
             }

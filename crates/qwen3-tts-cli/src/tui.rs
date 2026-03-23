@@ -537,10 +537,10 @@ impl PlaybackStream {
         let device = host
             .default_output_device()
             .context("failed to open a default output device")?;
-        let device_name = device.name().unwrap_or_else(|_| "unknown".to_string());
+        let device_name = device.description()?.name().to_string();
         let supported = pick_output_config(&device)?;
         let stream_config = supported.config();
-        let sample_rate_hz = supported.sample_rate().0;
+        let sample_rate_hz = supported.sample_rate();
         let channels = stream_config.channels as usize;
         let queue = Arc::new((Mutex::new(PlaybackQueue::default()), Condvar::new()));
         let stream = build_stream(&device, &supported, Arc::clone(&queue), channels)?;
@@ -697,7 +697,7 @@ impl LinearResampler {
 }
 
 fn pick_output_config(device: &cpal::Device) -> Result<SupportedStreamConfig> {
-    let desired = cpal::SampleRate(SAMPLE_RATE_HZ);
+    let desired = SAMPLE_RATE_HZ;
     if let Ok(configs) = device.supported_output_configs() {
         for config in configs {
             if config.min_sample_rate() <= desired && config.max_sample_rate() >= desired {
@@ -840,7 +840,7 @@ fn warmup_engine(
     playback: &PlaybackStream,
 ) -> Result<PlaybackSummary> {
     let mut request = config.make_request(WARMUP_TEXT);
-    request.max_audio_frames = request.max_audio_frames.min(WARMUP_MAX_AUDIO_FRAMES).max(1);
+    request.max_audio_frames = request.max_audio_frames.clamp(1, WARMUP_MAX_AUDIO_FRAMES);
 
     let start = Instant::now();
     let mut first_chunk_latency: Option<Duration> = None;

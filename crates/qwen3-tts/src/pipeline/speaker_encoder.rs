@@ -374,7 +374,7 @@ fn build_mel_filters(sample_rate_hz: u32, fft_len: usize, mel_bins: usize) -> Ve
         let left = mel_points[mel_idx];
         let center = mel_points[mel_idx + 1];
         let right = mel_points[mel_idx + 2];
-        for bin in 0..fft_bins {
+        for (bin, weight_cell) in filters[mel_idx].iter_mut().enumerate().take(fft_bins) {
             let freq = bin_freq(bin);
             let weight = if freq >= left && freq < center {
                 (freq - left) / (center - left + 1e-6)
@@ -383,7 +383,7 @@ fn build_mel_filters(sample_rate_hz: u32, fft_len: usize, mel_bins: usize) -> Ve
             } else {
                 0.0
             };
-            filters[mel_idx][bin] = weight.max(0.0);
+            *weight_cell = weight.max(0.0);
         }
     }
     filters

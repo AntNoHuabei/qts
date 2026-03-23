@@ -305,6 +305,7 @@ impl BackendSet {
         Self::with_primary(primary, kind, Some(OwnedBackend::cpu()?))
     }
 
+    #[allow(clippy::arc_with_non_send_sync)]
     fn with_primary(
         primary: OwnedBackend,
         primary_kind: BackendKind,

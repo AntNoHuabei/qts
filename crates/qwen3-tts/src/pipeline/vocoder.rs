@@ -96,11 +96,17 @@ fn parse_requested_execution_provider() -> Result<RequestedExecutionProvider, Qw
 fn default_auto_execution_provider_order() -> Vec<VocoderExecutionProvider> {
     #[cfg(target_vendor = "apple")]
     {
-        let mut order = Vec::new();
         #[cfg(feature = "coreml")]
-        order.push(VocoderExecutionProvider::CoreMl);
-        order.push(VocoderExecutionProvider::Cpu);
-        order
+        {
+            vec![
+                VocoderExecutionProvider::CoreMl,
+                VocoderExecutionProvider::Cpu,
+            ]
+        }
+        #[cfg(not(feature = "coreml"))]
+        {
+            vec![VocoderExecutionProvider::Cpu]
+        }
     }
     #[cfg(not(target_vendor = "apple"))]
     {
