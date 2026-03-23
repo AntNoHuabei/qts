@@ -55,11 +55,11 @@ jobs:
             libpipewire-0.3-dev \
             pkg-config \
             libvulkan-dev \
-            shaderc
+            libshaderc-dev
 
       - name: Install macOS build prerequisites
         if: runner.os == 'macOS'
-        run: brew install shaderc
+        run: brew install shaderc vulkan-sdk vulkan-tools
 
       - name: Install Windows Vulkan SDK
         if: runner.os == 'Windows'
