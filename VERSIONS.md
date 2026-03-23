@@ -36,7 +36,7 @@
 - `cuda` is **rejected on Apple** targets.
 - `vulkan` requires the Vulkan toolchain to be discoverable by CMake, including `glslc`.
 
-Default workspace build uses **CPU** only and disables Apple Metal/BLAS in CMake unless you enable the corresponding features.
+Default crate features enable **Metal** and **Vulkan** where applicable; **`blas` is opt-in** (OpenBLAS on Linux/Windows makes CI and local builds much slower). On Apple, enabling `blas` uses Accelerate.
 
 ## Override ggml path
 
@@ -67,6 +67,6 @@ cargo build -p ggml-sys
 
 ## Vulkan prerequisites
 
-- Linux: install a Vulkan loader / headers plus `glslc` before building `--features vulkan`. If you also enable `blas`, this repository's release workflow prefers OpenBLAS and sets `BLA_VENDOR=OpenBLAS`.
-- Windows: the release workflow installs OpenBLAS through vcpkg and passes the vcpkg toolchain plus `BLA_VENDOR=OpenBLAS` to CMake for BLAS-enabled Vulkan builds.
+- Linux: install a Vulkan loader / headers plus `glslc` before building `--features vulkan`. If you enable `blas`, install a BLAS implementation (e.g. OpenBLAS) and set `GGML_BLAS_VENDOR` / `BLA_VENDOR` as needed for CMake.
+- Windows: for `blas`, install OpenBLAS (for example via vcpkg), point CMake at it, and set `GGML_BLAS_VENDOR` / `BLA_VENDOR` if required.
 - Apple: use **`QWEN3_TTS_BACKEND`** to pick the GGML primary backend (`auto` \| `cpu` \| `metal` \| `vulkan`). `cargo xtask profile <cpu|metal|vulkan>` sets this env for the CLI child so profiling matches the intended backend.

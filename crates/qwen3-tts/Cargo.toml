@@ -2,13 +2,12 @@
 name = "qwen3-tts"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Qwen3 TTS inference (GGUF + GGML); Rust API for host apps and gdext."
 
 [features]
-default = ["metal", "blas", "vulkan", "coreml"]
+default = ["metal", "vulkan", "coreml"]
 metal = ["ggml/metal"]
 vulkan = ["ggml/vulkan"]
 blas = ["ggml/blas"]
@@ -19,17 +18,17 @@ coreml = ["ort/coreml"]
 ggml.workspace = true
 thiserror.workspace = true
 rand.workspace = true
-hound = "3.5.1"
-rustfft = "6.4.1"
-prost = "0.13"
-ort = "2.0.0-rc.9"
+hound.workspace = true
+rustfft.workspace = true
+prost.workspace = true
+ort.workspace = true
 
 [dev-dependencies]
-criterion = "0.5.1"
+criterion.workspace = true
 
 [build-dependencies]
-prost-build = "0.13"
-protoc-bin-vendored = "3"
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
 
 [[bench]]
 name = "synthesize"

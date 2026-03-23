@@ -524,7 +524,7 @@ fn render_hf_model_card(
 }
 
 fn hf_xet_gitattributes() -> &'static str {
-    "*.gguf filter=xet diff=xet merge=xet -text\n*.onnx filter=xet diff=xet merge=xet -text\n"
+    "*.gguf filter=lfs diff=lfs merge=lfs -text\n*.onnx filter=lfs diff=lfs merge=lfs -text\n"
 }
 
 fn same_existing_path(left: &Path, right: &Path) -> Result<bool, Box<dyn std::error::Error>> {

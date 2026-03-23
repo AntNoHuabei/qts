@@ -9,15 +9,29 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/yet-another-ai/qts"
 
 [workspace.dependencies]
+qwen3-tts = { path = "crates/qwen3-tts" }
 ggml-sys = { path = "crates/ggml-sys" }
 ggml = { path = "crates/ggml" }
 thiserror = "2"
-rand = "0.9"
+rand = "0.10"
+anyhow = "1.0.102"
+cpal = "0.17"
+crossterm = "0.29"
+hound = "3.5.1"
+libc = "0.2"
+ratatui = "0.30"
+criterion = "0.8"
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+bindgen = "0.72"
+cmake = "0.1"
+rustfft = "6.4.1"
+prost = "0.14"
+ort = "2.0.0-rc.9"
 
 [profile.release]
 debug = "line-tables-only"

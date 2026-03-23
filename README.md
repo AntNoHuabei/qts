@@ -98,7 +98,7 @@ tracking for `*.gguf` / `*.onnx`, run `cargo xtask hf-release --model Qwen/Qwen3
 
 Official Hugging Face publication is handled by GitHub Actions:
 
-- `.github/workflows/build.yml` builds accelerated `qwen3-tts-cli` archives for Linux, macOS, and Windows on pull requests and `main` (`vulkan+OpenBLAS` on Linux/Windows, with Windows installing OpenBLAS through vcpkg; `metal+coreml` on macOS), and uploads tagged `v*` builds to GitHub Releases
+- `.github/workflows/build.yml` builds accelerated `qwen3-tts-cli` archives for Linux, macOS, and Windows on pull requests and `main` (Vulkan on Linux/Windows; `metal+coreml+blas` on macOS via Accelerate), and uploads tagged `v*` builds to GitHub Releases
 - `.github/workflows/hf-release.yml` publishes tagged `v*` releases to `dsh0416/Qwen3-TTS-12Hz-0.6B-Base-QTS`
 - `.github/workflows/model-integration.yml` provides a manual release-preview run that exports and uploads the staged bundle without pushing
 - repository secret `HF_TOKEN` must be configured with write access to the Hugging Face model repository

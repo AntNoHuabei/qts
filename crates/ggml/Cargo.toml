@@ -2,13 +2,12 @@
 name = "ggml"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Thin safe wrappers over ggml-sys for qts."
 
 [features]
-default = ["metal", "blas", "vulkan"]
+default = ["metal", "vulkan"]
 metal = ["ggml-sys/metal"]
 vulkan = ["ggml-sys/vulkan"]
 blas = ["ggml-sys/blas"]
