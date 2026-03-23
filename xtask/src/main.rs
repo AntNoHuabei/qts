@@ -281,11 +281,19 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(out_dir.join("README.md"), readme)?;
 
     if let Some(hf_repo_dir) = hf_repo_dir {
+        let packaged_in_repo = same_existing_path(&out_dir, &hf_repo_dir)?;
         sync_release_to_hf_repo(&out_dir, &hf_repo_dir)?;
-        eprintln!(
-            "synced prepared release files into git repo: {}",
-            hf_repo_dir.display()
-        );
+        if packaged_in_repo {
+            eprintln!(
+                "prepared release files directly in git repo: {}",
+                hf_repo_dir.display()
+            );
+        } else {
+            eprintln!(
+                "synced prepared release files into git repo: {}",
+                hf_repo_dir.display()
+            );
+        }
     }
 
     eprintln!(
