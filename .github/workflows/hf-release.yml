@@ -28,6 +28,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
+      - name: Free Runner Space
+        # NOTE: Use a specific tag or commit shasum for immutability
+        uses: justinthelaw/maximize-github-runner-space@latest
+        with:
+          skip-components: rust,cached-python
+          swapfile-size: 2G
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
