@@ -82,6 +82,10 @@ impl SynthesisStageTimings {
                 talker_steps: avg(|s| s.codec_rollout_detail.talker_steps),
                 code_pred_total: avg(|s| s.codec_rollout_detail.code_pred_total),
                 kv_writeback: avg(|s| s.codec_rollout_detail.kv_writeback),
+                kv_download: avg(|s| s.codec_rollout_detail.kv_download),
+                kv_quantize: avg(|s| s.codec_rollout_detail.kv_quantize),
+                kv_upload: avg(|s| s.codec_rollout_detail.kv_upload),
+                talker_kv_bytes: avg_usize(|s| s.codec_rollout_detail.talker_kv_bytes),
             },
             generated_samples: avg_usize(|s| s.generated_samples),
             sample_rate_hz: samples[0].sample_rate_hz,
@@ -124,16 +128,27 @@ impl SynthesisStageTimings {
         let has_detail = !d.talker_prefill.is_zero()
             || !d.talker_steps.is_zero()
             || !d.code_pred_total.is_zero()
-            || !d.kv_writeback.is_zero();
+            || !d.kv_writeback.is_zero()
+            || !d.kv_download.is_zero()
+            || !d.kv_quantize.is_zero()
+            || !d.kv_upload.is_zero()
+            || d.talker_kv_bytes > 0;
         if has_detail {
-            let sub_rows: [(&str, Duration); 4] = [
+            let sub_rows: [(&str, Duration); 7] = [
                 ("  talker_prefill", d.talker_prefill),
                 ("  talker_steps", d.talker_steps),
                 ("  code_pred_total", d.code_pred_total),
                 ("  kv_writeback", d.kv_writeback),
+                ("  kv_download", d.kv_download),
+                ("  kv_quantize", d.kv_quantize),
+                ("  kv_upload", d.kv_upload),
             ];
             for (name, sd) in sub_rows {
                 let _ = writeln!(out, "    {name:<26} {:>10.3} ms", duration_ms(sd));
+            }
+            if d.talker_kv_bytes > 0 {
+                let mib = d.talker_kv_bytes as f64 / (1024.0 * 1024.0);
+                let _ = writeln!(out, "    {:<26} {:>10.3} MiB", "talker_kv_bytes", mib);
             }
         }
         if !self.pipeline_overlap.is_zero() {
