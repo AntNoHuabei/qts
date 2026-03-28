@@ -15,9 +15,9 @@ license = "Apache-2.0"
 repository = "https://github.com/yet-another-ai/qts"
 
 [workspace.dependencies]
-qts = { path = "crates/qts", version = "0.1.0" }
-qts_ggml_sys = { path = "crates/qts_ggml_sys", version = "0.1.0" }
-qts_ggml = { path = "crates/qts_ggml", version = "0.1.0" }
+qts = { path = "crates/qts", version = "0.2.0" }
+qts_ggml_sys = { path = "crates/qts_ggml_sys", version = "0.2.0" }
+qts_ggml = { path = "crates/qts_ggml", version = "0.2.0" }
 thiserror = "2"
 rand = "0.10"
 anyhow = "1.0.102"

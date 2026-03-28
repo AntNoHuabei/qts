@@ -1911,7 +1911,7 @@ checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 
 [[package]]
 name = "qts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "hound",
@@ -1927,7 +1927,7 @@ dependencies = [
 
 [[package]]
 name = "qts_cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -1941,14 +1941,14 @@ dependencies = [
 
 [[package]]
 name = "qts_ggml"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "qts_ggml_sys",
 ]
 
 [[package]]
 name = "qts_ggml_sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bindgen",
  "cmake",
@@ -3314,7 +3314,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sha2",
 ]
