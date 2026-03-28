@@ -36,17 +36,17 @@ cargo check -p qts --no-default-features --features vulkan
 # Windows DirectML vocoder path (features pass through to `qts`)
 cargo check -p qts_cli --no-default-features --features directml
 
+# Linux CUDA vocoder path
+cargo check -p qts_cli --no-default-features --features cuda
+
+# x86_64 Linux / Windows OpenVINO vocoder path
+cargo check -p qts_cli --no-default-features --features openvino
+
 # CLI crate (same feature flags pass through to `qts`)
 cargo check -p qts_cli
 ```
 
-## Layer C — golden numerics (planned)
-
-Copy `reference/*.bin` from [qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp) and add component tests with explicit tolerances (tokenizer, encoder, transformer, vocoder).
-
-## Layer D — heavy E2E (manual)
-
-Python or upstream `compare_e2e.py`-style checks should stay out of default PR CI.
+For ONNX Runtime EPs, keep in mind that ort prebuilt binaries only cover specific feature bundles. Platform-native EPs like `directml`, `xnnpack`, and `coreml` are broadly available where supported, and ort also publishes prebuilt bundles for `cuda` + `tensorrt`, `webgpu`, and `nvrtx`. Mixed combinations outside those bundles may resolve to a CPU-only ORT download unless you build ONNX Runtime from source. That matters for this repo because the default Linux / Windows vocoder feature set now includes `cuda`, `nvrtx`, and `tensorrt` together.
 
 ## Benchmarks
 
@@ -64,7 +64,9 @@ The Vulkan path requires a working Vulkan SDK / loader and `glslc` on the machin
 
 Runtime backend is controlled by **`QWEN3_TTS_BACKEND`** (`auto`, `cpu`, `metal`, `vulkan`). When profiling with Vulkan on macOS (MoltenVK), build with `--features vulkan` and set `QWEN3_TTS_BACKEND=vulkan` for the CLI process.
 
-The ONNX vocoder execution provider is controlled separately by **`QWEN3_TTS_VOCODER_EP`** (`auto`, `cpu`, `coreml`, `directml`). On Apple platforms, `auto` prefers CoreML when available. On Windows builds with the `directml` feature, `auto` prefers DirectML before CPU.
+The ONNX vocoder execution provider is controlled separately by **`QWEN3_TTS_VOCODER_EP`**. Supported tokens are `cpu`, `acl`, `armnn`, `azure`, `cann`, `coreml`, `cuda`, `directml`, `migraphx`, `nnapi`, `nvrtx`, `onednn`, `openvino`, `qnn`, `rknpu`, `tensorrt`, `tvm`, `vitis`, `webgpu`, and `xnnpack`, subject to the corresponding Cargo feature being enabled in the binary. On Apple platforms, `auto` prefers CoreML when available. On Windows, `auto` now tries `cuda,nvrtx,tensorrt,directml,cpu`. On Linux and other non-Apple targets, `auto` tries `cuda,nvrtx,tensorrt,cpu`.
+
+If you expect all of those EPs to be usable in one binary, verify that your ONNX Runtime build actually includes the combination you enabled. With ort’s stock prebuilt downloads, some mixed EP sets require building ORT from source first.
 
 The CLI also accepts `--backend`, `--backend-fallback`, `--vocoder-ep`, and `--vocoder-ep-fallback`, which override the environment variables for that invocation.
 
