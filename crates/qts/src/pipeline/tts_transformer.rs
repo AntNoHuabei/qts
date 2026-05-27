@@ -1280,7 +1280,6 @@ impl TtsTransformer {
     ) -> Result<Vec<i32>, Qwen3TtsError> {
         let code_pred_thread_count = thread_count.min(4);
         let talker_hidden_size = self.config.hidden_size as usize;
-        let code_pred_hidden_size = self.config.code_pred_hidden_size as usize;
         if hidden_state.len() != talker_hidden_size {
             return Err(Qwen3TtsError::InvalidInput(
                 "code predictor hidden state shape is invalid".into(),
@@ -1288,33 +1287,61 @@ impl TtsTransformer {
         }
 
         let n_codebooks = self.config.n_codebooks as usize;
-        let mut cache = CodePredCpuKvCache::new(
-            cpu.layers.len(),
-            n_codebooks + 1,
-            self.config.n_key_value_heads as usize,
-            self.config.head_dim as usize,
-        );
+        let mut workspace = CodePredCpuWorkspace::new(&self.config, cpu, n_codebooks + 1);
+        self.predict_remaining_codebooks_cpu_cached_with_workspace(
+            cpu,
+            hidden_state,
+            codebook_0_token,
+            code_pred_thread_count,
+            temperature,
+            top_k,
+            top_p,
+            &mut workspace,
+        )
+    }
 
-        let mut projected = vec![0.0f32; code_pred_hidden_size];
-        self.project_code_pred_cpu_input(cpu, hidden_state, &mut projected)?;
+    #[allow(clippy::too_many_arguments)]
+    fn predict_remaining_codebooks_cpu_cached_with_workspace(
+        &self,
+        cpu: &CodePredCpuWeights,
+        hidden_state: &[f32],
+        codebook_0_token: i32,
+        thread_count: usize,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        workspace: &mut CodePredCpuWorkspace,
+    ) -> Result<Vec<i32>, Qwen3TtsError> {
+        let talker_hidden_size = self.config.hidden_size as usize;
+        if hidden_state.len() != talker_hidden_size {
+            return Err(Qwen3TtsError::InvalidInput(
+                "code predictor hidden state shape is invalid".into(),
+            ));
+        }
+
+        let n_codebooks = self.config.n_codebooks as usize;
+        workspace.reset();
+        self.project_code_pred_cpu_input(cpu, hidden_state, &mut workspace.projected)?;
         self.forward_code_pred_token_cpu_cached(
             cpu,
-            &projected,
+            &workspace.projected,
             0,
             None,
-            code_pred_thread_count,
-            &mut cache,
+            thread_count,
+            &mut workspace.cache,
+            &mut workspace.scratch,
         )?;
 
         let cb0 = self.lookup_codec_embedding_rows(&[codebook_0_token], thread_count)?;
-        self.project_code_pred_cpu_input(cpu, &cb0, &mut projected)?;
+        self.project_code_pred_cpu_input(cpu, &cb0, &mut workspace.projected)?;
         let first = self.forward_code_pred_token_cpu_cached(
             cpu,
-            &projected,
+            &workspace.projected,
             1,
             Some(0),
-            code_pred_thread_count,
-            &mut cache,
+            thread_count,
+            &mut workspace.cache,
+            &mut workspace.scratch,
         )?;
         let mut codebook_tokens = Vec::with_capacity(n_codebooks);
         codebook_tokens.push(codebook_0_token);
@@ -1336,15 +1363,16 @@ impl TtsTransformer {
                 cpu,
                 generation_step - 1,
                 prev_code,
-                &mut projected,
+                &mut workspace.projected,
             )?;
             let outputs = self.forward_code_pred_token_cpu_cached(
                 cpu,
-                &projected,
+                &workspace.projected,
                 generation_step + 1,
                 Some(generation_step),
-                code_pred_thread_count,
-                &mut cache,
+                thread_count,
+                &mut workspace.cache,
+                &mut workspace.scratch,
             )?;
             codebook_tokens.push(self.select_code_pred_token(
                 outputs.as_deref().ok_or_else(|| {
@@ -1626,6 +1654,10 @@ impl TtsTransformer {
             self.config.n_codebooks as usize,
             self.code_pred._backends.clone(),
         )?;
+        let code_pred_thread_count = thread_count.min(4);
+        let mut cpu_code_pred_workspace = self.code_pred.cpu.as_ref().map(|cpu| {
+            CodePredCpuWorkspace::new(&self.config, cpu, self.config.n_codebooks as usize + 1)
+        });
 
         let t_prefill = Instant::now();
         let first_outputs = self.forward_prefill_cached(prefill_embd, thread_count, &cache)?;
@@ -1671,15 +1703,31 @@ impl TtsTransformer {
 
         let mut code_pred_dur = Duration::ZERO;
         let t_cp = Instant::now();
-        let first_codes = self.predict_remaining_codebooks_kv_with_cache(
-            &first_outputs.hidden_state,
-            first_codebook_0,
-            thread_count,
-            temperature,
-            top_k,
-            top_p,
-            &code_pred_cache,
-        )?;
+        let first_codes = if let (Some(cpu), Some(workspace)) = (
+            self.code_pred.cpu.as_ref(),
+            cpu_code_pred_workspace.as_mut(),
+        ) {
+            self.predict_remaining_codebooks_cpu_cached_with_workspace(
+                cpu,
+                &first_outputs.hidden_state,
+                first_codebook_0,
+                code_pred_thread_count,
+                temperature,
+                top_k,
+                top_p,
+                workspace,
+            )?
+        } else {
+            self.predict_remaining_codebooks_kv_with_cache(
+                &first_outputs.hidden_state,
+                first_codebook_0,
+                thread_count,
+                temperature,
+                top_k,
+                top_p,
+                &code_pred_cache,
+            )?
+        };
         code_pred_dur += t_cp.elapsed();
 
         let mut frames = prompt_frames
@@ -1705,8 +1753,6 @@ impl TtsTransformer {
         let mut kv_download_dur = Duration::ZERO;
         let mut kv_quantize_dur = Duration::ZERO;
         let mut kv_upload_dur = Duration::ZERO;
-        let force_code_pred_recompute =
-            self.config.code_pred_hidden_size != self.config.hidden_size;
         let mut debug_step_embeddings = Vec::new();
         let mut debug_trailing_rows = Vec::new();
 
@@ -1761,14 +1807,19 @@ impl TtsTransformer {
                 break;
             }
             let t_cp = Instant::now();
-            let codebook_tokens = if force_code_pred_recompute {
-                self.predict_remaining_codebooks_recompute(
+            let codebook_tokens = if let (Some(cpu), Some(workspace)) = (
+                self.code_pred.cpu.as_ref(),
+                cpu_code_pred_workspace.as_mut(),
+            ) {
+                self.predict_remaining_codebooks_cpu_cached_with_workspace(
+                    cpu,
                     &step_outputs.hidden_state,
                     codebook_0_token,
-                    thread_count,
+                    code_pred_thread_count,
                     temperature,
                     top_k,
                     top_p,
+                    workspace,
                 )?
             } else {
                 self.predict_remaining_codebooks_kv_with_cache(
@@ -1874,6 +1925,10 @@ impl TtsTransformer {
             self.config.n_codebooks as usize,
             self.code_pred._backends.clone(),
         )?;
+        let code_pred_thread_count = thread_count.min(4);
+        let mut cpu_code_pred_workspace = self.code_pred.cpu.as_ref().map(|cpu| {
+            CodePredCpuWorkspace::new(&self.config, cpu, self.config.n_codebooks as usize + 1)
+        });
 
         let t_prefill = Instant::now();
         let first_outputs = self.forward_prefill_cached(prefill_embd, thread_count, &cache)?;
@@ -1919,15 +1974,31 @@ impl TtsTransformer {
 
         let mut code_pred_dur = Duration::ZERO;
         let t_cp = Instant::now();
-        let first_codes = self.predict_remaining_codebooks_kv_with_cache(
-            &first_outputs.hidden_state,
-            first_codebook_0,
-            thread_count,
-            temperature,
-            top_k,
-            top_p,
-            &code_pred_cache,
-        )?;
+        let first_codes = if let (Some(cpu), Some(workspace)) = (
+            self.code_pred.cpu.as_ref(),
+            cpu_code_pred_workspace.as_mut(),
+        ) {
+            self.predict_remaining_codebooks_cpu_cached_with_workspace(
+                cpu,
+                &first_outputs.hidden_state,
+                first_codebook_0,
+                code_pred_thread_count,
+                temperature,
+                top_k,
+                top_p,
+                workspace,
+            )?
+        } else {
+            self.predict_remaining_codebooks_kv_with_cache(
+                &first_outputs.hidden_state,
+                first_codebook_0,
+                thread_count,
+                temperature,
+                top_k,
+                top_p,
+                &code_pred_cache,
+            )?
+        };
         code_pred_dur += t_cp.elapsed();
 
         let mut frames = prompt_frames
@@ -1975,9 +2046,6 @@ impl TtsTransformer {
         let mut kv_download_dur = Duration::ZERO;
         let mut kv_quantize_dur = Duration::ZERO;
         let mut kv_upload_dur = Duration::ZERO;
-        let force_code_pred_recompute =
-            self.config.code_pred_hidden_size != self.config.hidden_size;
-
         while frames.len() < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
             let recent_tokens = Self::recent_codebook0_tokens_from_frames(&frames);
@@ -2025,14 +2093,19 @@ impl TtsTransformer {
                 break;
             }
             let t_cp = Instant::now();
-            let codebook_tokens = if force_code_pred_recompute {
-                self.predict_remaining_codebooks_recompute(
+            let codebook_tokens = if let (Some(cpu), Some(workspace)) = (
+                self.code_pred.cpu.as_ref(),
+                cpu_code_pred_workspace.as_mut(),
+            ) {
+                self.predict_remaining_codebooks_cpu_cached_with_workspace(
+                    cpu,
                     &step_outputs.hidden_state,
                     codebook_0_token,
-                    thread_count,
+                    code_pred_thread_count,
                     temperature,
                     top_k,
                     top_p,
+                    workspace,
                 )?
             } else {
                 self.predict_remaining_codebooks_kv_with_cache(
@@ -2843,6 +2916,7 @@ impl TtsTransformer {
         head_idx: Option<usize>,
         thread_count: usize,
         cache: &mut CodePredCpuKvCache,
+        scratch: &mut CodePredCpuScratch,
     ) -> Result<Option<Vec<f32>>, Qwen3TtsError> {
         let code_pred_hidden_size = self.config.code_pred_hidden_size as usize;
         let head_dim = self.config.head_dim as usize;
@@ -2860,72 +2934,70 @@ impl TtsTransformer {
             ));
         }
 
-        let mut x = projected_input.to_vec();
-        let mut tmp = vec![0.0f32; code_pred_hidden_size];
-        let mut q = vec![0.0f32; n_heads * head_dim];
-        let mut k = vec![0.0f32; n_kv_heads * head_dim];
-        let mut v = vec![0.0f32; n_kv_heads * head_dim];
-        let mut attn_out = vec![0.0f32; n_heads * head_dim];
-        let mut gate = vec![0.0f32; intermediate];
-        let mut up = vec![0.0f32; intermediate];
-        let mut ffn = vec![0.0f32; code_pred_hidden_size];
+        scratch.x.copy_from_slice(projected_input);
 
         for (layer_idx, layer) in cpu.layers.iter().enumerate() {
             rms_norm_one_cpu(
-                &x,
+                &scratch.x,
                 &layer.attn_norm,
                 code_pred_hidden_size,
                 self.config.rms_norm_eps,
-                &mut tmp,
+                &mut scratch.tmp,
             );
             linear_no_bias_cpu(
-                &tmp,
+                &scratch.tmp,
                 &layer.attn_q,
                 code_pred_hidden_size,
                 n_heads * head_dim,
-                &mut q,
+                &mut scratch.q,
                 thread_count,
             );
             linear_no_bias_cpu(
-                &tmp,
+                &scratch.tmp,
                 &layer.attn_k,
                 code_pred_hidden_size,
                 n_kv_heads * head_dim,
-                &mut k,
+                &mut scratch.k,
                 thread_count,
             );
             linear_no_bias_cpu(
-                &tmp,
+                &scratch.tmp,
                 &layer.attn_v,
                 code_pred_hidden_size,
                 n_kv_heads * head_dim,
-                &mut v,
+                &mut scratch.v,
                 thread_count,
             );
             rms_norm_rows_in_place_cpu(
-                &mut q,
+                &mut scratch.q,
                 &layer.attn_q_norm,
                 head_dim,
                 self.config.rms_norm_eps,
             );
             rms_norm_rows_in_place_cpu(
-                &mut k,
+                &mut scratch.k,
                 &layer.attn_k_norm,
                 head_dim,
                 self.config.rms_norm_eps,
             );
-            apply_rope_single_in_place_cpu(&mut q, pos, n_heads, head_dim, self.config.rope_theta);
             apply_rope_single_in_place_cpu(
-                &mut k,
+                &mut scratch.q,
+                pos,
+                n_heads,
+                head_dim,
+                self.config.rope_theta,
+            );
+            apply_rope_single_in_place_cpu(
+                &mut scratch.k,
                 pos,
                 n_kv_heads,
                 head_dim,
                 self.config.rope_theta,
             );
 
-            cache.write(layer_idx, pos, &k, &v)?;
+            cache.write(layer_idx, pos, &scratch.k, &scratch.v)?;
             attention_single_cpu(
-                &q,
+                &scratch.q,
                 &cache.k[layer_idx],
                 &cache.v[layer_idx],
                 pos + 1,
@@ -2934,55 +3006,55 @@ impl TtsTransformer {
                 kv_group,
                 head_dim,
                 cache.n_ctx,
-                &mut attn_out,
+                &mut scratch.attn_out,
             );
             linear_no_bias_cpu(
-                &attn_out,
+                &scratch.attn_out,
                 &layer.attn_output,
                 n_heads * head_dim,
                 code_pred_hidden_size,
-                &mut tmp,
+                &mut scratch.tmp,
                 thread_count,
             );
-            for (dst, add) in x.iter_mut().zip(&tmp) {
+            for (dst, add) in scratch.x.iter_mut().zip(&scratch.tmp) {
                 *dst += *add;
             }
 
             rms_norm_one_cpu(
-                &x,
+                &scratch.x,
                 &layer.ffn_norm,
                 code_pred_hidden_size,
                 self.config.rms_norm_eps,
-                &mut tmp,
+                &mut scratch.tmp,
             );
             linear_no_bias_cpu(
-                &tmp,
+                &scratch.tmp,
                 &layer.ffn_gate,
                 code_pred_hidden_size,
                 intermediate,
-                &mut gate,
+                &mut scratch.gate,
                 thread_count,
             );
             linear_no_bias_cpu(
-                &tmp,
+                &scratch.tmp,
                 &layer.ffn_up,
                 code_pred_hidden_size,
                 intermediate,
-                &mut up,
+                &mut scratch.up,
                 thread_count,
             );
-            for (g, u) in gate.iter_mut().zip(&up) {
+            for (g, u) in scratch.gate.iter_mut().zip(&scratch.up) {
                 *g = silu(*g) * *u;
             }
             linear_no_bias_cpu(
-                &gate,
+                &scratch.gate,
                 &layer.ffn_down,
                 intermediate,
                 code_pred_hidden_size,
-                &mut ffn,
+                &mut scratch.ffn,
                 thread_count,
             );
-            for (dst, add) in x.iter_mut().zip(&ffn) {
+            for (dst, add) in scratch.x.iter_mut().zip(&scratch.ffn) {
                 *dst += *add;
             }
         }
@@ -2991,26 +3063,25 @@ impl TtsTransformer {
             return Ok(None);
         };
         rms_norm_one_cpu(
-            &x,
+            &scratch.x,
             &cpu.output_norm,
             code_pred_hidden_size,
             self.config.rms_norm_eps,
-            &mut tmp,
+            &mut scratch.tmp,
         );
         let head = cpu
             .heads
             .get(head_idx)
             .ok_or_else(|| Qwen3TtsError::InvalidInput("missing code predictor head".into()))?;
-        let mut logits = vec![0.0f32; self.config.code_pred_vocab_size as usize];
         linear_no_bias_cpu(
-            &tmp,
+            &scratch.tmp,
             head,
             code_pred_hidden_size,
             self.config.code_pred_vocab_size as usize,
-            &mut logits,
+            &mut scratch.logits,
             thread_count,
         );
-        Ok(Some(logits))
+        Ok(Some(scratch.logits.clone()))
     }
 
     fn lookup_code_pred_embedding_row(
@@ -4989,6 +5060,79 @@ impl CodePredCpuKvCache {
         k[offset..offset + width].copy_from_slice(k_src);
         v[offset..offset + width].copy_from_slice(v_src);
         Ok(())
+    }
+
+    fn clear(&mut self) {
+        for layer in &mut self.k {
+            layer.fill(0.0);
+        }
+        for layer in &mut self.v {
+            layer.fill(0.0);
+        }
+    }
+}
+
+struct CodePredCpuWorkspace {
+    cache: CodePredCpuKvCache,
+    scratch: CodePredCpuScratch,
+    projected: Vec<f32>,
+}
+
+impl CodePredCpuWorkspace {
+    fn new(cfg: &TtsTransformerConfig, cpu: &CodePredCpuWeights, n_ctx: usize) -> Self {
+        Self {
+            cache: CodePredCpuKvCache::new(
+                cpu.layers.len(),
+                n_ctx,
+                cfg.n_key_value_heads as usize,
+                cfg.head_dim as usize,
+            ),
+            scratch: CodePredCpuScratch::new(cfg, cpu),
+            projected: vec![0.0; cfg.code_pred_hidden_size as usize],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.cache.clear();
+    }
+}
+
+struct CodePredCpuScratch {
+    x: Vec<f32>,
+    tmp: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn_out: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    ffn: Vec<f32>,
+    logits: Vec<f32>,
+}
+
+impl CodePredCpuScratch {
+    fn new(cfg: &TtsTransformerConfig, cpu: &CodePredCpuWeights) -> Self {
+        let code_pred_hidden_size = cfg.code_pred_hidden_size as usize;
+        let head_dim = cfg.head_dim as usize;
+        let n_heads = cfg.n_attention_heads as usize;
+        let n_kv_heads = cfg.n_key_value_heads as usize;
+        let intermediate = cpu
+            .layers
+            .first()
+            .map(|layer| layer.ffn_gate.len() / code_pred_hidden_size)
+            .unwrap_or(0);
+        Self {
+            x: vec![0.0; code_pred_hidden_size],
+            tmp: vec![0.0; code_pred_hidden_size],
+            q: vec![0.0; n_heads * head_dim],
+            k: vec![0.0; n_kv_heads * head_dim],
+            v: vec![0.0; n_kv_heads * head_dim],
+            attn_out: vec![0.0; n_heads * head_dim],
+            gate: vec![0.0; intermediate],
+            up: vec![0.0; intermediate],
+            ffn: vec![0.0; code_pred_hidden_size],
+            logits: vec![0.0; cfg.code_pred_vocab_size as usize],
+        }
     }
 }
 
