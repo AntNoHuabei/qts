@@ -2960,28 +2960,21 @@ impl TtsTransformer {
             );
             linear_no_bias_cpu(
                 &scratch.tmp,
-                &layer.attn_q,
+                &layer.attn_qkv,
                 code_pred_hidden_size,
-                n_heads * head_dim,
-                &mut scratch.q,
+                scratch.qkv.len(),
+                &mut scratch.qkv,
                 thread_count,
             );
-            linear_no_bias_cpu(
-                &scratch.tmp,
-                &layer.attn_k,
-                code_pred_hidden_size,
-                n_kv_heads * head_dim,
-                &mut scratch.k,
-                thread_count,
-            );
-            linear_no_bias_cpu(
-                &scratch.tmp,
-                &layer.attn_v,
-                code_pred_hidden_size,
-                n_kv_heads * head_dim,
-                &mut scratch.v,
-                thread_count,
-            );
+            let q_len = n_heads * head_dim;
+            let kv_len = n_kv_heads * head_dim;
+            scratch.q.copy_from_slice(&scratch.qkv[..q_len]);
+            scratch
+                .k
+                .copy_from_slice(&scratch.qkv[q_len..q_len + kv_len]);
+            scratch
+                .v
+                .copy_from_slice(&scratch.qkv[q_len + kv_len..q_len + kv_len * 2]);
             rms_norm_rows_in_place_cpu(
                 &mut scratch.q,
                 &layer.attn_q_norm,
@@ -3043,20 +3036,16 @@ impl TtsTransformer {
             );
             linear_no_bias_cpu(
                 &scratch.tmp,
-                &layer.ffn_gate,
+                &layer.ffn_gate_up,
                 code_pred_hidden_size,
-                intermediate,
-                &mut scratch.gate,
+                intermediate * 2,
+                &mut scratch.gate_up,
                 thread_count,
             );
-            linear_no_bias_cpu(
-                &scratch.tmp,
-                &layer.ffn_up,
-                code_pred_hidden_size,
-                intermediate,
-                &mut scratch.up,
-                thread_count,
-            );
+            scratch
+                .gate
+                .copy_from_slice(&scratch.gate_up[..intermediate]);
+            scratch.up.copy_from_slice(&scratch.gate_up[intermediate..]);
             for (g, u) in scratch.gate.iter_mut().zip(&scratch.up) {
                 *g = silu(*g) * *u;
             }
@@ -5025,10 +5014,12 @@ struct CodePredCpuLayerWeights {
     attn_q: Vec<f32>,
     attn_k: Vec<f32>,
     attn_v: Vec<f32>,
+    attn_qkv: Vec<f32>,
     attn_output: Vec<f32>,
     ffn_norm: Vec<f32>,
     ffn_gate: Vec<f32>,
     ffn_up: Vec<f32>,
+    ffn_gate_up: Vec<f32>,
     ffn_down: Vec<f32>,
 }
 
@@ -5115,10 +5106,12 @@ impl CodePredCpuWorkspace {
 struct CodePredCpuScratch {
     x: Vec<f32>,
     tmp: Vec<f32>,
+    qkv: Vec<f32>,
     q: Vec<f32>,
     k: Vec<f32>,
     v: Vec<f32>,
     attn_out: Vec<f32>,
+    gate_up: Vec<f32>,
     gate: Vec<f32>,
     up: Vec<f32>,
     ffn: Vec<f32>,
@@ -5139,10 +5132,12 @@ impl CodePredCpuScratch {
         Self {
             x: vec![0.0; code_pred_hidden_size],
             tmp: vec![0.0; code_pred_hidden_size],
+            qkv: vec![0.0; (n_heads + n_kv_heads * 2) * head_dim],
             q: vec![0.0; n_heads * head_dim],
             k: vec![0.0; n_kv_heads * head_dim],
             v: vec![0.0; n_kv_heads * head_dim],
             attn_out: vec![0.0; n_heads * head_dim],
+            gate_up: vec![0.0; intermediate * 2],
             gate: vec![0.0; intermediate],
             up: vec![0.0; intermediate],
             ffn: vec![0.0; code_pred_hidden_size],
@@ -5677,11 +5672,13 @@ impl CodePredCpuWeights {
             let (_, attn_q) = file.read_tensor_f32(&(prefix.clone() + "attn_q.weight"))?;
             let (_, attn_k) = file.read_tensor_f32(&(prefix.clone() + "attn_k.weight"))?;
             let (_, attn_v) = file.read_tensor_f32(&(prefix.clone() + "attn_v.weight"))?;
+            let attn_qkv = concat_linear_weights_cpu(&[&attn_q, &attn_k, &attn_v]);
             let (_, attn_output) =
                 file.read_tensor_f32(&(prefix.clone() + "attn_output.weight"))?;
             let (_, ffn_norm) = file.read_tensor_f32(&(prefix.clone() + "ffn_norm.weight"))?;
             let (_, ffn_gate) = file.read_tensor_f32(&(prefix.clone() + "ffn_gate.weight"))?;
             let (_, ffn_up) = file.read_tensor_f32(&(prefix.clone() + "ffn_up.weight"))?;
+            let ffn_gate_up = concat_linear_weights_cpu(&[&ffn_gate, &ffn_up]);
             let (_, ffn_down) = file.read_tensor_f32(&(prefix.clone() + "ffn_down.weight"))?;
             layers.push(CodePredCpuLayerWeights {
                 attn_norm,
@@ -5690,10 +5687,12 @@ impl CodePredCpuWeights {
                 attn_q,
                 attn_k,
                 attn_v,
+                attn_qkv,
                 attn_output,
                 ffn_norm,
                 ffn_gate,
                 ffn_up,
+                ffn_gate_up,
                 ffn_down,
             });
         }
@@ -5800,6 +5799,15 @@ fn try_read_code_pred_projected_embedding_tables_cpu(
         tables.push(data);
     }
     Some(tables)
+}
+
+fn concat_linear_weights_cpu(weights: &[&[f32]]) -> Vec<f32> {
+    let total_len = weights.iter().map(|weight| weight.len()).sum();
+    let mut out = Vec::with_capacity(total_len);
+    for weight in weights {
+        out.extend_from_slice(weight);
+    }
+    out
 }
 
 fn linear_cpu(
