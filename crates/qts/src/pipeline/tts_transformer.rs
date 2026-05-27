@@ -197,6 +197,8 @@ struct KvWritebackTensorDownloads {
     v_data: Vec<f32>,
 }
 
+const CUSTOMVOICE_GREEDY_STABILITY_EPS: f32 = 0.01;
+
 impl TtsTransformer {
     fn recent_codebook0_tokens_from_frames(frames: &[SelectedCodecFrame]) -> Vec<i32> {
         frames.iter().map(|frame| frame.codebook_0_token).collect()
@@ -389,13 +391,17 @@ impl TtsTransformer {
             cfg.english_language_id,
         );
 
-        let force_cpu_talker = cfg.code_pred_hidden_size != cfg.hidden_size;
+        let is_custom_voice = cfg.code_pred_hidden_size != cfg.hidden_size;
+        let force_cpu_talker = is_custom_voice
+            && std::env::var("QTS_CUSTOMVOICE_FORCE_CPU_TALKER")
+                .map(|value| value.trim() == "1")
+                .unwrap_or(false);
         let talker_backends = if force_cpu_talker {
             BackendSet::cpu()?
         } else {
             BackendSet::new()?
         };
-        let code_pred_backends = if force_cpu_talker {
+        let code_pred_backends = if is_custom_voice {
             BackendSet::cpu()?
         } else {
             BackendSet::new()?
@@ -569,7 +575,8 @@ impl TtsTransformer {
             tts_pad_plus_codec_bos[h] = tts_pad_embed[h] + codec_bos_embed[h];
         }
 
-        let prefill_len = instruct_len + 3 + codec_plus_overlay_len + text_plus_codec_pad.len() / hidden_size + 1;
+        let prefill_len =
+            instruct_len + 3 + codec_plus_overlay_len + text_plus_codec_pad.len() / hidden_size + 1;
         let mut prefill_embd = vec![0.0f32; prefill_len * hidden_size];
         if !instruct_proj.is_empty() {
             prefill_embd[..instruct_proj.len()].copy_from_slice(&instruct_proj);
@@ -1081,7 +1088,7 @@ impl TtsTransformer {
                 prev_codes,
                 thread_count,
             )?;
-            let token = select_token(&logits, 1.0, temperature, top_k, top_p, &[])?;
+            let token = self.select_code_pred_token(&logits, temperature, top_k, top_p)?;
             codebook_tokens.push(token);
         }
 
@@ -1114,7 +1121,7 @@ impl TtsTransformer {
                 prev_codes,
                 thread_count,
             )?;
-            let selected_token = select_token(&logits, 1.0, 0.0, 0, 1.0, &[])?;
+            let selected_token = self.select_code_pred_token(&logits, 0.0, 0, 1.0)?;
             let mut top_logits = logits
                 .iter()
                 .copied()
@@ -1140,6 +1147,19 @@ impl TtsTransformer {
         }
 
         Ok(steps)
+    }
+
+    fn select_code_pred_token(
+        &self,
+        logits: &[f32],
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+    ) -> Result<i32, Qwen3TtsError> {
+        if self.config.code_pred_hidden_size != self.config.hidden_size && temperature <= 0.0 {
+            return select_token_stable(logits, CUSTOMVOICE_GREEDY_STABILITY_EPS);
+        }
+        select_token(logits, 1.0, temperature, top_k, top_p, &[])
     }
 
     pub fn predict_remaining_codebooks_kv(
@@ -1217,13 +1237,11 @@ impl TtsTransformer {
             thread_count,
             cache,
         )?;
-        codebook_tokens.push(select_token(
+        codebook_tokens.push(self.select_code_pred_token(
             &first.logits,
-            1.0,
             temperature,
             top_k,
             top_p,
-            &[],
         )?);
 
         while codebook_tokens.len() < self.config.n_codebooks as usize {
@@ -1238,13 +1256,11 @@ impl TtsTransformer {
                 thread_count,
                 cache,
             )?;
-            codebook_tokens.push(select_token(
+            codebook_tokens.push(self.select_code_pred_token(
                 &outputs.logits,
-                1.0,
                 temperature,
                 top_k,
                 top_p,
-                &[],
             )?);
         }
 
@@ -1302,15 +1318,13 @@ impl TtsTransformer {
         )?;
         let mut codebook_tokens = Vec::with_capacity(n_codebooks);
         codebook_tokens.push(codebook_0_token);
-        codebook_tokens.push(select_token(
+        codebook_tokens.push(self.select_code_pred_token(
             first.as_deref().ok_or_else(|| {
                 Qwen3TtsError::InvalidInput("missing code predictor logits".into())
             })?,
-            1.0,
             temperature,
             top_k,
             top_p,
-            &[],
         )?);
 
         while codebook_tokens.len() < n_codebooks {
@@ -1332,15 +1346,13 @@ impl TtsTransformer {
                 code_pred_thread_count,
                 &mut cache,
             )?;
-            codebook_tokens.push(select_token(
+            codebook_tokens.push(self.select_code_pred_token(
                 outputs.as_deref().ok_or_else(|| {
                     Qwen3TtsError::InvalidInput("missing code predictor logits".into())
                 })?,
-                1.0,
                 temperature,
                 top_k,
                 top_p,
-                &[],
             )?);
         }
 
@@ -1693,7 +1705,8 @@ impl TtsTransformer {
         let mut kv_download_dur = Duration::ZERO;
         let mut kv_quantize_dur = Duration::ZERO;
         let mut kv_upload_dur = Duration::ZERO;
-        let force_code_pred_recompute = self.config.code_pred_hidden_size != self.config.hidden_size;
+        let force_code_pred_recompute =
+            self.config.code_pred_hidden_size != self.config.hidden_size;
         let mut debug_step_embeddings = Vec::new();
         let mut debug_trailing_rows = Vec::new();
 
@@ -1962,7 +1975,8 @@ impl TtsTransformer {
         let mut kv_download_dur = Duration::ZERO;
         let mut kv_quantize_dur = Duration::ZERO;
         let mut kv_upload_dur = Duration::ZERO;
-        let force_code_pred_recompute = self.config.code_pred_hidden_size != self.config.hidden_size;
+        let force_code_pred_recompute =
+            self.config.code_pred_hidden_size != self.config.hidden_size;
 
         while frames.len() < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
@@ -2257,32 +2271,32 @@ impl TtsTransformer {
                 self.talker.codec_embd_cpu.as_ref(),
                 self.code_pred.codec_embd_cpu.as_ref(),
             ) {
-            let expected_pred = codebook_tokens.len().saturating_sub(1);
-            if pred_tables.len() == expected_pred {
-                let mut out = vec![0.0f32; hidden_size];
-                let token0 = codebook_tokens[0] as usize;
-                let row0 = token0 * hidden_size..(token0 + 1) * hidden_size;
-                if row0.end <= codec_table.len() {
-                    out.copy_from_slice(&codec_table[row0]);
-                    let mut cpu_ok = true;
-                    for (cb_idx, &token) in codebook_tokens[1..].iter().enumerate() {
-                        let tok = token as usize;
-                        let row = tok * hidden_size..(tok + 1) * hidden_size;
-                        let table = &pred_tables[cb_idx];
-                        if row.end > table.len() {
-                            cpu_ok = false;
-                            break;
+                let expected_pred = codebook_tokens.len().saturating_sub(1);
+                if pred_tables.len() == expected_pred {
+                    let mut out = vec![0.0f32; hidden_size];
+                    let token0 = codebook_tokens[0] as usize;
+                    let row0 = token0 * hidden_size..(token0 + 1) * hidden_size;
+                    if row0.end <= codec_table.len() {
+                        out.copy_from_slice(&codec_table[row0]);
+                        let mut cpu_ok = true;
+                        for (cb_idx, &token) in codebook_tokens[1..].iter().enumerate() {
+                            let tok = token as usize;
+                            let row = tok * hidden_size..(tok + 1) * hidden_size;
+                            let table = &pred_tables[cb_idx];
+                            if row.end > table.len() {
+                                cpu_ok = false;
+                                break;
+                            }
+                            for i in 0..hidden_size {
+                                out[i] += table[row.start + i];
+                            }
                         }
-                        for i in 0..hidden_size {
-                            out[i] += table[row.start + i];
+                        if cpu_ok {
+                            return Ok(out);
                         }
-                    }
-                    if cpu_ok {
-                        return Ok(out);
                     }
                 }
             }
-        }
         }
 
         let mut out = self.lookup_codec_embedding_rows(&[codebook_tokens[0]], thread_count)?;
@@ -2325,8 +2339,7 @@ impl TtsTransformer {
             ));
         }
 
-        let mut sequence_embd =
-            Vec::with_capacity((2 + prev_codes.len()) * talker_hidden_size);
+        let mut sequence_embd = Vec::with_capacity((2 + prev_codes.len()) * talker_hidden_size);
         sequence_embd.extend_from_slice(hidden_state);
         sequence_embd.extend_from_slice(
             &self.lookup_codec_embedding_rows(&[codebook_0_token], thread_count)?,
@@ -2582,8 +2595,7 @@ impl TtsTransformer {
             ));
         }
 
-        let mut sequence_embd =
-            Vec::with_capacity((2 + prev_codes.len()) * talker_hidden_size);
+        let mut sequence_embd = Vec::with_capacity((2 + prev_codes.len()) * talker_hidden_size);
         sequence_embd.extend_from_slice(hidden_state);
         sequence_embd.extend_from_slice(
             &self.lookup_codec_embedding_rows(&[codebook_0_token], thread_count)?,
@@ -2668,10 +2680,26 @@ impl TtsTransformer {
                 &mut v,
                 thread_count,
             );
-            rms_norm_rows_in_place_cpu(&mut q, &layer.attn_q_norm, head_dim, self.config.rms_norm_eps);
-            rms_norm_rows_in_place_cpu(&mut k, &layer.attn_k_norm, head_dim, self.config.rms_norm_eps);
+            rms_norm_rows_in_place_cpu(
+                &mut q,
+                &layer.attn_q_norm,
+                head_dim,
+                self.config.rms_norm_eps,
+            );
+            rms_norm_rows_in_place_cpu(
+                &mut k,
+                &layer.attn_k_norm,
+                head_dim,
+                self.config.rms_norm_eps,
+            );
             apply_rope_in_place_cpu(&mut q, n_tokens, n_heads, head_dim, self.config.rope_theta);
-            apply_rope_in_place_cpu(&mut k, n_tokens, n_kv_heads, head_dim, self.config.rope_theta);
+            apply_rope_in_place_cpu(
+                &mut k,
+                n_tokens,
+                n_kv_heads,
+                head_dim,
+                self.config.rope_theta,
+            );
             attention_cpu(
                 &q,
                 &k,
@@ -2746,14 +2774,20 @@ impl TtsTransformer {
             self.config.rms_norm_eps,
             &mut tmp,
         );
-        let last =
-            &tmp[(n_tokens - 1) * code_pred_hidden_size..n_tokens * code_pred_hidden_size];
+        let last = &tmp[(n_tokens - 1) * code_pred_hidden_size..n_tokens * code_pred_hidden_size];
         let head = cpu
             .heads
             .get(prev_codes.len())
             .ok_or_else(|| Qwen3TtsError::InvalidInput("missing code predictor head".into()))?;
         let mut logits = vec![0.0f32; vocab];
-        linear_no_bias_cpu(last, head, code_pred_hidden_size, vocab, &mut logits, thread_count);
+        linear_no_bias_cpu(
+            last,
+            head,
+            code_pred_hidden_size,
+            vocab,
+            &mut logits,
+            thread_count,
+        );
         Ok(logits)
     }
 
@@ -2868,10 +2902,26 @@ impl TtsTransformer {
                 &mut v,
                 thread_count,
             );
-            rms_norm_rows_in_place_cpu(&mut q, &layer.attn_q_norm, head_dim, self.config.rms_norm_eps);
-            rms_norm_rows_in_place_cpu(&mut k, &layer.attn_k_norm, head_dim, self.config.rms_norm_eps);
+            rms_norm_rows_in_place_cpu(
+                &mut q,
+                &layer.attn_q_norm,
+                head_dim,
+                self.config.rms_norm_eps,
+            );
+            rms_norm_rows_in_place_cpu(
+                &mut k,
+                &layer.attn_k_norm,
+                head_dim,
+                self.config.rms_norm_eps,
+            );
             apply_rope_single_in_place_cpu(&mut q, pos, n_heads, head_dim, self.config.rope_theta);
-            apply_rope_single_in_place_cpu(&mut k, pos, n_kv_heads, head_dim, self.config.rope_theta);
+            apply_rope_single_in_place_cpu(
+                &mut k,
+                pos,
+                n_kv_heads,
+                head_dim,
+                self.config.rope_theta,
+            );
 
             cache.write(layer_idx, pos, &k, &v)?;
             attention_single_cpu(
@@ -3078,7 +3128,8 @@ impl TtsTransformer {
             )
         })?;
 
-        let mut cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), weight.as_ptr(), inp_embd.as_ptr()) };
+        let mut cur =
+            unsafe { sys::ggml_mul_mat(ctx.as_ptr(), weight.as_ptr(), inp_embd.as_ptr()) };
         cur = unsafe { sys::ggml_add(ctx.as_ptr(), cur, bias.as_ptr()) };
         cur = unsafe { sys::ggml_cast(ctx.as_ptr(), cur, sys::ggml_type_GGML_TYPE_F32) };
         unsafe {
@@ -3175,7 +3226,8 @@ impl TtsTransformer {
                 1,
             )
         };
-        let mut inp_l = unsafe { sys::ggml_concat(ctx.as_ptr(), hidden_2d, inp_cb0_embd.as_ptr(), 1) };
+        let mut inp_l =
+            unsafe { sys::ggml_concat(ctx.as_ptr(), hidden_2d, inp_cb0_embd.as_ptr(), 1) };
         let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
         let mut attn_softmax_mask: Option<(*mut sys::ggml_tensor, Vec<f32>)> = None;
 
@@ -3430,7 +3482,8 @@ impl TtsTransformer {
         })?;
         let pos = n_past as i32;
 
-        let looked_up = self.lookup_code_pred_embedding_row(generation_step - 1, prev_code, thread_count)?;
+        let looked_up =
+            self.lookup_code_pred_embedding_row(generation_step - 1, prev_code, thread_count)?;
         let projected_lookup =
             self.project_code_pred_input_if_needed(&looked_up, 1, thread_count)?;
         let inp_code_embd = unsafe {
@@ -4643,16 +4696,43 @@ impl TalkerWeights {
         let tensor_count = 8 + cfg.n_layers as usize * 12;
         let ctx = OwnedContext::new_for_tensor_metadata(tensor_count)?;
 
-        let text_embd = load_tensor_into_context(file, ctx.as_ptr(), "talker.text_embd.weight")?;
-        let text_proj_fc1 =
-            load_tensor_into_context(file, ctx.as_ptr(), "talker.text_proj.fc1.weight")?;
-        let text_proj_fc1_bias =
-            load_tensor_into_context(file, ctx.as_ptr(), "talker.text_proj.fc1.bias")?;
-        let text_proj_fc2 =
-            load_tensor_into_context(file, ctx.as_ptr(), "talker.text_proj.fc2.weight")?;
-        let text_proj_fc2_bias =
-            load_tensor_into_context(file, ctx.as_ptr(), "talker.text_proj.fc2.bias")?;
-        let codec_embd = load_tensor_into_context(file, ctx.as_ptr(), "talker.codec_embd.weight")?;
+        let force_f32_core = cfg.code_pred_hidden_size != cfg.hidden_size;
+        let text_embd = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.text_embd.weight",
+            force_f32_core,
+        )?;
+        let text_proj_fc1 = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.text_proj.fc1.weight",
+            force_f32_core,
+        )?;
+        let text_proj_fc1_bias = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.text_proj.fc1.bias",
+            force_f32_core,
+        )?;
+        let text_proj_fc2 = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.text_proj.fc2.weight",
+            force_f32_core,
+        )?;
+        let text_proj_fc2_bias = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.text_proj.fc2.bias",
+            force_f32_core,
+        )?;
+        let codec_embd = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.codec_embd.weight",
+            force_f32_core,
+        )?;
         let hidden_u = cfg.hidden_size as usize;
         let codec_vocab_u = cfg.codec_vocab_size as usize;
         let codec_embd_cpu = try_read_embedding_matrix_f32(
@@ -4662,65 +4742,89 @@ impl TalkerWeights {
             hidden_u,
             codec_vocab_u,
         );
-        let output_norm =
-            load_tensor_into_context(file, ctx.as_ptr(), "talker.output_norm.weight")?;
-        let codec_head = load_tensor_into_context(file, ctx.as_ptr(), "talker.codec_head.weight")?;
+        let output_norm = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.output_norm.weight",
+            force_f32_core,
+        )?;
+        let codec_head = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.codec_head.weight",
+            force_f32_core,
+        )?;
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
         for layer_idx in 0..cfg.n_layers {
             let prefix = format!("talker.blk.{layer_idx}.");
             let ffn_down_name = prefix.clone() + "ffn_down.weight";
             layers.push(TalkerLayerWeights {
-                attn_norm: load_tensor_into_context(
+                attn_norm: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_norm.weight"),
+                    force_f32_core,
                 )?,
-                attn_q_norm: load_optional_tensor_into_context(
+                attn_q_norm: load_optional_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_q_norm.weight"),
+                    force_f32_core,
                 )?,
-                attn_k_norm: load_optional_tensor_into_context(
+                attn_k_norm: load_optional_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_k_norm.weight"),
+                    force_f32_core,
                 )?,
-                attn_q: load_tensor_into_context(
+                attn_q: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_q.weight"),
+                    force_f32_core,
                 )?,
-                attn_k: load_tensor_into_context(
+                attn_k: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_k.weight"),
+                    force_f32_core,
                 )?,
-                attn_v: load_tensor_into_context(
+                attn_v: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_v.weight"),
+                    force_f32_core,
                 )?,
-                attn_output: load_tensor_into_context(
+                attn_output: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_output.weight"),
+                    force_f32_core,
                 )?,
-                ffn_norm: load_tensor_into_context(
+                ffn_norm: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "ffn_norm.weight"),
+                    force_f32_core,
                 )?,
-                ffn_gate: load_tensor_into_context(
+                ffn_gate: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "ffn_gate.weight"),
+                    force_f32_core,
                 )?,
-                ffn_up: load_tensor_into_context(
+                ffn_up: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "ffn_up.weight"),
+                    force_f32_core,
                 )?,
-                ffn_down: load_tensor_into_context(file, ctx.as_ptr(), &ffn_down_name)?,
+                ffn_down: load_talker_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &ffn_down_name,
+                    force_f32_core,
+                )?,
                 ffn_down_f32: load_tensor_f32_into_context(file, ctx.as_ptr(), &ffn_down_name)?,
             });
         }
@@ -4736,10 +4840,7 @@ impl TalkerWeights {
             ("talker.output_norm.weight", output_norm),
             ("talker.codec_head.weight", codec_head),
         ] {
-            let (_, raw) = file.read_tensor_bytes(name)?;
-            unsafe {
-                sys::ggml_backend_tensor_set(tensor.as_ptr(), raw.as_ptr().cast(), 0, raw.len());
-            }
+            upload_talker_tensor(file, name, tensor, force_f32_core)?;
         }
         for (layer_idx, layer) in layers.iter().enumerate() {
             for (suffix, tensor) in [
@@ -4757,15 +4858,7 @@ impl TalkerWeights {
             ] {
                 if let Some(tensor) = tensor {
                     let name = format!("talker.blk.{layer_idx}.{suffix}");
-                    let (_, raw) = file.read_tensor_bytes(&name)?;
-                    unsafe {
-                        sys::ggml_backend_tensor_set(
-                            tensor.as_ptr(),
-                            raw.as_ptr().cast(),
-                            0,
-                            raw.len(),
-                        );
-                    }
+                    upload_talker_tensor(file, &name, tensor, force_f32_core)?;
                 }
             }
             if let Some(tensor) = layer.ffn_down_f32 {
@@ -5174,8 +5267,10 @@ impl CodePredWeights {
         }
         let per_codebook = (cfg.n_codebooks - 1) as usize;
         let has_input_proj = cfg.code_pred_hidden_size != cfg.hidden_size;
-        let tensor_count =
-            1 + per_codebook * 2 + cfg.code_pred_layers as usize * 12 + usize::from(has_input_proj) * 2;
+        let tensor_count = 1
+            + per_codebook * 2
+            + cfg.code_pred_layers as usize * 12
+            + usize::from(has_input_proj) * 2;
         let ctx = OwnedContext::new_for_tensor_metadata(tensor_count)?;
 
         let input_proj_weight = if has_input_proj {
@@ -5403,7 +5498,8 @@ impl CodePredCpuWeights {
         let mut embeddings = Vec::with_capacity(per_codebook);
         let mut heads = Vec::with_capacity(per_codebook);
         for cb_idx in 0..per_codebook {
-            let (_, embd) = file.read_tensor_f32(&format!("code_pred.codec_embd.{cb_idx}.weight"))?;
+            let (_, embd) =
+                file.read_tensor_f32(&format!("code_pred.codec_embd.{cb_idx}.weight"))?;
             embeddings.push(embd);
             let (_, head) = file.read_tensor_f32(&format!("code_pred.lm_head.{cb_idx}.weight"))?;
             heads.push(head);
@@ -5413,12 +5509,15 @@ impl CodePredCpuWeights {
         for layer_idx in 0..cfg.code_pred_layers {
             let prefix = format!("code_pred.blk.{layer_idx}.");
             let (_, attn_norm) = file.read_tensor_f32(&(prefix.clone() + "attn_norm.weight"))?;
-            let (_, attn_q_norm) = file.read_tensor_f32(&(prefix.clone() + "attn_q_norm.weight"))?;
-            let (_, attn_k_norm) = file.read_tensor_f32(&(prefix.clone() + "attn_k_norm.weight"))?;
+            let (_, attn_q_norm) =
+                file.read_tensor_f32(&(prefix.clone() + "attn_q_norm.weight"))?;
+            let (_, attn_k_norm) =
+                file.read_tensor_f32(&(prefix.clone() + "attn_k_norm.weight"))?;
             let (_, attn_q) = file.read_tensor_f32(&(prefix.clone() + "attn_q.weight"))?;
             let (_, attn_k) = file.read_tensor_f32(&(prefix.clone() + "attn_k.weight"))?;
             let (_, attn_v) = file.read_tensor_f32(&(prefix.clone() + "attn_v.weight"))?;
-            let (_, attn_output) = file.read_tensor_f32(&(prefix.clone() + "attn_output.weight"))?;
+            let (_, attn_output) =
+                file.read_tensor_f32(&(prefix.clone() + "attn_output.weight"))?;
             let (_, ffn_norm) = file.read_tensor_f32(&(prefix.clone() + "ffn_norm.weight"))?;
             let (_, ffn_gate) = file.read_tensor_f32(&(prefix.clone() + "ffn_gate.weight"))?;
             let (_, ffn_up) = file.read_tensor_f32(&(prefix.clone() + "ffn_up.weight"))?;
@@ -5543,8 +5642,7 @@ fn dot_product_cpu(input: &[f32], weights: &[f32]) -> f32 {
     debug_assert_eq!(input.len(), weights.len());
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma")
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
             return unsafe { dot_product_avx2_fma(input, weights) };
         }
@@ -5786,10 +5884,7 @@ fn attention_single_cpu(
             }
             scores[k_pos] = dot * scale;
         }
-        let max_score = scores
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut denom = 0.0f32;
         for score in &mut scores {
             *score = (*score - max_score).exp();
@@ -5871,6 +5966,56 @@ fn load_tensor_into_context(
     NonNull::new(tensor).ok_or_else(|| Qwen3TtsError::InvalidTensor(name.into()))
 }
 
+fn load_talker_tensor_into_context(
+    file: &GgufFile,
+    ctx: *mut sys::ggml_context,
+    name: &str,
+    force_f32: bool,
+) -> Result<NonNull<sys::ggml_tensor>, Qwen3TtsError> {
+    if !force_f32 {
+        return load_tensor_into_context(file, ctx, name);
+    }
+    let info = file.tensor_info(name)?;
+    let mut ne = [1i64; 4];
+    for (idx, dim) in info.dims.iter().copied().enumerate() {
+        ne[idx] = dim as i64;
+    }
+    let tensor = unsafe {
+        sys::ggml_new_tensor(
+            ctx,
+            sys::ggml_type_GGML_TYPE_F32,
+            info.dims.len() as i32,
+            ne.as_ptr(),
+        )
+    };
+    NonNull::new(tensor).ok_or_else(|| Qwen3TtsError::InvalidTensor(name.into()))
+}
+
+fn upload_talker_tensor(
+    file: &GgufFile,
+    name: &str,
+    tensor: NonNull<sys::ggml_tensor>,
+    force_f32: bool,
+) -> Result<(), Qwen3TtsError> {
+    if force_f32 {
+        let (_, data) = file.read_tensor_f32(name)?;
+        unsafe {
+            sys::ggml_backend_tensor_set(
+                tensor.as_ptr(),
+                data.as_ptr().cast(),
+                0,
+                std::mem::size_of_val(data.as_slice()),
+            );
+        }
+    } else {
+        let (_, raw) = file.read_tensor_bytes(name)?;
+        unsafe {
+            sys::ggml_backend_tensor_set(tensor.as_ptr(), raw.as_ptr().cast(), 0, raw.len());
+        }
+    }
+    Ok(())
+}
+
 fn load_tensor_f32_into_context(
     file: &GgufFile,
     ctx: *mut sys::ggml_context,
@@ -5899,6 +6044,19 @@ fn load_tensor_f32_into_context(
         )
     };
     Ok(NonNull::new(tensor))
+}
+
+fn load_optional_talker_tensor_into_context(
+    file: &GgufFile,
+    ctx: *mut sys::ggml_context,
+    name: &str,
+    force_f32: bool,
+) -> Result<Option<NonNull<sys::ggml_tensor>>, Qwen3TtsError> {
+    match file.tensor_info(name) {
+        Ok(_) => load_talker_tensor_into_context(file, ctx, name, force_f32).map(Some),
+        Err(Qwen3TtsError::MissingTensor(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn load_optional_tensor_into_context(
@@ -6082,9 +6240,35 @@ fn select_token(
         .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to sample token".into()))
 }
 
+fn select_token_stable(logits: &[f32], epsilon: f32) -> Result<i32, Qwen3TtsError> {
+    if logits.is_empty() {
+        return Err(Qwen3TtsError::InvalidInput(
+            "logits must not be empty".into(),
+        ));
+    }
+    let best = logits
+        .iter()
+        .copied()
+        .filter(|logit| logit.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !best.is_finite() {
+        return Err(Qwen3TtsError::InvalidInput(
+            "all candidate logits were filtered out".into(),
+        ));
+    }
+    logits
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, logit)| logit.is_finite() && best - *logit <= epsilon)
+        .map(|(idx, _)| idx as i32)
+        .min()
+        .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to select stable token".into()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::select_token;
+    use super::{select_token, select_token_stable};
 
     #[test]
     fn select_token_prefers_best_logit() {
@@ -6101,6 +6285,12 @@ mod tests {
     #[test]
     fn select_token_prefers_first_max_when_greedy_tied() {
         let token = select_token(&[1.0, 2.0, 2.0, 0.5], 1.0, 0.0, 0, 1.0, &[]).unwrap();
+        assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn select_token_stable_prefers_lowest_near_tie() {
+        let token = select_token_stable(&[0.0, 1.0, 1.005, 0.5], 0.01).unwrap();
         assert_eq!(token, 1);
     }
 }

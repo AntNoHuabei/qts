@@ -77,15 +77,12 @@ impl CustomVoiceMetadata {
 
     pub fn speaker_token_id(&self, speaker: &str) -> Result<i32, Qwen3TtsError> {
         let normalized = speaker.trim().to_ascii_lowercase();
-        self.speaker_ids
-            .get(&normalized)
-            .copied()
-            .ok_or_else(|| {
-                Qwen3TtsError::InvalidInput(format!(
-                    "unsupported custom voice speaker '{speaker}' (supported: {})",
-                    self.supported_speakers.join(", ")
-                ))
-            })
+        self.speaker_ids.get(&normalized).copied().ok_or_else(|| {
+            Qwen3TtsError::InvalidInput(format!(
+                "unsupported custom voice speaker '{speaker}' (supported: {})",
+                self.supported_speakers.join(", ")
+            ))
+        })
     }
 
     pub fn resolve_language_id(&self, requested_language_id: i32, speaker: &str) -> i32 {

@@ -3,8 +3,8 @@
 //! Output sample rate for the published Qwen3-TTS checkpoints.
 pub const SAMPLE_RATE_HZ: u32 = 24_000;
 
-mod error;
 mod custom_voice;
+mod error;
 mod model;
 pub mod pipeline;
 mod synthesis_profile;
@@ -391,8 +391,12 @@ impl Qwen3TtsEngine {
         custom_voice: Option<CustomVoiceConditioning<'_>>,
         timings: Option<&mut SynthesisStageTimings>,
     ) -> Result<SynthesizeResult, Qwen3TtsError> {
-        let prepared =
-            self.prepare_synthesis(req, speaker_embedding_override, voice_clone_prompt, custom_voice)?;
+        let prepared = self.prepare_synthesis(
+            req,
+            speaker_embedding_override,
+            voice_clone_prompt,
+            custom_voice,
+        )?;
 
         if req.vocoder_chunk_size > 0 {
             self.synthesize_pipelined(req, &prepared, timings)
@@ -413,8 +417,12 @@ impl Qwen3TtsEngine {
     where
         S: StreamingSynthesis + Send,
     {
-        let prepared =
-            self.prepare_synthesis(req, speaker_embedding_override, voice_clone_prompt, custom_voice)?;
+        let prepared = self.prepare_synthesis(
+            req,
+            speaker_embedding_override,
+            voice_clone_prompt,
+            custom_voice,
+        )?;
 
         if req.vocoder_chunk_size > 0 {
             self.synthesize_pipelined_streaming(req, &prepared, sink, timings)
@@ -430,8 +438,12 @@ impl Qwen3TtsEngine {
         voice_clone_prompt: Option<&VoiceClonePromptV2>,
         custom_voice: Option<CustomVoiceConditioning<'_>>,
     ) -> Result<SynthesizeDebugResult, Qwen3TtsError> {
-        let prepared =
-            self.prepare_synthesis(req, speaker_embedding_override, voice_clone_prompt, custom_voice)?;
+        let prepared = self.prepare_synthesis(
+            req,
+            speaker_embedding_override,
+            voice_clone_prompt,
+            custom_voice,
+        )?;
         let codec_rollout = self.transformer.rollout_codec_frames_kv(
             &prepared.prepared_inputs.prefill_embd,
             &prepared.prepared_inputs.trailing_text_hidden,
@@ -562,13 +574,17 @@ impl Qwen3TtsEngine {
             let instruct_tokens = custom_voice
                 .instruct
                 .filter(|text| !text.trim().is_empty())
-                .map_or_else(Vec::new, |text| self.tokenizer.encode_instruct_for_tts(text));
+                .map_or_else(Vec::new, |text| {
+                    self.tokenizer.encode_instruct_for_tts(text)
+                });
             (
                 self.transformer.build_prefill_inputs(
                     PrefillConditioning {
                         text_tokens: &text_tokens,
                         instruct_tokens: &instruct_tokens,
-                        speaker_embd: speaker_embedding.as_ref().map(SpeakerEmbeddingStorage::as_slice),
+                        speaker_embd: speaker_embedding
+                            .as_ref()
+                            .map(SpeakerEmbeddingStorage::as_slice),
                         ref_codebook_0: &[],
                         language_id: effective_language_id,
                     },
@@ -580,7 +596,9 @@ impl Qwen3TtsEngine {
             let speaker_embedding = if let Some(speaker_embedding) = speaker_embedding_override {
                 Some(SpeakerEmbeddingStorage::Borrowed(speaker_embedding))
             } else {
-                Some(SpeakerEmbeddingStorage::Borrowed(prompt.speaker_embedding()))
+                Some(SpeakerEmbeddingStorage::Borrowed(
+                    prompt.speaker_embedding(),
+                ))
             };
             if prompt.icl_mode {
                 let text_tokens = self.tokenizer.encode_for_tts(&req.text);
@@ -590,7 +608,9 @@ impl Qwen3TtsEngine {
                         IclPrefillConditioning {
                             text_tokens: &text_tokens,
                             ref_text_tokens: &ref_text_tokens,
-                            speaker_embd: speaker_embedding.as_ref().map(SpeakerEmbeddingStorage::as_slice),
+                            speaker_embd: speaker_embedding
+                                .as_ref()
+                                .map(SpeakerEmbeddingStorage::as_slice),
                             ref_code_frames: &prompt_frames,
                             language_id: req.language_id,
                         },
@@ -609,7 +629,9 @@ impl Qwen3TtsEngine {
                         PrefillConditioning {
                             text_tokens: &text_tokens,
                             instruct_tokens: &[],
-                            speaker_embd: speaker_embedding.as_ref().map(SpeakerEmbeddingStorage::as_slice),
+                            speaker_embd: speaker_embedding
+                                .as_ref()
+                                .map(SpeakerEmbeddingStorage::as_slice),
                             ref_codebook_0: &ref_codebook_0,
                             language_id: req.language_id,
                         },
@@ -633,7 +655,9 @@ impl Qwen3TtsEngine {
                     PrefillConditioning {
                         text_tokens: &text_tokens,
                         instruct_tokens: &[],
-                        speaker_embd: speaker_embedding.as_ref().map(SpeakerEmbeddingStorage::as_slice),
+                        speaker_embd: speaker_embedding
+                            .as_ref()
+                            .map(SpeakerEmbeddingStorage::as_slice),
                         ref_codebook_0: &[],
                         language_id: req.language_id,
                     },

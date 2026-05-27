@@ -4,8 +4,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
-use serde::Serialize;
 use qts::{CodePredDebugStep, Qwen3TtsEngine, SynthesisStageTimings, VoiceClonePromptV2};
+use serde::Serialize;
 
 mod cli_support;
 mod tui;
@@ -129,11 +129,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
                 engine.synthesize_with_voice_clone_prompt_profile(&request, prompt)?
             }
             LoadedConditioning::CustomVoice { speaker, instruct } => engine
-                .synthesize_with_custom_voice_profile(
-                    &request,
-                    speaker,
-                    instruct.as_deref(),
-                )?,
+                .synthesize_with_custom_voice_profile(&request, speaker, instruct.as_deref())?,
             LoadedConditioning::None => engine.synthesize_with_profile(&request)?,
         };
         if run_idx == 0 {
