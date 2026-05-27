@@ -163,6 +163,10 @@ struct BackendSetInner {
 }
 
 impl BackendSet {
+    pub(crate) fn cpu() -> Result<Self, Qwen3TtsError> {
+        Self::with_primary(OwnedBackend::cpu()?, BackendKind::Cpu, None)
+    }
+
     pub(crate) fn new() -> Result<Self, Qwen3TtsError> {
         unsafe {
             sys::ggml_backend_load_all();

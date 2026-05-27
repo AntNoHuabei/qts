@@ -7,13 +7,16 @@ pub struct ModelPaths {
     pub main_gguf: PathBuf,
     /// Vocoder artifact exported for ONNX Runtime.
     pub vocoder_onnx: PathBuf,
+    /// Optional copied source config for model-type specific runtime behavior.
+    pub config_json: PathBuf,
 }
 
 impl ModelPaths {
-    pub fn new(main_gguf: PathBuf, vocoder_onnx: PathBuf) -> Self {
+    pub fn new(main_gguf: PathBuf, vocoder_onnx: PathBuf, config_json: PathBuf) -> Self {
         Self {
             main_gguf,
             vocoder_onnx,
+            config_json,
         }
     }
 
@@ -26,12 +29,17 @@ impl ModelPaths {
                 &[
                     "qwen3-tts-0.6b-f16.gguf",
                     "qwen3-tts-0.6b-q8_0.gguf",
+                    "qwen3-tts-1.7b-customvoice-f16.gguf",
+                    "qwen3-tts-1.7b-customvoice-q8_0.gguf",
+                    "qwen3-tts-1.7b-voicedesign-f16.gguf",
+                    "qwen3-tts-1.7b-voicedesign-q8_0.gguf",
                     "qwen3-tts-0.6b-q6_k.gguf",
                     "qwen3-tts-0.6b-q5_k.gguf",
                     "qwen3-tts-0.6b-q4_k.gguf",
                 ],
             ),
             vocoder_onnx: dir.join("qwen3-tts-vocoder.onnx"),
+            config_json: dir.join("config.json"),
         }
     }
 
@@ -64,6 +72,7 @@ mod tests {
         let p = ModelPaths::from_model_dir("/models");
         assert!(p.main_gguf.ends_with("qwen3-tts-0.6b-f16.gguf"));
         assert!(p.vocoder_onnx.ends_with("qwen3-tts-vocoder.onnx"));
+        assert!(p.config_json.ends_with("config.json"));
     }
 
     #[test]

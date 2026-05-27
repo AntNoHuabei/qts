@@ -40,6 +40,8 @@ hound.workspace = true
 libc.workspace = true
 qts.workspace = true
 ratatui.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }

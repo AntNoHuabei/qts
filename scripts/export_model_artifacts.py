@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import json
 import logging
 import re
@@ -74,6 +75,8 @@ class Qwen3MainGgufExporter:
         "talker.text_projection.linear_fc2.weight": "talker.text_proj.fc2.weight",
         "talker.text_projection.linear_fc2.bias": "talker.text_proj.fc2.bias",
         "talker.code_predictor.model.norm.weight": "code_pred.output_norm.weight",
+        "talker.code_predictor.small_to_mtp_projection.weight": "code_pred.input_proj.weight",
+        "talker.code_predictor.small_to_mtp_projection.bias": "code_pred.input_proj.bias",
     }
 
     TALKER_LAYER_PATTERNS = [
@@ -141,13 +144,38 @@ class Qwen3MainGgufExporter:
         self.rope_theta = talker_config.get("rope_theta", 1_000_000)
         self.mrope_section = talker_config.get("rope_scaling", {}).get("mrope_section", [24, 20, 20])
         self.code_predictor_num_layers = code_predictor_config.get("num_hidden_layers", 5)
+        self.code_predictor_hidden_size = code_predictor_config.get("hidden_size", self.hidden_size)
         self.code_predictor_vocab_size = code_predictor_config.get("vocab_size", 2048)
         self.speaker_enc_dim = speaker_encoder_config.get("enc_dim", 1024)
         self.speaker_sample_rate = speaker_encoder_config.get("sample_rate", 24000)
         self.codec_pad_id = talker_config.get("codec_pad_id", 2148)
         self.codec_bos_id = talker_config.get("codec_bos_id", 2149)
         self.codec_eos_id = talker_config.get("codec_eos_token_id", 2150)
-        self.model_name = "Qwen3-TTS-12Hz-0.6B"
+        self.model_size_tag = self._resolve_model_size_tag(self.config.get("tts_model_size"))
+        self.model_type_tag = self._resolve_model_type_tag(self.config.get("tts_model_type"))
+        self.model_name = self._resolve_model_name()
+
+    def _resolve_model_size_tag(self, raw_size: Any) -> str:
+        value = str(raw_size or "").strip().lower()
+        if value in {"1b7", "1.7b", "1_7b"}:
+            return "1.7b"
+        return "0.6b"
+
+    def _resolve_model_type_tag(self, raw_type: Any) -> str:
+        value = str(raw_type or "base").strip().lower()
+        if value == "custom_voice":
+            return "customvoice"
+        if value == "voice_design":
+            return "voicedesign"
+        return "base"
+
+    def _resolve_model_name(self) -> str:
+        suffix = ""
+        if self.model_type_tag == "customvoice":
+            suffix = "-CustomVoice"
+        elif self.model_type_tag == "voicedesign":
+            suffix = "-VoiceDesign"
+        return f"Qwen3-TTS-12Hz-{self.model_size_tag.upper()}{suffix}"
 
     def _map_tensor_name(self, hf_name: str) -> str | None:
         if hf_name in self.TENSOR_MAP:
@@ -194,6 +222,10 @@ class Qwen3MainGgufExporter:
     ) -> tuple[np.ndarray, gguf.GGMLQuantizationType]:
         data = tensor.float().numpy() if tensor.dtype == torch.bfloat16 else tensor.numpy()
         if data.ndim <= 1:
+            return data.astype(np.float32), gguf.GGMLQuantizationType.F32
+        if tensor_name.startswith("code_pred."):
+            return data.astype(np.float32), gguf.GGMLQuantizationType.F32
+        if self.model_type_tag == "customvoice" and tensor_name.startswith("talker.blk."):
             return data.astype(np.float32), gguf.GGMLQuantizationType.F32
         if self.output_type == "f16":
             return data.astype(np.float16), gguf.GGMLQuantizationType.F16
@@ -265,6 +297,7 @@ class Qwen3MainGgufExporter:
         writer.add_uint32(f"{arch}.num_code_groups", self.num_code_groups)
         writer.add_array(f"{arch}.rope.mrope_section", self.mrope_section)
         writer.add_uint32(f"{arch}.code_predictor.layer_count", self.code_predictor_num_layers)
+        writer.add_uint32(f"{arch}.code_predictor.hidden_size", self.code_predictor_hidden_size)
         writer.add_uint32(f"{arch}.code_predictor.vocab_size", self.code_predictor_vocab_size)
         writer.add_uint32(f"{arch}.speaker_encoder.embedding_length", self.speaker_enc_dim)
         writer.add_uint32(f"{arch}.speaker_encoder.sample_rate", self.speaker_sample_rate)
@@ -428,6 +461,19 @@ def resolve_model_dir(model_name_or_path: str, local_files_only: bool) -> Path:
 
 
 def default_main_output(out_dir: Path, main_type: str) -> Path:
+    config_path = out_dir / "config.json"
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            size = str(config.get("tts_model_size", "")).strip().lower()
+            model_type = str(config.get("tts_model_type", "base")).strip().lower()
+            size_tag = "1.7b" if size in {"1b7", "1.7b", "1_7b"} else "0.6b"
+            if model_type == "custom_voice":
+                return out_dir / f"qwen3-tts-{size_tag}-customvoice-{main_type}.gguf"
+            if model_type == "voice_design":
+                return out_dir / f"qwen3-tts-{size_tag}-voicedesign-{main_type}.gguf"
+        except Exception:
+            pass
     return out_dir / f"qwen3-tts-0.6b-{main_type}.gguf"
 
 
@@ -573,6 +619,7 @@ def main() -> None:
     model_dir = resolve_model_dir(args.model, local_files_only=args.local_files_only)
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(model_dir / "config.json", out_dir / "config.json")
 
     if args.main_out and len(main_types) != 1:
         raise SystemExit("--main-out can only be used when exporting exactly one --main-type.")
