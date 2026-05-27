@@ -244,6 +244,38 @@ class Qwen3MainGgufExporter:
             )
             return data.astype(np.float16), gguf.GGMLQuantizationType.F16
 
+    @staticmethod
+    def _codec_embedding_index(hf_name: str) -> int | None:
+        match = re.match(
+            r"talker\.code_predictor\.model\.codec_embedding\.(\d+)\.weight",
+            hf_name,
+        )
+        return int(match.group(1)) if match else None
+
+    def _add_projected_code_pred_embedding(
+        self,
+        writer: gguf.GGUFWriter,
+        cb_idx: int,
+        embedding: torch.Tensor,
+        input_proj_weight: torch.Tensor | None,
+        input_proj_bias: torch.Tensor | None,
+    ) -> bool:
+        if input_proj_weight is None or input_proj_bias is None:
+            return False
+        with torch.no_grad():
+            projected = torch.nn.functional.linear(
+                embedding.float(),
+                input_proj_weight.float(),
+                input_proj_bias.float(),
+            )
+        data = projected.cpu().numpy().astype(np.float32)
+        writer.add_tensor(
+            f"code_pred.codec_embd_projected.{cb_idx}.weight",
+            data,
+            raw_dtype=gguf.GGMLQuantizationType.F32,
+        )
+        return True
+
     def _load_tokenizer(self) -> tuple[list[str], list[int], list[str]]:
         vocab_path = self.input_dir / "vocab.json"
         merges_path = self.input_dir / "merges.txt"
@@ -342,20 +374,42 @@ class Qwen3MainGgufExporter:
         self._add_tokenizer(writer)
 
         tensor_count = 0
+        derived_count = 0
         skipped_count = 0
+        code_pred_input_proj_weight: torch.Tensor | None = None
+        code_pred_input_proj_bias: torch.Tensor | None = None
+        pending_code_pred_embeddings: dict[int, torch.Tensor] = {}
         for hf_name, tensor in tqdm(self._get_tensors(), desc="Converting GGUF"):
             ggml_name = self._map_tensor_name(hf_name)
             if ggml_name is None:
                 skipped_count += 1
                 logger.debug("Skipping unmapped tensor: %s", hf_name)
                 continue
+            if hf_name == "talker.code_predictor.small_to_mtp_projection.weight":
+                code_pred_input_proj_weight = tensor
+            elif hf_name == "talker.code_predictor.small_to_mtp_projection.bias":
+                code_pred_input_proj_bias = tensor
             data, dtype = self._convert_dtype(tensor, ggml_name)
             writer.add_tensor(ggml_name, data, raw_dtype=dtype)
             tensor_count += 1
+            cb_idx = self._codec_embedding_index(hf_name)
+            if cb_idx is not None:
+                pending_code_pred_embeddings[cb_idx] = tensor
+
+        for cb_idx, tensor in sorted(pending_code_pred_embeddings.items()):
+            if self._add_projected_code_pred_embedding(
+                writer,
+                cb_idx,
+                tensor,
+                code_pred_input_proj_weight,
+                code_pred_input_proj_bias,
+            ):
+                derived_count += 1
 
         logger.info(
-            "Prepared GGUF tensors: converted=%s skipped=%s output=%s",
+            "Prepared GGUF tensors: converted=%s derived=%s skipped=%s output=%s",
             tensor_count,
+            derived_count,
             skipped_count,
             self.output_path,
         )

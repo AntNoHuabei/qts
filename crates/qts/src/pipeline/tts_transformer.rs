@@ -2896,6 +2896,20 @@ impl TtsTransformer {
         out: &mut [f32],
     ) -> Result<(), Qwen3TtsError> {
         let talker_hidden_size = self.config.hidden_size as usize;
+        if token_id >= 0 {
+            let code_pred_hidden_size = self.config.code_pred_hidden_size as usize;
+            if let Some(tables) = cpu.projected_embeddings.as_ref() {
+                if let Some(table) = tables.get(cb_idx) {
+                    let offset = token_id as usize * code_pred_hidden_size;
+                    if offset + code_pred_hidden_size <= table.len()
+                        && out.len() == code_pred_hidden_size
+                    {
+                        out.copy_from_slice(&table[offset..offset + code_pred_hidden_size]);
+                        return Ok(());
+                    }
+                }
+            }
+        }
         let table = cpu.embeddings.get(cb_idx).ok_or_else(|| {
             Qwen3TtsError::InvalidInput("missing CPU code predictor embedding".into())
         })?;
@@ -4998,6 +5012,7 @@ struct CodePredCpuWeights {
     input_proj_weight: Vec<f32>,
     input_proj_bias: Vec<f32>,
     embeddings: Vec<Vec<f32>>,
+    projected_embeddings: Option<Vec<Vec<f32>>>,
     output_norm: Vec<f32>,
     heads: Vec<Vec<f32>>,
     layers: Vec<CodePredCpuLayerWeights>,
@@ -5648,6 +5663,8 @@ impl CodePredCpuWeights {
             let (_, head) = file.read_tensor_f32(&format!("code_pred.lm_head.{cb_idx}.weight"))?;
             heads.push(head);
         }
+        let projected_embeddings =
+            try_read_code_pred_projected_embedding_tables_cpu(file, cfg, per_codebook);
 
         let mut layers = Vec::with_capacity(cfg.code_pred_layers as usize);
         for layer_idx in 0..cfg.code_pred_layers {
@@ -5685,6 +5702,7 @@ impl CodePredCpuWeights {
             input_proj_weight,
             input_proj_bias,
             embeddings,
+            projected_embeddings,
             output_norm,
             heads,
             layers,
@@ -5762,6 +5780,26 @@ fn try_read_embedding_matrix_f32(
     }
     let (_, data) = file.read_tensor_f32(name).ok()?;
     (data.len() == hidden * vocab).then_some(data)
+}
+
+fn try_read_code_pred_projected_embedding_tables_cpu(
+    file: &GgufFile,
+    cfg: &TtsTransformerConfig,
+    per_codebook: usize,
+) -> Option<Vec<Vec<f32>>> {
+    let code_pred_hidden_size = cfg.code_pred_hidden_size as usize;
+    let vocab = cfg.code_pred_vocab_size as usize;
+    let expected_len = vocab.checked_mul(code_pred_hidden_size)?;
+    let mut tables = Vec::with_capacity(per_codebook);
+    for cb_idx in 0..per_codebook {
+        let name = format!("code_pred.codec_embd_projected.{cb_idx}.weight");
+        let (_, data) = file.read_tensor_f32(&name).ok()?;
+        if data.len() != expected_len {
+            return None;
+        }
+        tables.push(data);
+    }
+    Some(tables)
 }
 
 fn linear_cpu(
