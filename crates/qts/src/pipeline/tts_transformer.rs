@@ -13,7 +13,7 @@ use super::backend::{
     slice_as_bytes_mut, BackendKind, BackendSet, OwnedBuffer, TensorDownload, TensorUpload,
 };
 use crate::model::GgufFile;
-use crate::{Qwen3TtsError, TalkerKvMode};
+use crate::{Qwen3TtsError, SynthesisProgress, TalkerKvMode};
 
 #[derive(Debug, Clone)]
 pub struct TtsTransformerConfig {
@@ -1609,7 +1609,40 @@ impl TtsTransformer {
         top_k: i32,
         top_p: f32,
     ) -> Result<CodecRollout, Qwen3TtsError> {
+        self.rollout_codec_frames_kv_with_progress(
+            prefill_embd,
+            trailing_text_hidden,
+            tts_pad_embed,
+            prompt_frames,
+            talker_kv_mode,
+            thread_count,
+            max_frames,
+            repetition_penalty,
+            temperature,
+            top_k,
+            top_p,
+            &mut |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rollout_codec_frames_kv_with_progress(
+        &self,
+        prefill_embd: &[f32],
+        trailing_text_hidden: &[f32],
+        tts_pad_embed: &[f32],
+        prompt_frames: &[Vec<i32>],
+        talker_kv_mode: TalkerKvMode,
+        thread_count: usize,
+        max_frames: usize,
+        repetition_penalty: f32,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        progress: &mut dyn FnMut(SynthesisProgress),
+    ) -> Result<CodecRollout, Qwen3TtsError> {
         if max_frames == 0 {
+            progress(SynthesisProgress::rollout(0, 0));
             return Ok(CodecRollout {
                 frames: Vec::new(),
                 first_frame_elapsed: Duration::ZERO,
@@ -1619,6 +1652,7 @@ impl TtsTransformer {
             });
         }
         let t_rollout_start = Instant::now();
+        progress(SynthesisProgress::rollout(0, max_frames));
 
         let hidden_size = self.config.hidden_size as usize;
         if prefill_embd.is_empty() || !prefill_embd.len().is_multiple_of(hidden_size) {
@@ -1680,6 +1714,7 @@ impl TtsTransformer {
             &prompt_recent_tokens,
         )?;
         if first_codebook_0 == self.config.codec_eos_id {
+            progress(SynthesisProgress::rollout(0, max_frames));
             return Ok(CodecRollout {
                 first_frame_elapsed: t_rollout_start.elapsed(),
                 frames: prompt_frames
@@ -1746,6 +1781,7 @@ impl TtsTransformer {
             logits,
         });
         let first_frame_elapsed = t_rollout_start.elapsed();
+        progress(SynthesisProgress::rollout(1, max_frames));
         let mut n_past = prefill_len;
 
         let mut talker_steps_dur = Duration::ZERO;
@@ -1840,6 +1876,10 @@ impl TtsTransformer {
                 hidden_state: step_outputs.hidden_state,
                 logits,
             });
+            progress(SynthesisProgress::rollout(
+                frames.len().saturating_sub(prompt_frames.len()),
+                max_frames,
+            ));
             n_past += 1;
         }
 

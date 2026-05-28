@@ -179,6 +179,42 @@ pub struct StreamingSynthesizeResult {
     pub generated_samples: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SynthesisProgressStage {
+    Preparing,
+    Prefill,
+    Rollout,
+    Vocoder,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SynthesisProgress {
+    pub stage: SynthesisProgressStage,
+    pub generated_frames: usize,
+    pub max_frames: usize,
+}
+
+impl SynthesisProgress {
+    #[must_use]
+    pub fn new(stage: SynthesisProgressStage, generated_frames: usize, max_frames: usize) -> Self {
+        Self {
+            stage,
+            generated_frames,
+            max_frames,
+        }
+    }
+
+    #[must_use]
+    pub fn rollout(generated_frames: usize, max_frames: usize) -> Self {
+        Self::new(
+            SynthesisProgressStage::Rollout,
+            generated_frames,
+            max_frames,
+        )
+    }
+}
+
 struct PreparedSynthesis<'a> {
     prepared_inputs: PreparedPrefillInputs,
     prompt_frames: Vec<Vec<i32>>,
@@ -507,6 +543,59 @@ impl Qwen3TtsEngine {
         Ok((result, timings))
     }
 
+    pub fn synthesize_with_progress(
+        &self,
+        req: &SynthesizeRequest,
+        mut progress: impl FnMut(SynthesisProgress),
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.synthesize_impl_with_progress(req, None, None, None, None, None, &mut progress)
+    }
+
+    pub fn synthesize_with_custom_voice_progress(
+        &self,
+        req: &SynthesizeRequest,
+        speaker: &str,
+        instruct: Option<&str>,
+        mut progress: impl FnMut(SynthesisProgress),
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.synthesize_impl_with_progress(
+            req,
+            None,
+            None,
+            Some(CustomVoiceConditioning { speaker, instruct }),
+            None,
+            None,
+            &mut progress,
+        )
+    }
+
+    pub fn synthesize_with_voice_design_progress(
+        &self,
+        req: &SynthesizeRequest,
+        instruct: &str,
+        mut progress: impl FnMut(SynthesisProgress),
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.synthesize_impl_with_progress(
+            req,
+            None,
+            None,
+            None,
+            Some(instruct),
+            None,
+            &mut progress,
+        )
+    }
+
+    pub fn synthesize_with_voice_clone_prompt_progress(
+        &self,
+        req: &SynthesizeRequest,
+        prompt: &VoiceClonePromptV2,
+        mut progress: impl FnMut(SynthesisProgress),
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.validate_speaker_embedding(prompt.speaker_embedding())?;
+        self.synthesize_impl_with_progress(req, None, Some(prompt), None, None, None, &mut progress)
+    }
+
     fn synthesize_impl(
         &self,
         req: &SynthesizeRequest,
@@ -516,6 +605,32 @@ impl Qwen3TtsEngine {
         voice_design_instruct: Option<&str>,
         timings: Option<&mut SynthesisStageTimings>,
     ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.synthesize_impl_with_progress(
+            req,
+            speaker_embedding_override,
+            voice_clone_prompt,
+            custom_voice,
+            voice_design_instruct,
+            timings,
+            &mut |_| {},
+        )
+    }
+
+    fn synthesize_impl_with_progress(
+        &self,
+        req: &SynthesizeRequest,
+        speaker_embedding_override: Option<&[f32]>,
+        voice_clone_prompt: Option<&VoiceClonePromptV2>,
+        custom_voice: Option<CustomVoiceConditioning<'_>>,
+        voice_design_instruct: Option<&str>,
+        timings: Option<&mut SynthesisStageTimings>,
+        progress: &mut dyn FnMut(SynthesisProgress),
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        progress(SynthesisProgress::new(
+            SynthesisProgressStage::Preparing,
+            0,
+            req.max_audio_frames,
+        ));
         let prepared = self.prepare_synthesis(
             req,
             speaker_embedding_override,
@@ -524,10 +639,21 @@ impl Qwen3TtsEngine {
             voice_design_instruct,
         )?;
 
+        progress(SynthesisProgress::new(
+            SynthesisProgressStage::Prefill,
+            0,
+            req.max_audio_frames,
+        ));
         if req.vocoder_chunk_size > 0 {
-            self.synthesize_pipelined(req, &prepared, timings)
+            let result = self.synthesize_pipelined(req, &prepared, timings)?;
+            progress(SynthesisProgress::new(
+                SynthesisProgressStage::Done,
+                result.generated_frames,
+                req.max_audio_frames,
+            ));
+            Ok(result)
         } else {
-            self.synthesize_sequential(req, &prepared, timings)
+            self.synthesize_sequential_with_progress(req, &prepared, timings, progress)
         }
     }
 
@@ -860,8 +986,18 @@ impl Qwen3TtsEngine {
         prepared: &PreparedSynthesis<'_>,
         timings: Option<&mut SynthesisStageTimings>,
     ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.synthesize_sequential_with_progress(req, prepared, timings, &mut |_| {})
+    }
+
+    fn synthesize_sequential_with_progress(
+        &self,
+        req: &SynthesizeRequest,
+        prepared: &PreparedSynthesis<'_>,
+        timings: Option<&mut SynthesisStageTimings>,
+        progress: &mut dyn FnMut(SynthesisProgress),
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
         let t_roll = Instant::now();
-        let codec_rollout = self.transformer.rollout_codec_frames_kv(
+        let codec_rollout = self.transformer.rollout_codec_frames_kv_with_progress(
             &prepared.prepared_inputs.prefill_embd,
             &prepared.prepared_inputs.trailing_text_hidden,
             &prepared.prepared_inputs.tts_pad_embed,
@@ -873,6 +1009,7 @@ impl Qwen3TtsEngine {
             req.temperature,
             req.top_k,
             req.top_p,
+            progress,
         )?;
         let codec_rollout_dur = t_roll.elapsed();
 
@@ -889,6 +1026,11 @@ impl Qwen3TtsEngine {
             .collect::<Vec<_>>();
         let flatten_dur = t_post.elapsed();
 
+        progress(SynthesisProgress::new(
+            SynthesisProgressStage::Vocoder,
+            generated_frames,
+            req.max_audio_frames,
+        ));
         let t_voc = Instant::now();
         let pcm_all = self.vocoder.decode(
             &flattened_codes,
@@ -912,6 +1054,11 @@ impl Qwen3TtsEngine {
         let post = t_trim.elapsed() + flatten_dur;
 
         let sample_rate_hz = self.vocoder.config().sample_rate as u32;
+        progress(SynthesisProgress::new(
+            SynthesisProgressStage::Done,
+            generated_frames,
+            req.max_audio_frames,
+        ));
         if let Some(t) = timings {
             t.speaker_encode = prepared.speaker_encode;
             t.tokenize = prepared.tokenize;

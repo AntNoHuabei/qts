@@ -199,6 +199,51 @@ cargo xtask package-cli
 
 ## Using the CLI
 
+### HTTP server
+
+`qts_server` is a separate executable. The conditioning mode is fixed at
+startup, so requests cannot switch a running server between `none`, `custom`,
+`design`, and `clone`.
+
+```bash
+cargo run --release -p qts_cli --bin qts_server -- \
+  --mode design \
+  --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --backend vulkan \
+  --vocoder-ep cpu \
+  --language-id 2055 \
+  --instruct "温柔年轻女声"
+```
+
+Health and async job flow:
+
+```bash
+curl http://127.0.0.1:8080/health
+
+curl -X POST http://127.0.0.1:8080/v1/qts/audio/jobs \
+  -H "content-type: application/json" \
+  -d '{"input":"你好，测试一下进度查询。","instructions":"温柔年轻女声","frames":64,"response_format":"wav"}'
+
+curl http://127.0.0.1:8080/v1/qts/audio/jobs/1
+curl -o out.wav http://127.0.0.1:8080/v1/qts/audio/jobs/1/audio
+```
+
+OpenAI-compatible synchronous speech endpoint:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/audio/speech \
+  -H "content-type: application/json" \
+  -d '{"model":"qwen3-tts","input":"你好","voice":"default","instructions":"温柔年轻女声","response_format":"wav"}' \
+  -o out.wav
+```
+
+Mode-specific startup flags:
+
+```bash
+qts_server --mode custom --speaker serena --model-dir models/Qwen3-TTS-12Hz-1.7B-CustomVoice
+qts_server --mode clone --voice-clone-wav ref.wav --voice-clone-ref-text "reference text" --model-dir models/Qwen3-TTS-12Hz-0.6B-Base
+```
+
 ### Synthesize text to WAV
 
 ```bash

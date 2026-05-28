@@ -3,17 +3,17 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use hound::{SampleFormat, WavSpec, WavWriter};
-use qts::{
-    CodePredDebugStep, Qwen3TtsEngine, SynthesisStageTimings, TensorF32, VoiceClonePromptV2,
-    VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
-};
+use qts::{CodePredDebugStep, Qwen3TtsEngine, SynthesisStageTimings, VoiceClonePromptV2};
 use serde::Serialize;
 
 mod cli_support;
 mod tui;
 
-use crate::cli_support::{load_engine, parse_value_arg, CommonSynthesisArgs};
+use crate::cli_support::{
+    build_icl_voice_clone_prompt as build_icl_voice_clone_prompt_from_bytes,
+    build_wav_only_voice_clone_prompt as build_wav_only_voice_clone_prompt_from_bytes, load_engine,
+    parse_value_arg, write_wav_f32, CommonSynthesisArgs,
+};
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
@@ -250,23 +250,12 @@ fn build_wav_only_voice_clone_prompt(
     path: &Path,
 ) -> Result<VoiceClonePromptV2> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let speaker_embedding = engine.encode_reference_speaker(&bytes)?;
-    let prompt = VoiceClonePromptV2 {
-        schema_version: VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
-        source: path.display().to_string(),
-        model_id: args.model_dir.display().to_string(),
-        speaker_encoder_sample_rate_hz: 16_000,
-        x_vector_only_mode: true,
-        icl_mode: false,
-        ref_text: String::new(),
-        ref_code: None,
-        ref_spk_embedding: Some(TensorF32 {
-            shape: vec![speaker_embedding.len() as u32],
-            values: speaker_embedding,
-        }),
-    };
-    prompt.validate()?;
-    Ok(prompt)
+    build_wav_only_voice_clone_prompt_from_bytes(
+        engine,
+        &args.model_dir,
+        path.display().to_string(),
+        &bytes,
+    )
 }
 
 fn build_icl_voice_clone_prompt(
@@ -276,51 +265,13 @@ fn build_icl_voice_clone_prompt(
     ref_text: &str,
 ) -> Result<VoiceClonePromptV2> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let speaker_embedding = engine.encode_reference_speaker(&bytes)?;
-    let ref_code = engine.encode_reference_audio_codes(&bytes).with_context(|| {
-        format!(
-            "failed to encode reference audio codes for {}; ensure qwen3-tts-tokenizer-encoder.onnx exists in {}",
-            path.display(),
-            args.model_dir.display()
-        )
-    })?;
-    let prompt = VoiceClonePromptV2 {
-        schema_version: VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
-        source: path.display().to_string(),
-        model_id: args.model_dir.display().to_string(),
-        speaker_encoder_sample_rate_hz: 16_000,
-        x_vector_only_mode: false,
-        icl_mode: true,
-        ref_text: ref_text.to_string(),
-        ref_code: Some(ref_code),
-        ref_spk_embedding: Some(TensorF32 {
-            shape: vec![speaker_embedding.len() as u32],
-            values: speaker_embedding,
-        }),
-    };
-    prompt.validate()?;
-    Ok(prompt)
-}
-
-fn write_wav_f32(path: &Path, sample_rate_hz: u32, pcm_f32: &[f32]) -> Result<()> {
-    let spec = WavSpec {
-        channels: 1,
-        sample_rate: sample_rate_hz,
-        bits_per_sample: 16,
-        sample_format: SampleFormat::Int,
-    };
-    let mut writer = WavWriter::create(path, spec)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    for sample in pcm_f32.iter().copied() {
-        let clamped = sample.clamp(-1.0, 1.0);
-        writer
-            .write_sample((clamped * i16::MAX as f32) as i16)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-    }
-    writer
-        .finalize()
-        .with_context(|| format!("failed to finalize {}", path.display()))?;
-    Ok(())
+    build_icl_voice_clone_prompt_from_bytes(
+        engine,
+        &args.model_dir,
+        path.display().to_string(),
+        &bytes,
+        ref_text,
+    )
 }
 
 #[derive(Debug, Serialize)]

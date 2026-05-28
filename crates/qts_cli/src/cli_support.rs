@@ -1,8 +1,13 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use qts::{Qwen3TtsEngine, SynthesizeRequest, TalkerKvMode};
+use hound::{SampleFormat, WavSpec, WavWriter};
+use qts::{
+    Qwen3TtsEngine, SynthesizeRequest, TalkerKvMode, TensorF32, VoiceClonePromptV2,
+    VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeBackendOverrides {
@@ -295,4 +300,87 @@ where
     value
         .parse::<T>()
         .map_err(|err| anyhow::anyhow!("invalid value for {flag}: {err}"))
+}
+
+pub(crate) fn encode_wav_f32(sample_rate_hz: u32, pcm_f32: &[f32]) -> Result<Vec<u8>> {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: sample_rate_hz,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = WavWriter::new(&mut cursor, spec).context("failed to create WAV")?;
+        for sample in pcm_f32.iter().copied() {
+            let clamped = sample.clamp(-1.0, 1.0);
+            writer
+                .write_sample((clamped * i16::MAX as f32) as i16)
+                .context("failed to write WAV sample")?;
+        }
+        writer.finalize().context("failed to finalize WAV")?;
+    }
+    Ok(cursor.into_inner())
+}
+
+pub(crate) fn write_wav_f32(path: &Path, sample_rate_hz: u32, pcm_f32: &[f32]) -> Result<()> {
+    let bytes = encode_wav_f32(sample_rate_hz, pcm_f32)?;
+    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+pub(crate) fn build_wav_only_voice_clone_prompt(
+    engine: &Qwen3TtsEngine,
+    model_dir: &Path,
+    source: impl Into<String>,
+    wav_bytes: &[u8],
+) -> Result<VoiceClonePromptV2> {
+    let speaker_embedding = engine.encode_reference_speaker(wav_bytes)?;
+    let prompt = VoiceClonePromptV2 {
+        schema_version: VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+        source: source.into(),
+        model_id: model_dir.display().to_string(),
+        speaker_encoder_sample_rate_hz: 16_000,
+        x_vector_only_mode: true,
+        icl_mode: false,
+        ref_text: String::new(),
+        ref_code: None,
+        ref_spk_embedding: Some(TensorF32 {
+            shape: vec![speaker_embedding.len() as u32],
+            values: speaker_embedding,
+        }),
+    };
+    prompt.validate()?;
+    Ok(prompt)
+}
+
+pub(crate) fn build_icl_voice_clone_prompt(
+    engine: &Qwen3TtsEngine,
+    model_dir: &Path,
+    source: impl Into<String>,
+    wav_bytes: &[u8],
+    ref_text: &str,
+) -> Result<VoiceClonePromptV2> {
+    let speaker_embedding = engine.encode_reference_speaker(wav_bytes)?;
+    let ref_code = engine.encode_reference_audio_codes(wav_bytes).with_context(|| {
+        format!(
+            "failed to encode reference audio codes; ensure qwen3-tts-tokenizer-encoder.onnx exists in {}",
+            model_dir.display()
+        )
+    })?;
+    let prompt = VoiceClonePromptV2 {
+        schema_version: VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+        source: source.into(),
+        model_id: model_dir.display().to_string(),
+        speaker_encoder_sample_rate_hz: 16_000,
+        x_vector_only_mode: false,
+        icl_mode: true,
+        ref_text: ref_text.to_string(),
+        ref_code: Some(ref_code),
+        ref_spk_embedding: Some(TensorF32 {
+            shape: vec![speaker_embedding.len() as u32],
+            values: speaker_embedding,
+        }),
+    };
+    prompt.validate()?;
+    Ok(prompt)
 }
