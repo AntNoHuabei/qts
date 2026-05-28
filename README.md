@@ -50,6 +50,8 @@ Vulkan builds also need the Vulkan SDK (`glslc` on `PATH`).
    ```
 
    Those names match the default lookup used by `--model-dir` (see [`ModelPaths`](crates/qts/src/model/paths.rs)).
+   VoiceDesign and CustomVoice model folders also need their exported
+   `config.json`; see [Model type config](#model-type-config).
 
 4. **Synthesize**
 
@@ -172,6 +174,40 @@ Where to download, how to export, and layout options: **[docs/models.md](docs/mo
 - `qwen3-tts-vocoder.onnx`
 - One of: `qwen3-tts-0.6b-f16.gguf`, `qwen3-tts-0.6b-q8_0.gguf`, … (see `ModelPaths` for the full preference order)
 
+### Model type config
+
+VoiceDesign and CustomVoice exports should keep their source `config.json` in
+the same `--model-dir` as the GGUF and vocoder. `qts` reads this file to
+determine the model type, especially `tts_model_type` values such as
+`voice_design` and `custom_voice`. Without it, a fixed server mode like
+`--mode design` or `--mode custom` can reject requests or use the wrong
+conditioning path.
+
+Recommended layouts:
+
+```text
+models/Qwen3-TTS-12Hz-1.7B-VoiceDesign/
+  qwen3-tts-1.7b-voicedesign-q8_0.gguf
+  qwen3-tts-vocoder.onnx
+  config.json
+  qwen3-tts-tokenizer-encoder.onnx  # recommended for long-form voice stability
+
+models/Qwen3-TTS-12Hz-1.7B-CustomVoice/
+  qwen3-tts-1.7b-customvoice-q8_0.gguf
+  qwen3-tts-vocoder.onnx
+  config.json
+
+models/Qwen3-TTS-12Hz-0.6B-Base/
+  qwen3-tts-0.6b-f16.gguf
+  qwen3-tts-vocoder.onnx
+  qwen3-tts-tokenizer-encoder.onnx  # required for WAV voice clone prompts
+```
+
+For long-form VoiceDesign jobs, `qts_server` uses
+`qwen3-tts-tokenizer-encoder.onnx` when it is present to build an ICL prompt
+from the first generated segment, so later segments keep the same voice. If the
+encoder is missing, it falls back to speaker-embedding reuse.
+
 ### Maintainers: two repos, one workflow
 
 | Repo | Role |
@@ -204,6 +240,9 @@ cargo xtask package-cli
 `qts_server` is a separate executable. The conditioning mode is fixed at
 startup, so requests cannot switch a running server between `none`, `custom`,
 `design`, and `clone`.
+For long inputs, the server splits text into sequential synthesis segments,
+concatenates the audio into one WAV response, and reports aggregate async job
+progress.
 
 ```bash
 cargo run --release -p qts_cli --bin qts_server -- \

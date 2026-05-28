@@ -428,6 +428,23 @@ impl Qwen3TtsEngine {
         self.synthesize_impl(req, None, None, None, Some(instruct), None)
     }
 
+    pub fn synthesize_with_voice_design_speaker_embedding(
+        &self,
+        req: &SynthesizeRequest,
+        instruct: &str,
+        speaker_embedding: &[f32],
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.validate_speaker_embedding(speaker_embedding)?;
+        self.synthesize_impl(
+            req,
+            Some(speaker_embedding),
+            None,
+            None,
+            Some(instruct),
+            None,
+        )
+    }
+
     pub fn synthesize_debug(
         &self,
         req: &SynthesizeRequest,
@@ -578,6 +595,25 @@ impl Qwen3TtsEngine {
         self.synthesize_impl_with_progress(
             req,
             None,
+            None,
+            None,
+            Some(instruct),
+            None,
+            &mut progress,
+        )
+    }
+
+    pub fn synthesize_with_voice_design_speaker_embedding_progress(
+        &self,
+        req: &SynthesizeRequest,
+        instruct: &str,
+        speaker_embedding: &[f32],
+        mut progress: impl FnMut(SynthesisProgress),
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.validate_speaker_embedding(speaker_embedding)?;
+        self.synthesize_impl_with_progress(
+            req,
+            Some(speaker_embedding),
             None,
             None,
             Some(instruct),
@@ -880,18 +916,22 @@ impl Qwen3TtsEngine {
             }
             let text_tokens = self.tokenizer.encode_for_tts(&req.text);
             let instruct_tokens = self.tokenizer.encode_instruct_for_tts(instruct);
+            let speaker_embedding =
+                speaker_embedding_override.map(SpeakerEmbeddingStorage::Borrowed);
             (
                 self.transformer.build_prefill_inputs(
                     PrefillConditioning {
                         text_tokens: &text_tokens,
                         instruct_tokens: &instruct_tokens,
-                        speaker_embd: None,
+                        speaker_embd: speaker_embedding
+                            .as_ref()
+                            .map(SpeakerEmbeddingStorage::as_slice),
                         ref_codebook_0: &[],
                         language_id: req.language_id,
                     },
                     req.thread_count,
                 )?,
-                None,
+                speaker_embedding,
             )
         } else if let Some(prompt) = voice_clone_prompt {
             let speaker_embedding = if let Some(speaker_embedding) = speaker_embedding_override {

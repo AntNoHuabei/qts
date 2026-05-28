@@ -15,8 +15,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use qts::{
-    Qwen3TtsEngine, SynthesisProgress, SynthesisProgressStage, SynthesizeRequest, TalkerKvMode,
-    VoiceClonePromptV2,
+    Qwen3TtsEngine, SynthesisProgress, SynthesisProgressStage, SynthesizeRequest, SynthesizeResult,
+    TalkerKvMode, VoiceClonePromptV2,
 };
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +86,12 @@ struct AppState {
 }
 
 type JobStore = Arc<Mutex<HashMap<String, JobInfo>>>;
+
+const LONG_TEXT_TARGET_CHARS: usize = 120;
+const LONG_TEXT_MAX_CHARS: usize = 160;
+const LONG_TEXT_SHORT_CHARS: usize = 60;
+const LONG_TEXT_SINGLE_PASS_CHARS: usize = 220;
+const LONG_TEXT_MIN_TAIL_CHARS: usize = 45;
 
 #[derive(Clone)]
 struct ServerConfig {
@@ -603,12 +609,187 @@ fn synthesize_job(
     job_id: &str,
     payload: JobPayload,
 ) -> Result<AudioPayload> {
-    let req = build_request(&config.request_defaults, &payload.request)?;
+    let mut req = build_request(&config.request_defaults, &payload.request)?;
+    if payload.request.frames.is_none() {
+        req.max_audio_frames =
+            segment_max_audio_frames(&req.text, None, config.request_defaults.max_audio_frames);
+    }
+    let segments = split_long_speech_text(&req.text);
+    if segments.len() > 1 {
+        return synthesize_segmented_job(engine, config, jobs, job_id, &payload, &req, segments);
+    }
     let mut progress_cb = |progress: SynthesisProgress| update_progress(jobs, job_id, progress);
+    let result = synthesize_single_segment(engine, config, &payload, &req, &mut progress_cb)?;
+    let bytes = encode_wav_f32(result.sample_rate_hz, &result.pcm_f32)?;
+    Ok(AudioPayload {
+        bytes,
+        sample_rate_hz: result.sample_rate_hz,
+        generated_frames: result.generated_frames,
+    })
+}
+
+fn synthesize_segmented_job(
+    engine: &Qwen3TtsEngine,
+    config: &ServerConfig,
+    jobs: &JobStore,
+    job_id: &str,
+    payload: &JobPayload,
+    base_req: &SynthesizeRequest,
+    segments: Vec<String>,
+) -> Result<AudioPayload> {
+    let frame_budgets = segments
+        .iter()
+        .map(|segment| {
+            segment_max_audio_frames(segment, payload.request.frames, base_req.max_audio_frames)
+        })
+        .collect::<Vec<_>>();
+    let total_max_frames = frame_budgets.iter().copied().sum::<usize>().max(1);
+    update_progress(
+        jobs,
+        job_id,
+        SynthesisProgress::new(SynthesisProgressStage::Preparing, 0, total_max_frames),
+    );
+
+    let mut pcm_f32 = Vec::new();
+    let mut sample_rate_hz = None;
+    let mut completed_frames = 0usize;
+    let mut total_generated_frames = 0usize;
+    let mut design_speaker_embedding = None;
+    let mut design_prompt = None;
+
+    for (idx, segment) in segments.iter().enumerate() {
+        let mut req = base_req.clone();
+        req.text = segment.clone();
+        req.max_audio_frames = frame_budgets[idx];
+        let completed_before_segment = completed_frames;
+        let mut progress_cb = |progress: SynthesisProgress| {
+            update_segmented_progress(
+                jobs,
+                job_id,
+                progress,
+                completed_before_segment,
+                total_max_frames,
+            )
+        };
+        let result = synthesize_segment_with_optional_design_embedding(
+            engine,
+            config,
+            payload,
+            &req,
+            design_prompt.as_ref(),
+            design_speaker_embedding.as_deref(),
+            &mut progress_cb,
+        )
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "failed to synthesize segment {}/{}: {err:#}",
+                idx + 1,
+                segments.len()
+            )
+        })?;
+        if let Some(sample_rate) = sample_rate_hz {
+            if sample_rate != result.sample_rate_hz {
+                bail!(
+                    "segment {} sample rate changed from {} to {}",
+                    idx + 1,
+                    sample_rate,
+                    result.sample_rate_hz
+                );
+            }
+        } else {
+            sample_rate_hz = Some(result.sample_rate_hz);
+        }
+        completed_frames = completed_frames.saturating_add(req.max_audio_frames);
+        total_generated_frames = total_generated_frames.saturating_add(result.generated_frames);
+        if idx == 0 && is_design_mode(config) && design_speaker_embedding.is_none() {
+            let first_segment_wav = encode_wav_f32(result.sample_rate_hz, &result.pcm_f32)?;
+            if let Ok(prompt) = build_icl_voice_clone_prompt(
+                engine,
+                &config.model_dir,
+                "generated:first_segment",
+                &first_segment_wav,
+                segment,
+            ) {
+                design_prompt = Some(prompt);
+            }
+            design_speaker_embedding = Some(engine.encode_reference_speaker(&first_segment_wav)?);
+        }
+        pcm_f32.extend_from_slice(&result.pcm_f32);
+    }
+
+    update_progress(
+        jobs,
+        job_id,
+        SynthesisProgress::new(
+            SynthesisProgressStage::Vocoder,
+            total_generated_frames,
+            total_max_frames,
+        ),
+    );
+    let sample_rate_hz = sample_rate_hz.unwrap_or(qts::SAMPLE_RATE_HZ);
+    let bytes = encode_wav_f32(sample_rate_hz, &pcm_f32)?;
+    Ok(AudioPayload {
+        bytes,
+        sample_rate_hz,
+        generated_frames: total_generated_frames,
+    })
+}
+
+fn synthesize_segment_with_optional_design_embedding(
+    engine: &Qwen3TtsEngine,
+    config: &ServerConfig,
+    payload: &JobPayload,
+    req: &SynthesizeRequest,
+    design_prompt: Option<&VoiceClonePromptV2>,
+    design_speaker_embedding: Option<&[f32]>,
+    progress_cb: &mut dyn FnMut(SynthesisProgress),
+) -> Result<SynthesizeResult> {
+    if let (FixedMode::Design { instruct }, Some(speaker_embedding)) =
+        (&config.mode, design_speaker_embedding)
+    {
+        validate_mode_request(config.mode.name(), &payload.request)?;
+        let effective_instruct = payload
+            .request
+            .qts_conditioning
+            .as_ref()
+            .and_then(|c| c.instruct.as_deref())
+            .or(payload.request.instructions.as_deref())
+            .or(instruct.as_deref())
+            .context("design mode requires `instructions`, `qts_conditioning.instruct`, or startup --instruct")?;
+        if let Some(prompt) = design_prompt {
+            return Ok(engine.synthesize_with_voice_clone_prompt_progress(
+                req,
+                prompt,
+                progress_cb,
+            )?);
+        }
+        return Ok(
+            engine.synthesize_with_voice_design_speaker_embedding_progress(
+                req,
+                effective_instruct,
+                speaker_embedding,
+                progress_cb,
+            )?,
+        );
+    }
+    synthesize_single_segment(engine, config, payload, req, progress_cb)
+}
+
+fn is_design_mode(config: &ServerConfig) -> bool {
+    matches!(config.mode, FixedMode::Design { .. })
+}
+
+fn synthesize_single_segment(
+    engine: &Qwen3TtsEngine,
+    config: &ServerConfig,
+    payload: &JobPayload,
+    req: &SynthesizeRequest,
+    progress_cb: &mut dyn FnMut(SynthesisProgress),
+) -> Result<SynthesizeResult> {
     let result = match &config.mode {
         FixedMode::None => {
             validate_mode_request(config.mode.name(), &payload.request)?;
-            engine.synthesize_with_progress(&req, &mut progress_cb)?
+            engine.synthesize_with_progress(req, progress_cb)?
         }
         FixedMode::Custom { speaker, instruct } => {
             validate_mode_request(config.mode.name(), &payload.request)?;
@@ -634,10 +815,10 @@ fn synthesize_job(
                 }
             }
             engine.synthesize_with_custom_voice_progress(
-                &req,
+                req,
                 speaker,
                 request_instruct,
-                &mut progress_cb,
+                progress_cb,
             )?
         }
         FixedMode::Design { instruct } => {
@@ -650,24 +831,15 @@ fn synthesize_job(
                 .or(payload.request.instructions.as_deref())
                 .or(instruct.as_deref())
                 .context("design mode requires `instructions`, `qts_conditioning.instruct`, or startup --instruct")?;
-            engine.synthesize_with_voice_design_progress(
-                &req,
-                effective_instruct,
-                &mut progress_cb,
-            )?
+            engine.synthesize_with_voice_design_progress(req, effective_instruct, progress_cb)?
         }
         FixedMode::Clone { .. } => {
             validate_mode_request(config.mode.name(), &payload.request)?;
             let prompt = resolve_clone_prompt(engine, config, &payload)?;
-            engine.synthesize_with_voice_clone_prompt_progress(&req, &prompt, &mut progress_cb)?
+            engine.synthesize_with_voice_clone_prompt_progress(req, &prompt, progress_cb)?
         }
     };
-    let bytes = encode_wav_f32(result.sample_rate_hz, &result.pcm_f32)?;
-    Ok(AudioPayload {
-        bytes,
-        sample_rate_hz: result.sample_rate_hz,
-        generated_frames: result.generated_frames,
-    })
+    Ok(result)
 }
 
 fn build_request(defaults: &RequestDefaults, request: &SpeechRequest) -> Result<SynthesizeRequest> {
@@ -701,6 +873,111 @@ fn build_request(defaults: &RequestDefaults, request: &SpeechRequest) -> Result<
             None => defaults.talker_kv_mode,
         },
     })
+}
+
+fn split_long_speech_text(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= LONG_TEXT_SINGLE_PASS_CHARS {
+        return vec![trimmed.to_string()];
+    }
+
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    let mut last_soft_boundary = None;
+
+    for ch in trimmed.chars() {
+        current.push(ch);
+        current_chars += 1;
+        if is_soft_speech_boundary(ch) {
+            last_soft_boundary = Some(current.len());
+        }
+
+        if current_chars >= LONG_TEXT_TARGET_CHARS && is_soft_speech_boundary(ch) {
+            push_segment(&mut segments, &mut current);
+            current_chars = 0;
+            last_soft_boundary = None;
+            continue;
+        }
+
+        if current_chars >= LONG_TEXT_MAX_CHARS {
+            if let Some(boundary) = last_soft_boundary {
+                let tail = current.split_off(boundary);
+                push_segment_text(&mut segments, &current);
+                current = tail;
+                current_chars = current.chars().count();
+                last_soft_boundary = None;
+            } else {
+                push_segment(&mut segments, &mut current);
+                current_chars = 0;
+            }
+        }
+    }
+    push_segment(&mut segments, &mut current);
+    merge_short_tail_segment(&mut segments);
+
+    if segments.is_empty() {
+        vec![trimmed.to_string()]
+    } else {
+        segments
+    }
+}
+
+fn merge_short_tail_segment(segments: &mut Vec<String>) {
+    if segments.len() < 2 {
+        return;
+    }
+    let tail_len = segments
+        .last()
+        .map(|segment| segment.chars().count())
+        .unwrap_or_default();
+    if tail_len >= LONG_TEXT_MIN_TAIL_CHARS {
+        return;
+    }
+    let tail = segments.pop().unwrap_or_default();
+    if let Some(previous) = segments.last_mut() {
+        if !previous.ends_with('\n') && !tail.starts_with('\n') {
+            previous.push('\n');
+        }
+        previous.push_str(&tail);
+    }
+}
+
+fn push_segment(segments: &mut Vec<String>, current: &mut String) {
+    push_segment_text(segments, current);
+    current.clear();
+}
+
+fn push_segment_text(segments: &mut Vec<String>, text: &str) {
+    let segment = text.trim();
+    if !segment.is_empty() {
+        segments.push(segment.to_string());
+    }
+}
+
+fn is_soft_speech_boundary(ch: char) -> bool {
+    matches!(
+        ch,
+        '。' | '！' | '？' | '；' | '，' | '、' | '.' | '!' | '?' | ';' | ',' | '\n' | '\r'
+    )
+}
+
+fn segment_max_audio_frames(
+    segment: &str,
+    requested_frames: Option<usize>,
+    default_frames: usize,
+) -> usize {
+    if let Some(frames) = requested_frames {
+        return frames.max(1);
+    }
+    let char_count = segment.chars().count();
+    if char_count <= LONG_TEXT_SHORT_CHARS {
+        default_frames.max(256)
+    } else if char_count <= LONG_TEXT_TARGET_CHARS {
+        default_frames.max(384)
+    } else {
+        default_frames.max(512)
+    }
 }
 
 fn validate_mode_request(fixed_mode: &str, request: &SpeechRequest) -> Result<()> {
@@ -866,6 +1143,45 @@ fn update_progress(jobs: &JobStore, job_id: &str, progress: SynthesisProgress) {
     }
 }
 
+fn update_segmented_progress(
+    jobs: &JobStore,
+    job_id: &str,
+    progress: SynthesisProgress,
+    completed_frames: usize,
+    total_max_frames: usize,
+) {
+    let segment_max_frames = progress.max_frames.max(1);
+    let local_ratio = match progress.stage {
+        SynthesisProgressStage::Preparing => 0.02,
+        SynthesisProgressStage::Prefill => 0.05,
+        SynthesisProgressStage::Rollout => {
+            progress.generated_frames as f32 / segment_max_frames as f32
+        }
+        SynthesisProgressStage::Vocoder => 0.98,
+        SynthesisProgressStage::Done => 1.0,
+    }
+    .clamp(0.0, 1.0);
+    let segment_progress_frames = (local_ratio * segment_max_frames as f32).round() as usize;
+    let adjusted_generated_frames = completed_frames
+        .saturating_add(segment_progress_frames)
+        .min(total_max_frames);
+    if let Some(job) = jobs.lock().expect("job lock poisoned").get_mut(job_id) {
+        job.status = "running".into();
+        job.stage = match progress.stage {
+            SynthesisProgressStage::Preparing => "preparing",
+            SynthesisProgressStage::Prefill => "prefill",
+            SynthesisProgressStage::Rollout => "rollout",
+            SynthesisProgressStage::Vocoder => "vocoder",
+            SynthesisProgressStage::Done => "rollout",
+        }
+        .into();
+        job.generated_frames = adjusted_generated_frames;
+        job.max_frames = total_max_frames;
+        let global_ratio = adjusted_generated_frames as f32 / total_max_frames.max(1) as f32;
+        job.progress = (0.02 + 0.93 * global_ratio).clamp(job.progress, 0.99);
+    }
+}
+
 fn mark_done(jobs: &JobStore, job_id: &str, audio: &AudioPayload) {
     if let Some(job) = jobs.lock().expect("job lock poisoned").get_mut(job_id) {
         job.status = "done".into();
@@ -950,4 +1266,145 @@ fn print_usage() {
     eprintln!(
         "usage:\n  qts_server --mode none|custom|design|clone [--model-dir DIR] [--host 127.0.0.1] [--port 8080] [--speaker NAME] [--instruct TEXT] [--voice-clone-prompt prompt.pb | --voice-clone-wav REF.wav [--voice-clone-ref-text TEXT]] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--talker-kv-mode f16|turboquant] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|cuda|directml|nvrtx|tensorrt] [--vocoder-ep-fallback LIST]\n\nserver mode is fixed at startup. Requests may provide mode-specific fields, but cannot switch conditioning type."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_long_speech_text_keeps_short_text_as_one_segment() {
+        let segments = split_long_speech_text("你好呀，今天过得怎么样？");
+        assert_eq!(segments, vec!["你好呀，今天过得怎么样？"]);
+    }
+
+    #[test]
+    fn split_long_speech_text_keeps_medium_text_as_one_segment() {
+        let text = "新华社北京二月十七日电　新华社奉中国政府之命，于一九七九年二月十七日发布声明如下：\n\n越南当局无视中国方面的一再警告，最近连续出动武装部队，侵犯中国领土，袭击中国边防人员和边境居民，局势急剧恶化，严重威胁我国边疆的和平和安全。中国边防部队在忍无可忍的情况下，被迫奋起还击。";
+        let segments = split_long_speech_text(text);
+        assert_eq!(segments, vec![text.trim()]);
+    }
+
+    #[test]
+    fn split_long_speech_text_prefers_sentence_boundaries() {
+        let text = "第一段内容，".repeat(50) + "最后一句。";
+        let segments = split_long_speech_text(&text);
+        assert!(segments.len() > 1);
+        assert!(segments
+            .iter()
+            .all(|segment| segment.chars().count() <= LONG_TEXT_MAX_CHARS));
+        assert_eq!(
+            segments.concat().replace(char::is_whitespace, ""),
+            text.replace(char::is_whitespace, "")
+        );
+    }
+
+    #[test]
+    fn split_long_speech_text_merges_short_tail() {
+        let text = "This is a sentence with enough words to create a long segment, ".repeat(8)
+            + "short tail.";
+        let segments = split_long_speech_text(&text);
+        assert!(segments.len() > 1);
+        assert!(segments
+            .last()
+            .map(|segment| segment.chars().count() >= LONG_TEXT_MIN_TAIL_CHARS)
+            .unwrap_or(false));
+        assert_eq!(
+            without_whitespace(&segments.concat()),
+            without_whitespace(&text)
+        );
+    }
+
+    #[test]
+    fn split_long_speech_text_hard_splits_when_no_boundary_exists() {
+        let text = "长".repeat(LONG_TEXT_MAX_CHARS * 2 + 17);
+        let segments = split_long_speech_text(&text);
+        assert_eq!(segments.len(), 2);
+        assert!(segments.iter().all(
+            |segment| segment.chars().count() <= LONG_TEXT_MAX_CHARS + LONG_TEXT_MIN_TAIL_CHARS
+        ));
+        assert_eq!(
+            without_whitespace(&segments.concat()),
+            without_whitespace(&text)
+        );
+    }
+
+    fn without_whitespace(text: &str) -> String {
+        text.chars().filter(|ch| !ch.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn segment_max_audio_frames_uses_request_frames_when_present() {
+        assert_eq!(segment_max_audio_frames("短句", Some(123), 256), 123);
+        assert_eq!(segment_max_audio_frames("短句", Some(0), 256), 1);
+    }
+
+    #[test]
+    fn segment_max_audio_frames_scales_for_longer_segments() {
+        assert_eq!(segment_max_audio_frames(&"短".repeat(40), None, 256), 256);
+        assert_eq!(segment_max_audio_frames(&"中".repeat(90), None, 256), 384);
+        assert_eq!(segment_max_audio_frames(&"长".repeat(140), None, 256), 512);
+    }
+
+    #[test]
+    fn segmented_progress_offsets_rollout_frames() {
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        jobs.lock().unwrap().insert(
+            "1".into(),
+            JobInfo {
+                job_id: "1".into(),
+                status: "running".into(),
+                stage: "rollout".into(),
+                progress: 0.0,
+                generated_frames: 0,
+                max_frames: 10,
+                sample_rate_hz: None,
+                error: None,
+                created_at_ms: 0,
+                started_at_ms: Some(0),
+                finished_at_ms: None,
+                audio: None,
+            },
+        );
+
+        update_segmented_progress(&jobs, "1", SynthesisProgress::rollout(25, 100), 200, 500);
+        let job = jobs.lock().unwrap().get("1").cloned().unwrap();
+        assert_eq!(job.generated_frames, 225);
+        assert_eq!(job.max_frames, 500);
+        assert!(job.progress > 0.05);
+        assert!(job.progress < 0.95);
+    }
+
+    #[test]
+    fn segmented_progress_does_not_jump_to_global_vocoder_near_done() {
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        jobs.lock().unwrap().insert(
+            "1".into(),
+            JobInfo {
+                job_id: "1".into(),
+                status: "running".into(),
+                stage: "rollout".into(),
+                progress: 0.0,
+                generated_frames: 0,
+                max_frames: 10,
+                sample_rate_hz: None,
+                error: None,
+                created_at_ms: 0,
+                started_at_ms: Some(0),
+                finished_at_ms: None,
+                audio: None,
+            },
+        );
+
+        update_segmented_progress(
+            &jobs,
+            "1",
+            SynthesisProgress::new(SynthesisProgressStage::Vocoder, 94, 384),
+            0,
+            1408,
+        );
+        let job = jobs.lock().unwrap().get("1").cloned().unwrap();
+        assert_eq!(job.stage, "vocoder");
+        assert!(job.progress < 0.30);
+    }
 }
