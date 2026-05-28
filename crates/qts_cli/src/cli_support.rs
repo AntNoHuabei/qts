@@ -75,6 +75,8 @@ pub(crate) struct CommonSynthesisArgs {
     pub(crate) out_path: Option<PathBuf>,
     pub(crate) dump_codec_frames_path: Option<PathBuf>,
     pub(crate) voice_clone_prompt: Option<PathBuf>,
+    pub(crate) voice_clone_wav: Option<PathBuf>,
+    pub(crate) voice_clone_ref_text: Option<String>,
     pub(crate) speaker: Option<String>,
     pub(crate) instruct: Option<String>,
     pub(crate) thread_count: usize,
@@ -98,6 +100,8 @@ impl CommonSynthesisArgs {
             out_path: None,
             dump_codec_frames_path: None,
             voice_clone_prompt: None,
+            voice_clone_wav: None,
+            voice_clone_ref_text: None,
             speaker: None,
             instruct: None,
             thread_count: 4,
@@ -139,6 +143,15 @@ impl CommonSynthesisArgs {
             "--voice-clone-prompt" => {
                 self.voice_clone_prompt =
                     Some(PathBuf::from(value_arg(args, idx, "--voice-clone-prompt")?));
+                Ok(true)
+            }
+            "--voice-clone-wav" => {
+                self.voice_clone_wav =
+                    Some(PathBuf::from(value_arg(args, idx, "--voice-clone-wav")?));
+                Ok(true)
+            }
+            "--voice-clone-ref-text" => {
+                self.voice_clone_ref_text = Some(value_arg(args, idx, "--voice-clone-ref-text")?);
                 Ok(true)
             }
             "--speaker" => {
@@ -195,11 +208,19 @@ impl CommonSynthesisArgs {
     }
 
     pub(crate) fn validate_conditioning(&self) -> Result<()> {
-        if self.voice_clone_prompt.is_some() && self.speaker.is_some() {
-            anyhow::bail!("--voice-clone-prompt cannot be combined with --speaker");
+        let clone_modes = usize::from(self.voice_clone_prompt.is_some())
+            + usize::from(self.voice_clone_wav.is_some());
+        if clone_modes > 1 {
+            anyhow::bail!("--voice-clone-prompt cannot be combined with --voice-clone-wav");
         }
-        if self.voice_clone_prompt.is_some() && self.instruct.is_some() {
-            anyhow::bail!("--voice-clone-prompt cannot be combined with --instruct");
+        if clone_modes > 0 && self.speaker.is_some() {
+            anyhow::bail!("voice clone flags cannot be combined with --speaker");
+        }
+        if clone_modes > 0 && self.instruct.is_some() {
+            anyhow::bail!("voice clone flags cannot be combined with --instruct");
+        }
+        if self.voice_clone_ref_text.is_some() && self.voice_clone_wav.is_none() {
+            anyhow::bail!("--voice-clone-ref-text requires --voice-clone-wav");
         }
         Ok(())
     }

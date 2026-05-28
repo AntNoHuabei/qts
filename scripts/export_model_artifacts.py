@@ -15,6 +15,8 @@ from typing import Any, Iterator
 import numpy as np
 import onnx
 import torch
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.models.mimi import modeling_mimi
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from tqdm import tqdm
@@ -433,6 +435,102 @@ class VocoderOnnxWrapper(torch.nn.Module):
         return audio_values, audio_lengths
 
 
+class TokenizerEncoderOnnxWrapper(torch.nn.Module):
+    def __init__(self, tokenizer_model: torch.nn.Module):
+        super().__init__()
+        self.model = tokenizer_model
+
+    def forward(self, input_values: torch.Tensor) -> torch.Tensor:
+        encoded = self.model.encoder.encode(
+            input_values=input_values.unsqueeze(1),
+            return_dict=True,
+        )
+        codes = encoded.audio_codes
+        codes = codes[:, : self.model.encoder_valid_num_quantizers]
+        return codes.transpose(1, 2).to(dtype=torch.long)
+
+
+def patch_mimi_encoder_for_onnx_export(transformer: torch.nn.Module) -> None:
+    """Avoid exporter-hostile masking/vmap code while preserving causal masking."""
+
+    def simple_forward(
+        self: torch.nn.Module,
+        hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Any | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        cache_position: torch.Tensor | None = None,
+    ) -> Any:
+        del attention_mask, past_key_values, use_cache
+        assert hidden_states is not None
+        batch_size = hidden_states.shape[0]
+        seq_len = hidden_states.shape[1]
+        if cache_position is None:
+            cache_position = torch.arange(seq_len, device=hidden_states.device)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        q = torch.arange(seq_len, device=hidden_states.device).view(seq_len, 1)
+        k = torch.arange(seq_len, device=hidden_states.device).view(1, seq_len)
+        allowed = k <= q
+        window = int(getattr(self.config, "sliding_window", 0) or 0)
+        if window > 0:
+            allowed = allowed & (k >= (q - window + 1))
+        mask = torch.zeros((seq_len, seq_len), dtype=hidden_states.dtype, device=hidden_states.device)
+        mask = mask.masked_fill(~allowed, torch.finfo(hidden_states.dtype).min)
+        causal_mask = mask.view(1, 1, seq_len, seq_len).expand(batch_size, 1, seq_len, seq_len)
+
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        for layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                output_attentions=bool(output_attentions),
+                use_cache=False,
+                cache_position=cache_position,
+            )
+            hidden_states = layer_outputs[0]
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+        if not return_dict:
+            return tuple(
+                v for v in [hidden_states, None, all_hidden_states, all_self_attns] if v is not None
+            )
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=None,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+    transformer.forward = simple_forward.__get__(transformer, type(transformer))
+
+
+def patch_mimi_vq_for_onnx_export() -> None:
+    """Replace torch.cdist with ONNX-friendly squared-distance matmul."""
+
+    def quantize(self: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden = hidden_states.float()
+        embed = self.embed.float()
+        hidden_norm = (hidden * hidden).sum(dim=-1, keepdim=True)
+        embed_norm = (embed * embed).sum(dim=-1).unsqueeze(0)
+        dists = hidden_norm - 2.0 * torch.matmul(hidden, embed.transpose(0, 1)) + embed_norm
+        return dists.argmin(dim=-1)
+
+    modeling_mimi.MimiEuclideanCodebook.quantize = quantize
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Hugging Face repo id or local model directory.")
@@ -449,6 +547,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--main-out", default=None, help="Override the main GGUF output path.")
     parser.add_argument("--vocoder-out", default=None, help="Override the vocoder ONNX output path.")
     parser.add_argument(
+        "--tokenizer-encoder-out",
+        default=None,
+        help="Experimental: export the speech-tokenizer encoder ONNX to this path.",
+    )
+    parser.add_argument(
+        "--export-tokenizer-encoder",
+        action="store_true",
+        help="Attempt experimental speech-tokenizer encoder ONNX export.",
+    )
+    parser.add_argument(
         "--vocoder-dtype",
         default="float32",
         help="dtype used when loading the PyTorch vocoder before ONNX export.",
@@ -458,6 +566,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=17,
         help="ONNX opset version for vocoder export.",
+    )
+    parser.add_argument(
+        "--tokenizer-encoder-opset",
+        type=int,
+        default=17,
+        help="ONNX opset version for speech-tokenizer encoder export.",
     )
     parser.add_argument(
         "--local-files-only",
@@ -533,6 +647,10 @@ def default_main_output(out_dir: Path, main_type: str) -> Path:
 
 def default_vocoder_output(out_dir: Path) -> Path:
     return out_dir / "qwen3-tts-vocoder.onnx"
+
+
+def default_tokenizer_encoder_output(out_dir: Path) -> Path:
+    return out_dir / "qwen3-tts-tokenizer-encoder.onnx"
 
 
 def add_onnx_metadata(
@@ -664,6 +782,74 @@ def export_vocoder_onnx(
     return output_path
 
 
+def export_tokenizer_encoder_onnx(
+    *,
+    speech_tokenizer_dir: Path,
+    output_path: Path,
+    source_model: str,
+    dtype_name: str,
+    opset: int,
+) -> Path:
+    tokenizer = Qwen3TTSTokenizer.from_pretrained(
+        str(speech_tokenizer_dir),
+        device_map="cpu",
+        dtype=resolve_dtype(dtype_name),
+        attn_implementation="eager",
+    )
+    model = tokenizer.model
+    model.eval()
+    if model.get_model_type() != "qwen3_tts_tokenizer_12hz":
+        raise SystemExit(
+            f"Only the 12Hz speech tokenizer encoder is supported for ONNX export, got {model.get_model_type()}"
+        )
+    patch_mimi_encoder_for_onnx_export(model.encoder.encoder_transformer)
+    patch_mimi_vq_for_onnx_export()
+
+    input_sample_rate = int(model.get_input_sample_rate())
+    num_quantizers = int(model.config.encoder_valid_num_quantizers)
+    wrapper = TokenizerEncoderOnnxWrapper(model).cpu().eval()
+    dummy_samples = torch.zeros((1, input_sample_rate), dtype=torch.float32)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        wrapper,
+        (dummy_samples,),
+        str(output_path),
+        export_params=True,
+        opset_version=opset,
+        dynamo=False,
+        do_constant_folding=True,
+        input_names=["input_values"],
+        output_names=["audio_codes"],
+        dynamic_axes={
+            "input_values": {0: "batch", 1: "samples"},
+            "audio_codes": {0: "batch", 1: "frames"},
+        },
+    )
+    model_proto = onnx.load(str(output_path), load_external_data=True)
+    metadata = {
+        "source_model": source_model,
+        "speech_tokenizer_dir": str(speech_tokenizer_dir),
+        "input_sample_rate_hz": str(input_sample_rate),
+        "num_quantizers": str(num_quantizers),
+        "input_layout": "batch,samples",
+        "output_layout": "batch,frames,quantizers",
+    }
+    for key, value in metadata.items():
+        prop = model_proto.metadata_props.add()
+        prop.key = key
+        prop.value = value
+    onnx.save_model(model_proto, str(output_path), save_as_external_data=False)
+    cleanup_stale_onnx_external_data(output_path)
+    logger.info(
+        "Exported speech-tokenizer encoder ONNX: path=%s input_sample_rate=%s num_quantizers=%s",
+        output_path,
+        input_sample_rate,
+        num_quantizers,
+    )
+    return output_path
+
+
 def main() -> None:
     configure_stdio()
     args = parse_args()
@@ -673,16 +859,26 @@ def main() -> None:
     model_dir = resolve_model_dir(args.model, local_files_only=args.local_files_only)
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(model_dir / "config.json", out_dir / "config.json")
+    src_config = (model_dir / "config.json").resolve()
+    dst_config = (out_dir / "config.json").resolve()
+    if src_config != dst_config:
+        shutil.copy2(src_config, dst_config)
 
     if args.main_out and len(main_types) != 1:
         raise SystemExit("--main-out can only be used when exporting exactly one --main-type.")
 
     vocoder_out = Path(args.vocoder_out).expanduser().resolve() if args.vocoder_out else default_vocoder_output(out_dir)
+    tokenizer_encoder_out = (
+        Path(args.tokenizer_encoder_out).expanduser().resolve()
+        if args.tokenizer_encoder_out
+        else default_tokenizer_encoder_output(out_dir)
+    )
 
     logger.info("Resolved model dir: %s", model_dir)
     logger.info("Main GGUF types: %s", ", ".join(main_types))
     logger.info("Vocoder ONNX output: %s", vocoder_out)
+    if args.export_tokenizer_encoder:
+        logger.info("Tokenizer encoder ONNX output: %s", tokenizer_encoder_out)
 
     gguf_outputs: list[Path] = []
     for main_type in main_types:
@@ -716,9 +912,28 @@ def main() -> None:
             opset=args.vocoder_opset,
         )
 
+    tokenizer_encoder_onnx = None
+    if args.export_tokenizer_encoder:
+        if tokenizer_encoder_out.exists():
+            logger.info("Reusing existing tokenizer encoder ONNX: %s", tokenizer_encoder_out)
+            normalize_onnx_to_single_file(tokenizer_encoder_out)
+            tokenizer_encoder_onnx = tokenizer_encoder_out
+        else:
+            tokenizer_encoder_onnx = export_tokenizer_encoder_onnx(
+                speech_tokenizer_dir=model_dir / "speech_tokenizer",
+                output_path=tokenizer_encoder_out,
+                source_model=args.model,
+                dtype_name=args.vocoder_dtype,
+                opset=args.tokenizer_encoder_opset,
+            )
+
+    tokenizer_encoder_part = (
+        f" tokenizer_encoder_onnx={tokenizer_encoder_onnx}" if tokenizer_encoder_onnx else ""
+    )
     print(
         f"exported artifacts: main_ggufs={','.join(str(path) for path in gguf_outputs)} "
-        f"vocoder_onnx={onnx_out} main_types={','.join(main_types)}"
+        f"vocoder_onnx={onnx_out}{tokenizer_encoder_part} "
+        f"main_types={','.join(main_types)}"
     )
 
 

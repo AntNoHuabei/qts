@@ -5,6 +5,45 @@ use serde::{Deserialize, Deserializer};
 
 use crate::{ModelPaths, Qwen3TtsError};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceModelKind {
+    Base,
+    CustomVoice,
+    VoiceDesign,
+}
+
+impl VoiceModelKind {
+    pub fn load(paths: &ModelPaths) -> Result<Self, Qwen3TtsError> {
+        if !paths.config_json.is_file() {
+            return Ok(Self::Base);
+        }
+
+        let config_text = fs::read_to_string(&paths.config_json)?;
+        let parsed: Qwen3TtsConfig = serde_json::from_str(&config_text).map_err(|err| {
+            Qwen3TtsError::InvalidInput(format!(
+                "failed to parse {}: {err}",
+                paths.config_json.display()
+            ))
+        })?;
+
+        Ok(match parsed.tts_model_type.as_deref() {
+            Some("custom_voice") => Self::CustomVoice,
+            Some("voice_design") => Self::VoiceDesign,
+            _ => Self::Base,
+        })
+    }
+
+    #[must_use]
+    pub fn is_custom_voice(self) -> bool {
+        matches!(self, Self::CustomVoice)
+    }
+
+    #[must_use]
+    pub fn is_voice_design(self) -> bool {
+        matches!(self, Self::VoiceDesign)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CustomVoiceMetadata {
     speaker_ids: HashMap<String, i32>,

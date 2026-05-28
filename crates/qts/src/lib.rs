@@ -13,6 +13,7 @@ mod voice_clone_prompt;
 pub use custom_voice::CustomVoiceMetadata;
 pub use error::Qwen3TtsError;
 pub use model::{load_and_validate, GgufFile, ModelPaths};
+pub use pipeline::audio_code_encoder::{AudioCodeEncoder, AudioCodeEncoderConfig};
 pub use pipeline::backend::BackendKind;
 pub use pipeline::speaker_encoder::{SpeakerEncoder, SpeakerEncoderConfig};
 pub use pipeline::tokenizer::{TextTokenizer, TokenizerConfig};
@@ -29,7 +30,61 @@ pub use voice_clone_prompt::{
     TensorF32, TensorI32, VoiceClonePromptV2, VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
 };
 
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
+
+pub(crate) fn trace_stage(label: &str) {
+    if std::env::var_os("QWEN3_TTS_TRACE").is_some() {
+        eprintln!("[qts-trace] {label}");
+    }
+}
+
+pub(crate) fn ensure_ort_init() -> Result<(), Qwen3TtsError> {
+    static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+    ORT_INIT
+        .get_or_init(|| {
+            ensure_ort_dylib_path().map_err(|err| err.to_string())?;
+            let _ = ort::init().commit();
+            Ok(())
+        })
+        .as_ref()
+        .map(|_| ())
+        .map_err(|err| Qwen3TtsError::Ort(err.clone()))
+}
+
+fn ensure_ort_dylib_path() -> Result<(), Qwen3TtsError> {
+    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("onnxruntime.dll"));
+            }
+        }
+        if let Ok(dir) = std::env::current_dir() {
+            candidates.push(dir.join("onnxruntime.dll"));
+            candidates.push(dir.join("target").join("release").join("onnxruntime.dll"));
+        }
+
+        if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+            unsafe { std::env::set_var("ORT_DYLIB_PATH", path) };
+            return Ok(());
+        }
+
+        return Err(Qwen3TtsError::Ort(
+            "ONNX Runtime DLL not found. Put onnxruntime.dll next to qts_cli.exe or set ORT_DYLIB_PATH to its full path.".into(),
+        ));
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
+}
 
 /// User-facing synthesis parameters (stable for future `gdext` bindings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -161,18 +216,26 @@ pub struct Qwen3TtsEngine {
     transformer: TtsTransformer,
     vocoder: Vocoder,
     speaker_encoder: SpeakerEncoder,
+    audio_code_encoder: Mutex<Option<AudioCodeEncoder>>,
 }
 
 impl Qwen3TtsEngine {
     pub fn load(paths: ModelPaths) -> Result<Self, Qwen3TtsError> {
+        trace_stage("load: validate paths");
         load_and_validate(&paths)?;
+        trace_stage("load: custom voice metadata");
         let custom_voice = CustomVoiceMetadata::load(&paths)?;
-        let main = GgufFile::open(&paths.main_gguf)?;
-        let tokenizer = TextTokenizer::load_from_gguf(&main)?;
-        let transformer = TtsTransformer::load_from_gguf(&main)?;
+        trace_stage("load: vocoder");
         let vocoder = Vocoder::load_from_onnx(&paths.vocoder_onnx)?;
+        trace_stage("load: open main gguf");
+        let main = GgufFile::open(&paths.main_gguf)?;
+        trace_stage("load: tokenizer");
+        let tokenizer = TextTokenizer::load_from_gguf(&main)?;
+        trace_stage("load: transformer");
+        let transformer = TtsTransformer::load_from_gguf(&main)?;
+        trace_stage("load: speaker encoder");
         let speaker_encoder = SpeakerEncoder::new(transformer.config().hidden_size as usize)?;
-
+        trace_stage("load: done");
         Ok(Self {
             paths,
             custom_voice,
@@ -180,6 +243,7 @@ impl Qwen3TtsEngine {
             transformer,
             vocoder,
             speaker_encoder,
+            audio_code_encoder: Mutex::new(None),
         })
     }
 
@@ -238,6 +302,26 @@ impl Qwen3TtsEngine {
 
     pub fn encode_reference_speaker(&self, wav_bytes: &[u8]) -> Result<Vec<f32>, Qwen3TtsError> {
         self.speaker_encoder.encode_wav_bytes(wav_bytes)
+    }
+
+    pub fn encode_reference_audio_codes(
+        &self,
+        wav_bytes: &[u8],
+    ) -> Result<TensorI32, Qwen3TtsError> {
+        let mut encoder = self
+            .audio_code_encoder
+            .lock()
+            .map_err(|_| Qwen3TtsError::InvalidInput("audio code encoder mutex poisoned".into()))?;
+        if encoder.is_none() {
+            trace_stage("audio-code-encoder: load");
+            *encoder = Some(AudioCodeEncoder::load_from_onnx(
+                &self.paths.tokenizer_encoder_onnx,
+            )?);
+            trace_stage("audio-code-encoder: loaded");
+        }
+        let encoder = encoder.as_ref().expect("audio code encoder loaded");
+        trace_stage("audio-code-encoder: encode wav");
+        encoder.encode_wav_bytes(wav_bytes)
     }
 
     #[must_use]
@@ -438,12 +522,14 @@ impl Qwen3TtsEngine {
         voice_clone_prompt: Option<&VoiceClonePromptV2>,
         custom_voice: Option<CustomVoiceConditioning<'_>>,
     ) -> Result<SynthesizeDebugResult, Qwen3TtsError> {
+        trace_stage("synthesize-debug: prepare");
         let prepared = self.prepare_synthesis(
             req,
             speaker_embedding_override,
             voice_clone_prompt,
             custom_voice,
         )?;
+        trace_stage("synthesize-debug: rollout");
         let codec_rollout = self.transformer.rollout_codec_frames_kv(
             &prepared.prepared_inputs.prefill_embd,
             &prepared.prepared_inputs.trailing_text_hidden,
@@ -458,6 +544,7 @@ impl Qwen3TtsEngine {
             req.top_p,
         )?;
 
+        trace_stage("synthesize-debug: flatten");
         let generated_frames = codec_rollout
             .frames
             .len()
@@ -467,11 +554,13 @@ impl Qwen3TtsEngine {
             .iter()
             .flat_map(|frame| frame.codebook_tokens.iter().copied())
             .collect::<Vec<_>>();
+        trace_stage("synthesize-debug: vocoder decode");
         let pcm_all = self.vocoder.decode(
             &flattened_codes,
             codec_rollout.frames.len(),
             req.thread_count,
         )?;
+        trace_stage("synthesize-debug: done");
         let pcm_f32 = if prepared.prefix_frame_count == 0 || codec_rollout.frames.is_empty() {
             pcm_all
         } else {
@@ -505,7 +594,7 @@ impl Qwen3TtsEngine {
             prefix_frame_count: prepared.prefix_frame_count,
             debug_step_embeddings: codec_rollout.debug_step_embeddings,
             debug_trailing_rows: codec_rollout.debug_trailing_rows,
-            debug_code_pred_steps: codec_rollout
+            debug_code_pred_steps: match codec_rollout
                 .frames
                 .iter()
                 .skip(prepared.prefix_frame_count)
@@ -518,7 +607,16 @@ impl Qwen3TtsEngine {
                         8,
                     )
                 })
-                .collect::<Result<Vec<_>, _>>()?,
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(steps) => steps,
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to recompute debug code predictor steps; continuing without codepred_first2: {err}"
+                    );
+                    Vec::new()
+                }
+            },
         })
     }
 

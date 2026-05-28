@@ -7,15 +7,23 @@ pub struct ModelPaths {
     pub main_gguf: PathBuf,
     /// Vocoder artifact exported for ONNX Runtime.
     pub vocoder_onnx: PathBuf,
+    /// Optional speech-tokenizer encoder exported for ONNX Runtime.
+    pub tokenizer_encoder_onnx: PathBuf,
     /// Optional copied source config for model-type specific runtime behavior.
     pub config_json: PathBuf,
 }
 
 impl ModelPaths {
-    pub fn new(main_gguf: PathBuf, vocoder_onnx: PathBuf, config_json: PathBuf) -> Self {
+    pub fn new(
+        main_gguf: PathBuf,
+        vocoder_onnx: PathBuf,
+        tokenizer_encoder_onnx: PathBuf,
+        config_json: PathBuf,
+    ) -> Self {
         Self {
             main_gguf,
             vocoder_onnx,
+            tokenizer_encoder_onnx,
             config_json,
         }
     }
@@ -38,7 +46,8 @@ impl ModelPaths {
                     "qwen3-tts-0.6b-q4_k.gguf",
                 ],
             ),
-            vocoder_onnx: dir.join("qwen3-tts-vocoder.onnx"),
+            vocoder_onnx: choose_vocoder_file(dir),
+            tokenizer_encoder_onnx: dir.join("qwen3-tts-tokenizer-encoder.onnx"),
             config_json: dir.join("config.json"),
         }
     }
@@ -49,6 +58,10 @@ impl ModelPaths {
 
     pub fn vocoder_exists(&self) -> bool {
         self.vocoder_onnx.is_file()
+    }
+
+    pub fn tokenizer_encoder_exists(&self) -> bool {
+        self.tokenizer_encoder_onnx.is_file()
     }
 }
 
@@ -61,6 +74,28 @@ fn choose_model_file(dir: &Path, candidates: &[&str]) -> PathBuf {
     }
 
     dir.join(candidates[0])
+}
+
+fn choose_vocoder_file(dir: &Path) -> PathBuf {
+    let local = dir.join("qwen3-tts-vocoder.onnx");
+    if local.is_file() {
+        return local;
+    }
+
+    let Some(parent) = dir.parent() else {
+        return local;
+    };
+    for sibling in [
+        "Qwen3-TTS-12Hz-0.6B-Base",
+        "Qwen3-TTS-12Hz-1.7B-Base",
+    ] {
+        let path = parent.join(sibling).join("qwen3-tts-vocoder.onnx");
+        if path.is_file() {
+            return path;
+        }
+    }
+
+    local
 }
 
 #[cfg(test)]

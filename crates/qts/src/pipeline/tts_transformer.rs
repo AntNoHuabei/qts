@@ -1536,7 +1536,7 @@ impl TtsTransformer {
         let mut debug_step_embeddings = Vec::new();
         let mut debug_trailing_rows = Vec::new();
 
-        while frames.len() < max_frames {
+        while frames.len().saturating_sub(prompt_frames.len()) < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
             let recent_tokens = Self::recent_codebook0_tokens_from_frames(&frames);
             let prev_token = frames
@@ -1756,7 +1756,7 @@ impl TtsTransformer {
         let mut debug_step_embeddings = Vec::new();
         let mut debug_trailing_rows = Vec::new();
 
-        while frames.len() < max_frames {
+        while frames.len().saturating_sub(prompt_frames.len()) < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
             let recent_tokens = Self::recent_codebook0_tokens_from_frames(&frames);
             let trailing_idx = generated_frames.saturating_sub(1);
@@ -2046,7 +2046,7 @@ impl TtsTransformer {
         let mut kv_download_dur = Duration::ZERO;
         let mut kv_quantize_dur = Duration::ZERO;
         let mut kv_upload_dur = Duration::ZERO;
-        while frames.len() < max_frames {
+        while frames.len().saturating_sub(prompt_frames.len()) < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
             let recent_tokens = Self::recent_codebook0_tokens_from_frames(&frames);
             let trailing_idx = generated_frames.saturating_sub(1);

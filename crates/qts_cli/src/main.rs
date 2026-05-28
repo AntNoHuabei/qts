@@ -4,7 +4,10 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
-use qts::{CodePredDebugStep, Qwen3TtsEngine, SynthesisStageTimings, VoiceClonePromptV2};
+use qts::{
+    CodePredDebugStep, Qwen3TtsEngine, SynthesisStageTimings, TensorF32, VoiceClonePromptV2,
+    VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+};
 use serde::Serialize;
 
 mod cli_support;
@@ -42,6 +45,26 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
     let engine = load_engine(&common.model_dir, &common.runtime_backends)?;
     let request = common.build_request(text)?;
     let conditioning = load_synthesis_conditioning(&engine, &common)?;
+    if common.dump_codec_frames_path.is_none() {
+        let result = match &conditioning {
+            LoadedConditioning::VoiceClonePrompt(prompt) => {
+                engine.synthesize_with_voice_clone_prompt(&request, prompt)?
+            }
+            LoadedConditioning::CustomVoice { speaker, instruct } => {
+                engine.synthesize_with_custom_voice(&request, speaker, instruct.as_deref())?
+            }
+            LoadedConditioning::None => engine.synthesize(&request)?,
+        };
+        write_wav_f32(&out_path, result.sample_rate_hz, &result.pcm_f32)?;
+        eprintln!(
+            "wrote synthesis: path={} sample_rate={} frames={} samples={}",
+            out_path.display(),
+            result.sample_rate_hz,
+            result.generated_frames,
+            result.pcm_f32.len()
+        );
+        return Ok(());
+    }
 
     let debug_result = if let LoadedConditioning::VoiceClonePrompt(prompt) = &conditioning {
         engine.synthesize_with_voice_clone_prompt_debug(&request, prompt)?
@@ -83,7 +106,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         eprintln!(
             "qwen3-tts-cli profile — print per-stage synthesis timings (wall clock)\n\n\
-             usage:\n  profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--speaker NAME] [--instruct TEXT] [--vocoder-threads N] [--chunk-size N] [--talker-kv-mode f16|turboquant] [--voice-clone-prompt PATH] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|cuda|nvrtx|tensorrt|coreml|directml] [--vocoder-ep-fallback LIST]\n\n\
+             usage:\n  profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--speaker NAME] [--instruct TEXT] [--vocoder-threads N] [--chunk-size N] [--talker-kv-mode f16|turboquant] [--voice-clone-prompt PATH | --voice-clone-wav REF.wav [--voice-clone-ref-text TEXT]] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|cuda|nvrtx|tensorrt|coreml|directml] [--vocoder-ep-fallback LIST]\n\n\
              CLI flags override environment variables.\n\
              Default transformer auto chain: Apple = metal,vulkan,cpu ; others = vulkan,cpu.\n\
              Default vocoder auto chain: Apple = coreml,cpu ; Windows = cuda,nvrtx,tensorrt,directml,cpu ; Linux/others = cuda,nvrtx,tensorrt,cpu.\n\n\
@@ -178,6 +201,14 @@ fn load_synthesis_conditioning(
         let prompt = engine.decode_voice_clone_prompt(&bytes)?;
         return Ok(LoadedConditioning::VoiceClonePrompt(prompt));
     }
+    if let Some(path) = &args.voice_clone_wav {
+        let prompt = if let Some(ref_text) = &args.voice_clone_ref_text {
+            build_icl_voice_clone_prompt(engine, args, path, ref_text)?
+        } else {
+            build_wav_only_voice_clone_prompt(engine, args, path)?
+        };
+        return Ok(LoadedConditioning::VoiceClonePrompt(prompt));
+    }
     if let Some(speaker) = &args.speaker {
         if engine.custom_voice_metadata().is_none() {
             bail!(
@@ -192,6 +223,64 @@ fn load_synthesis_conditioning(
         });
     }
     Ok(LoadedConditioning::None)
+}
+
+fn build_wav_only_voice_clone_prompt(
+    engine: &Qwen3TtsEngine,
+    args: &CommonSynthesisArgs,
+    path: &Path,
+) -> Result<VoiceClonePromptV2> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let speaker_embedding = engine.encode_reference_speaker(&bytes)?;
+    let prompt = VoiceClonePromptV2 {
+        schema_version: VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+        source: path.display().to_string(),
+        model_id: args.model_dir.display().to_string(),
+        speaker_encoder_sample_rate_hz: 16_000,
+        x_vector_only_mode: true,
+        icl_mode: false,
+        ref_text: String::new(),
+        ref_code: None,
+        ref_spk_embedding: Some(TensorF32 {
+            shape: vec![speaker_embedding.len() as u32],
+            values: speaker_embedding,
+        }),
+    };
+    prompt.validate()?;
+    Ok(prompt)
+}
+
+fn build_icl_voice_clone_prompt(
+    engine: &Qwen3TtsEngine,
+    args: &CommonSynthesisArgs,
+    path: &Path,
+    ref_text: &str,
+) -> Result<VoiceClonePromptV2> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let speaker_embedding = engine.encode_reference_speaker(&bytes)?;
+    let ref_code = engine.encode_reference_audio_codes(&bytes).with_context(|| {
+        format!(
+            "failed to encode reference audio codes for {}; ensure qwen3-tts-tokenizer-encoder.onnx exists in {}",
+            path.display(),
+            args.model_dir.display()
+        )
+    })?;
+    let prompt = VoiceClonePromptV2 {
+        schema_version: VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+        source: path.display().to_string(),
+        model_id: args.model_dir.display().to_string(),
+        speaker_encoder_sample_rate_hz: 16_000,
+        x_vector_only_mode: false,
+        icl_mode: true,
+        ref_text: ref_text.to_string(),
+        ref_code: Some(ref_code),
+        ref_spk_embedding: Some(TensorF32 {
+            shape: vec![speaker_embedding.len() as u32],
+            values: speaker_embedding,
+        }),
+    };
+    prompt.validate()?;
+    Ok(prompt)
 }
 
 fn write_wav_f32(path: &Path, sample_rate_hz: u32, pcm_f32: &[f32]) -> Result<()> {
@@ -283,6 +372,6 @@ fn write_codec_frames_json(
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  cargo run -p qwen3-tts-cli -- synthesize --text TEXT --out OUT.wav [--model-dir DIR] [--speaker NAME] [--instruct TEXT] [--voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--talker-kv-mode f16|turboquant] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|acl|armnn|azure|cann|coreml|cuda|directml|migraphx|nnapi|nvrtx|onednn|openvino|qnn|rknpu|tensorrt|tvm|vitis|webgpu|xnnpack] [--vocoder-ep-fallback LIST]\n  cargo run -p qwen3-tts-cli -- profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--speaker NAME] [--instruct TEXT] [--voice-clone-prompt] (same tuning flags as synthesize plus backend flags)\n  cargo run -p qwen3-tts-cli -- tui [--model-dir DIR] [--voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--talker-kv-mode f16|turboquant] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|acl|armnn|azure|cann|coreml|cuda|directml|migraphx|nnapi|nvrtx|onednn|openvino|qnn|rknpu|tensorrt|tvm|vitis|webgpu|xnnpack] [--vocoder-ep-fallback LIST]\n\nCLI flags override environment variables.\nDefault transformer auto chain: Apple = metal,vulkan,cpu ; others = vulkan,cpu.\nDefault vocoder auto chain: Apple = coreml,cpu ; Windows = cuda,nvrtx,tensorrt,directml,cpu ; Linux/others = cuda,nvrtx,tensorrt,cpu.\n\nEnv fallback remains available: QWEN3_TTS_BACKEND / QWEN3_TTS_BACKEND_FALLBACK / QWEN3_TTS_VOCODER_EP / QWEN3_TTS_VOCODER_EP_FALLBACK / QWEN3_TTS_TALKER_KV_MODE\n\nIf --frames is omitted, synthesize/profile derive a text-length-based max frame budget.\n\nOr from the repo root (see .cargo/config.toml): cargo xtask bench … / cargo xtask profile …"
+        "usage:\n  cargo run -p qwen3-tts-cli -- synthesize --text TEXT --out OUT.wav [--model-dir DIR] [--speaker NAME] [--instruct TEXT] [--voice-clone-prompt prompt.pb | --voice-clone-wav REF.wav [--voice-clone-ref-text TEXT]] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--talker-kv-mode f16|turboquant] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|acl|armnn|azure|cann|coreml|cuda|directml|migraphx|nnapi|nvrtx|onednn|openvino|qnn|rknpu|tensorrt|tvm|vitis|webgpu|xnnpack] [--vocoder-ep-fallback LIST]\n  cargo run -p qwen3-tts-cli -- profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--speaker NAME] [--instruct TEXT] [--voice-clone-prompt prompt.pb | --voice-clone-wav REF.wav [--voice-clone-ref-text TEXT]] (same tuning flags as synthesize plus backend flags)\n  cargo run -p qwen3-tts-cli -- tui [--model-dir DIR] [--voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--talker-kv-mode f16|turboquant] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|acl|armnn|azure|cann|coreml|cuda|directml|migraphx|nnapi|nvrtx|onednn|openvino|qnn|rknpu|tensorrt|tvm|vitis|webgpu|xnnpack] [--vocoder-ep-fallback LIST]\n\nCLI flags override environment variables.\nDefault transformer auto chain: Apple = metal,vulkan,cpu ; others = vulkan,cpu.\nDefault vocoder auto chain: Apple = coreml,cpu ; Windows = cuda,nvrtx,tensorrt,directml,cpu ; Linux/others = cuda,nvrtx,tensorrt,cpu.\n\nEnv fallback remains available: QWEN3_TTS_BACKEND / QWEN3_TTS_BACKEND_FALLBACK / QWEN3_TTS_VOCODER_EP / QWEN3_TTS_VOCODER_EP_FALLBACK / QWEN3_TTS_TALKER_KV_MODE\n\n--voice-clone-wav alone uses pure Rust x-vector clone. Add --voice-clone-ref-text to use the native ICL clone path with qwen3-tts-tokenizer-encoder.onnx and bundled soxr audio-code extraction.\n\nIf --frames is omitted, synthesize/profile derive a text-length-based max frame budget.\n\nOr from the repo root (see .cargo/config.toml): cargo xtask bench … / cargo xtask profile …"
     );
 }

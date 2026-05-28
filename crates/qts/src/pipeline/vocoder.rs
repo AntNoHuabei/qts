@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::slice;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use ort::ep::ExecutionProvider;
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
@@ -20,18 +20,6 @@ use crate::Qwen3TtsError;
 
 fn ort_err(err: impl std::fmt::Display) -> Qwen3TtsError {
     Qwen3TtsError::Ort(err.to_string())
-}
-
-fn ensure_ort_init() -> Result<(), Qwen3TtsError> {
-    static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
-    ORT_INIT
-        .get_or_init(|| {
-            let _ = ort::init().commit();
-            Ok(())
-        })
-        .as_ref()
-        .map_err(|err| Qwen3TtsError::Ort(err.clone()))?;
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -556,7 +544,7 @@ impl Vocoder {
             return Err(Qwen3TtsError::ModelFile(path));
         }
 
-        ensure_ort_init()?;
+        crate::ensure_ort_init()?;
         let (default_session, execution_provider) = Self::build_session(&path, 1, None)?;
         let mut sessions = HashMap::new();
         sessions.insert(
@@ -797,7 +785,7 @@ impl Vocoder {
         thread_count: usize,
         n_frames: Option<usize>,
     ) -> Result<(Session, VocoderExecutionProvider), Qwen3TtsError> {
-        ensure_ort_init()?;
+        crate::ensure_ort_init()?;
 
         match parse_requested_execution_provider()? {
             RequestedExecutionProvider::Explicit(provider) => {
@@ -837,16 +825,19 @@ impl Vocoder {
         provider: VocoderExecutionProvider,
         required: bool,
     ) -> Result<Session, Qwen3TtsError> {
+        crate::trace_stage("vocoder: session builder");
         let mut builder = Session::builder().map_err(ort_err)?;
         let optimization_level = if provider.is_directml() {
             GraphOptimizationLevel::Disable
         } else {
             GraphOptimizationLevel::Level3
         };
+        crate::trace_stage("vocoder: optimization level");
         builder = builder
             .with_optimization_level(optimization_level)
             .map_err(ort_err)?;
         if thread_count > 0 {
+            crate::trace_stage("vocoder: intra threads");
             builder = builder.with_intra_threads(thread_count).map_err(ort_err)?;
         }
         if provider.is_directml() {
@@ -861,7 +852,9 @@ impl Vocoder {
                     .map_err(ort_err)?;
             }
         }
+        crate::trace_stage("vocoder: register ep");
         Self::register_execution_provider(&mut builder, provider, required)?;
+        crate::trace_stage("vocoder: commit session");
         builder.commit_from_file(path).map_err(ort_err)
     }
 

@@ -1926,6 +1926,7 @@ version = "0.2.0"
 dependencies = [
  "criterion",
  "hound",
+ "libloading 0.8.9",
  "ort",
  "prost 0.14.3",
  "prost-build",
