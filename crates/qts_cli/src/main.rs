@@ -53,6 +53,9 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
             LoadedConditioning::CustomVoice { speaker, instruct } => {
                 engine.synthesize_with_custom_voice(&request, speaker, instruct.as_deref())?
             }
+            LoadedConditioning::VoiceDesign { instruct } => {
+                engine.synthesize_with_voice_design(&request, instruct)?
+            }
             LoadedConditioning::None => engine.synthesize(&request)?,
         };
         write_wav_f32(&out_path, result.sample_rate_hz, &result.pcm_f32)?;
@@ -70,6 +73,8 @@ fn run_synthesize(args: Vec<String>) -> Result<()> {
         engine.synthesize_with_voice_clone_prompt_debug(&request, prompt)?
     } else if let LoadedConditioning::CustomVoice { speaker, instruct } = &conditioning {
         engine.synthesize_with_custom_voice_debug(&request, speaker, instruct.as_deref())?
+    } else if let LoadedConditioning::VoiceDesign { instruct } = &conditioning {
+        engine.synthesize_with_voice_design_debug(&request, instruct)?
     } else {
         engine.synthesize_debug(&request)?
     };
@@ -153,6 +158,9 @@ fn run_profile(args: Vec<String>) -> Result<()> {
             }
             LoadedConditioning::CustomVoice { speaker, instruct } => engine
                 .synthesize_with_custom_voice_profile(&request, speaker, instruct.as_deref())?,
+            LoadedConditioning::VoiceDesign { instruct } => {
+                engine.synthesize_with_voice_design_profile(&request, instruct)?
+            }
             LoadedConditioning::None => engine.synthesize_with_profile(&request)?,
         };
         if run_idx == 0 {
@@ -190,6 +198,9 @@ enum LoadedConditioning {
         speaker: String,
         instruct: Option<String>,
     },
+    VoiceDesign {
+        instruct: String,
+    },
 }
 
 fn load_synthesis_conditioning(
@@ -221,6 +232,14 @@ fn load_synthesis_conditioning(
             speaker: speaker.clone(),
             instruct: args.instruct.clone(),
         });
+    }
+    if let Some(instruct) = &args.instruct {
+        if engine.voice_model_kind().is_voice_design() {
+            return Ok(LoadedConditioning::VoiceDesign {
+                instruct: instruct.clone(),
+            });
+        }
+        bail!("--instruct without --speaker requires a voice_design model");
     }
     Ok(LoadedConditioning::None)
 }

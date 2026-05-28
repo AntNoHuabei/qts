@@ -5427,11 +5427,30 @@ impl CodePredWeights {
             + usize::from(has_input_proj) * 2;
         let ctx = OwnedContext::new_for_tensor_metadata(tensor_count)?;
 
+        let input_proj_weight_name = if has_input_proj {
+            Some(existing_tensor_name(
+                file,
+                &[
+                    "code_pred.input_proj.weight",
+                    "code_pred.hidden_proj.weight",
+                ],
+            )?)
+        } else {
+            None
+        };
+        let input_proj_bias_name = if has_input_proj {
+            Some(existing_tensor_name(
+                file,
+                &["code_pred.input_proj.bias", "code_pred.hidden_proj.bias"],
+            )?)
+        } else {
+            None
+        };
         let input_proj_weight = if has_input_proj {
             Some(load_tensor_into_context(
                 file,
                 ctx.as_ptr(),
-                "code_pred.input_proj.weight",
+                input_proj_weight_name.expect("input proj weight name"),
             )?)
         } else {
             None
@@ -5440,7 +5459,7 @@ impl CodePredWeights {
             Some(load_tensor_into_context(
                 file,
                 ctx.as_ptr(),
-                "code_pred.input_proj.bias",
+                input_proj_bias_name.expect("input proj bias name"),
             )?)
         } else {
             None
@@ -5547,13 +5566,15 @@ impl CodePredWeights {
 
         let buffer = OwnedBuffer::alloc(ctx.as_ptr(), backends.primary_ptr())?;
         if let Some(tensor) = input_proj_weight {
-            let (_, raw) = file.read_tensor_bytes("code_pred.input_proj.weight")?;
+            let (_, raw) =
+                file.read_tensor_bytes(input_proj_weight_name.expect("input proj weight name"))?;
             unsafe {
                 sys::ggml_backend_tensor_set(tensor.as_ptr(), raw.as_ptr().cast(), 0, raw.len());
             }
         }
         if let Some(tensor) = input_proj_bias {
-            let (_, raw) = file.read_tensor_bytes("code_pred.input_proj.bias")?;
+            let (_, raw) =
+                file.read_tensor_bytes(input_proj_bias_name.expect("input proj bias name"))?;
             unsafe {
                 sys::ggml_backend_tensor_set(tensor.as_ptr(), raw.as_ptr().cast(), 0, raw.len());
             }
@@ -5646,8 +5667,19 @@ impl CodePredCpuWeights {
         cfg: &TtsTransformerConfig,
         per_codebook: usize,
     ) -> Result<Self, Qwen3TtsError> {
-        let (_, input_proj_weight) = file.read_tensor_f32("code_pred.input_proj.weight")?;
-        let (_, input_proj_bias) = file.read_tensor_f32("code_pred.input_proj.bias")?;
+        let input_proj_weight_name = existing_tensor_name(
+            file,
+            &[
+                "code_pred.input_proj.weight",
+                "code_pred.hidden_proj.weight",
+            ],
+        )?;
+        let input_proj_bias_name = existing_tensor_name(
+            file,
+            &["code_pred.input_proj.bias", "code_pred.hidden_proj.bias"],
+        )?;
+        let (_, input_proj_weight) = file.read_tensor_f32(input_proj_weight_name)?;
+        let (_, input_proj_bias) = file.read_tensor_f32(input_proj_bias_name)?;
         let (_, output_norm) = file.read_tensor_f32("code_pred.output_norm.weight")?;
         let mut embeddings = Vec::with_capacity(per_codebook);
         let mut heads = Vec::with_capacity(per_codebook);
@@ -6154,6 +6186,20 @@ fn load_tensor_into_context(
     }
     let tensor = unsafe { sys::ggml_new_tensor(ctx, info.ty, info.dims.len() as i32, ne.as_ptr()) };
     NonNull::new(tensor).ok_or_else(|| Qwen3TtsError::InvalidTensor(name.into()))
+}
+
+fn existing_tensor_name<'a>(
+    file: &GgufFile,
+    names: &'a [&'a str],
+) -> Result<&'a str, Qwen3TtsError> {
+    for &name in names {
+        match file.tensor_info(name) {
+            Ok(_) => return Ok(name),
+            Err(Qwen3TtsError::MissingTensor(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Err(Qwen3TtsError::MissingTensor(names[0].into()))
 }
 
 fn load_talker_tensor_into_context(

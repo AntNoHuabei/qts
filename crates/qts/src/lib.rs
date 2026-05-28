@@ -10,7 +10,7 @@ pub mod pipeline;
 mod synthesis_profile;
 mod voice_clone_prompt;
 
-pub use custom_voice::CustomVoiceMetadata;
+pub use custom_voice::{CustomVoiceMetadata, VoiceModelKind};
 pub use error::Qwen3TtsError;
 pub use model::{load_and_validate, GgufFile, ModelPaths};
 pub use pipeline::audio_code_encoder::{AudioCodeEncoder, AudioCodeEncoderConfig};
@@ -211,6 +211,7 @@ struct CustomVoiceConditioning<'a> {
 
 pub struct Qwen3TtsEngine {
     paths: ModelPaths,
+    voice_model_kind: VoiceModelKind,
     custom_voice: Option<CustomVoiceMetadata>,
     tokenizer: TextTokenizer,
     transformer: TtsTransformer,
@@ -223,6 +224,8 @@ impl Qwen3TtsEngine {
     pub fn load(paths: ModelPaths) -> Result<Self, Qwen3TtsError> {
         trace_stage("load: validate paths");
         load_and_validate(&paths)?;
+        trace_stage("load: model kind");
+        let voice_model_kind = VoiceModelKind::load(&paths)?;
         trace_stage("load: custom voice metadata");
         let custom_voice = CustomVoiceMetadata::load(&paths)?;
         trace_stage("load: vocoder");
@@ -238,6 +241,7 @@ impl Qwen3TtsEngine {
         trace_stage("load: done");
         Ok(Self {
             paths,
+            voice_model_kind,
             custom_voice,
             tokenizer,
             transformer,
@@ -253,6 +257,11 @@ impl Qwen3TtsEngine {
 
     pub fn model_paths(&self) -> &ModelPaths {
         &self.paths
+    }
+
+    #[must_use]
+    pub fn voice_model_kind(&self) -> VoiceModelKind {
+        self.voice_model_kind
     }
 
     #[must_use]
@@ -352,11 +361,11 @@ impl Qwen3TtsEngine {
         prompt: &VoiceClonePromptV2,
     ) -> Result<SynthesizeResult, Qwen3TtsError> {
         self.validate_speaker_embedding(prompt.speaker_embedding())?;
-        self.synthesize_impl(req, None, Some(prompt), None, None)
+        self.synthesize_impl(req, None, Some(prompt), None, None, None)
     }
 
     pub fn synthesize(&self, req: &SynthesizeRequest) -> Result<SynthesizeResult, Qwen3TtsError> {
-        self.synthesize_impl(req, None, None, None, None)
+        self.synthesize_impl(req, None, None, None, None, None)
     }
 
     pub fn synthesize_with_custom_voice(
@@ -371,14 +380,23 @@ impl Qwen3TtsEngine {
             None,
             Some(CustomVoiceConditioning { speaker, instruct }),
             None,
+            None,
         )
+    }
+
+    pub fn synthesize_with_voice_design(
+        &self,
+        req: &SynthesizeRequest,
+        instruct: &str,
+    ) -> Result<SynthesizeResult, Qwen3TtsError> {
+        self.synthesize_impl(req, None, None, None, Some(instruct), None)
     }
 
     pub fn synthesize_debug(
         &self,
         req: &SynthesizeRequest,
     ) -> Result<SynthesizeDebugResult, Qwen3TtsError> {
-        self.synthesize_debug_impl(req, None, None, None)
+        self.synthesize_debug_impl(req, None, None, None, None)
     }
 
     pub fn synthesize_with_voice_clone_prompt_debug(
@@ -387,7 +405,7 @@ impl Qwen3TtsEngine {
         prompt: &VoiceClonePromptV2,
     ) -> Result<SynthesizeDebugResult, Qwen3TtsError> {
         self.validate_speaker_embedding(prompt.speaker_embedding())?;
-        self.synthesize_debug_impl(req, None, Some(prompt), None)
+        self.synthesize_debug_impl(req, None, Some(prompt), None, None)
     }
 
     pub fn synthesize_with_custom_voice_debug(
@@ -401,7 +419,16 @@ impl Qwen3TtsEngine {
             None,
             None,
             Some(CustomVoiceConditioning { speaker, instruct }),
+            None,
         )
+    }
+
+    pub fn synthesize_with_voice_design_debug(
+        &self,
+        req: &SynthesizeRequest,
+        instruct: &str,
+    ) -> Result<SynthesizeDebugResult, Qwen3TtsError> {
+        self.synthesize_debug_impl(req, None, None, None, Some(instruct))
     }
 
     pub fn synthesize_streaming<S>(
@@ -412,7 +439,7 @@ impl Qwen3TtsEngine {
     where
         S: StreamingSynthesis + Send,
     {
-        self.synthesize_streaming_impl(req, None, None, None, sink, None)
+        self.synthesize_streaming_impl(req, None, None, None, None, sink, None)
     }
 
     pub fn synthesize_with_voice_clone_prompt_streaming<S>(
@@ -425,7 +452,7 @@ impl Qwen3TtsEngine {
         S: StreamingSynthesis + Send,
     {
         self.validate_speaker_embedding(prompt.speaker_embedding())?;
-        self.synthesize_streaming_impl(req, None, Some(prompt), None, sink, None)
+        self.synthesize_streaming_impl(req, None, Some(prompt), None, None, sink, None)
     }
 
     /// Same as [`Self::synthesize`], plus wall-clock timings per pipeline stage.
@@ -434,7 +461,7 @@ impl Qwen3TtsEngine {
         req: &SynthesizeRequest,
     ) -> Result<(SynthesizeResult, SynthesisStageTimings), Qwen3TtsError> {
         let mut timings = SynthesisStageTimings::default();
-        let result = self.synthesize_impl(req, None, None, None, Some(&mut timings))?;
+        let result = self.synthesize_impl(req, None, None, None, None, Some(&mut timings))?;
         Ok((result, timings))
     }
 
@@ -446,7 +473,8 @@ impl Qwen3TtsEngine {
     ) -> Result<(SynthesizeResult, SynthesisStageTimings), Qwen3TtsError> {
         self.validate_speaker_embedding(prompt.speaker_embedding())?;
         let mut timings = SynthesisStageTimings::default();
-        let result = self.synthesize_impl(req, None, Some(prompt), None, Some(&mut timings))?;
+        let result =
+            self.synthesize_impl(req, None, Some(prompt), None, None, Some(&mut timings))?;
         Ok((result, timings))
     }
 
@@ -462,8 +490,20 @@ impl Qwen3TtsEngine {
             None,
             None,
             Some(CustomVoiceConditioning { speaker, instruct }),
+            None,
             Some(&mut timings),
         )?;
+        Ok((result, timings))
+    }
+
+    pub fn synthesize_with_voice_design_profile(
+        &self,
+        req: &SynthesizeRequest,
+        instruct: &str,
+    ) -> Result<(SynthesizeResult, SynthesisStageTimings), Qwen3TtsError> {
+        let mut timings = SynthesisStageTimings::default();
+        let result =
+            self.synthesize_impl(req, None, None, None, Some(instruct), Some(&mut timings))?;
         Ok((result, timings))
     }
 
@@ -473,6 +513,7 @@ impl Qwen3TtsEngine {
         speaker_embedding_override: Option<&[f32]>,
         voice_clone_prompt: Option<&VoiceClonePromptV2>,
         custom_voice: Option<CustomVoiceConditioning<'_>>,
+        voice_design_instruct: Option<&str>,
         timings: Option<&mut SynthesisStageTimings>,
     ) -> Result<SynthesizeResult, Qwen3TtsError> {
         let prepared = self.prepare_synthesis(
@@ -480,6 +521,7 @@ impl Qwen3TtsEngine {
             speaker_embedding_override,
             voice_clone_prompt,
             custom_voice,
+            voice_design_instruct,
         )?;
 
         if req.vocoder_chunk_size > 0 {
@@ -495,6 +537,7 @@ impl Qwen3TtsEngine {
         speaker_embedding_override: Option<&[f32]>,
         voice_clone_prompt: Option<&VoiceClonePromptV2>,
         custom_voice: Option<CustomVoiceConditioning<'_>>,
+        voice_design_instruct: Option<&str>,
         sink: &mut S,
         timings: Option<&mut SynthesisStageTimings>,
     ) -> Result<StreamingSynthesizeResult, Qwen3TtsError>
@@ -506,6 +549,7 @@ impl Qwen3TtsEngine {
             speaker_embedding_override,
             voice_clone_prompt,
             custom_voice,
+            voice_design_instruct,
         )?;
 
         if req.vocoder_chunk_size > 0 {
@@ -521,6 +565,7 @@ impl Qwen3TtsEngine {
         speaker_embedding_override: Option<&[f32]>,
         voice_clone_prompt: Option<&VoiceClonePromptV2>,
         custom_voice: Option<CustomVoiceConditioning<'_>>,
+        voice_design_instruct: Option<&str>,
     ) -> Result<SynthesizeDebugResult, Qwen3TtsError> {
         trace_stage("synthesize-debug: prepare");
         let prepared = self.prepare_synthesis(
@@ -528,6 +573,7 @@ impl Qwen3TtsEngine {
             speaker_embedding_override,
             voice_clone_prompt,
             custom_voice,
+            voice_design_instruct,
         )?;
         trace_stage("synthesize-debug: rollout");
         let codec_rollout = self.transformer.rollout_codec_frames_kv(
@@ -626,10 +672,14 @@ impl Qwen3TtsEngine {
         speaker_embedding_override: Option<&'a [f32]>,
         voice_clone_prompt: Option<&'a VoiceClonePromptV2>,
         custom_voice: Option<CustomVoiceConditioning<'a>>,
+        voice_design_instruct: Option<&'a str>,
     ) -> Result<PreparedSynthesis<'a>, Qwen3TtsError> {
-        if voice_clone_prompt.is_some() && custom_voice.is_some() {
+        let conditioning_count = usize::from(voice_clone_prompt.is_some())
+            + usize::from(custom_voice.is_some())
+            + usize::from(voice_design_instruct.is_some());
+        if conditioning_count > 1 {
             return Err(Qwen3TtsError::InvalidInput(
-                "voice clone prompt and custom voice speaker cannot be used together".into(),
+                "voice clone, custom voice, and voice design modes cannot be combined".into(),
             ));
         }
 
@@ -689,6 +739,33 @@ impl Qwen3TtsEngine {
                     req.thread_count,
                 )?,
                 speaker_embedding,
+            )
+        } else if let Some(instruct) = voice_design_instruct {
+            if !self.voice_model_kind.is_voice_design() {
+                return Err(Qwen3TtsError::InvalidInput(
+                    "voice design requires a voice_design model".into(),
+                ));
+            }
+            let instruct = instruct.trim();
+            if instruct.is_empty() {
+                return Err(Qwen3TtsError::InvalidInput(
+                    "voice design requires a non-empty instruct description".into(),
+                ));
+            }
+            let text_tokens = self.tokenizer.encode_for_tts(&req.text);
+            let instruct_tokens = self.tokenizer.encode_instruct_for_tts(instruct);
+            (
+                self.transformer.build_prefill_inputs(
+                    PrefillConditioning {
+                        text_tokens: &text_tokens,
+                        instruct_tokens: &instruct_tokens,
+                        speaker_embd: None,
+                        ref_codebook_0: &[],
+                        language_id: req.language_id,
+                    },
+                    req.thread_count,
+                )?,
+                None,
             )
         } else if let Some(prompt) = voice_clone_prompt {
             let speaker_embedding = if let Some(speaker_embedding) = speaker_embedding_override {

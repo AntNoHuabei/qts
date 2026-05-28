@@ -85,10 +85,7 @@ fn choose_vocoder_file(dir: &Path) -> PathBuf {
     let Some(parent) = dir.parent() else {
         return local;
     };
-    for sibling in [
-        "Qwen3-TTS-12Hz-0.6B-Base",
-        "Qwen3-TTS-12Hz-1.7B-Base",
-    ] {
+    for sibling in ["Qwen3-TTS-12Hz-0.6B-Base", "Qwen3-TTS-12Hz-1.7B-Base"] {
         let path = parent.join(sibling).join("qwen3-tts-vocoder.onnx");
         if path.is_file() {
             return path;
